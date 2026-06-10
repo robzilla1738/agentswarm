@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as http from "http";
+import * as os from "os";
 import * as path from "path";
 import { URL } from "url";
 import {
@@ -154,6 +155,29 @@ async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL
       return sendJson(res, 200, { models });
     } catch (e) {
       return sendJson(res, 200, { models: Object.keys(cfg.pricing), error: errMsg(e) });
+    }
+  }
+
+  // Directory browser for the launch-folder picker. Localhost-only hub, same
+  // user permissions as the CLI — lists directory names, never file contents.
+  if (p === "/api/fs/dirs" && method === "GET") {
+    const raw = url.searchParams.get("path") || os.homedir();
+    const dir = path.resolve(raw);
+    try {
+      const entries = fs
+        .readdirSync(dir, { withFileTypes: true })
+        .filter((e) => e.isDirectory() && !e.name.startsWith("."))
+        .map((e) => ({ name: e.name, path: path.join(dir, e.name) }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      const parent = path.dirname(dir);
+      return sendJson(res, 200, {
+        path: dir,
+        parent: parent === dir ? null : parent,
+        home: os.homedir(),
+        dirs: entries,
+      });
+    } catch (e) {
+      return sendJson(res, 400, { error: errMsg(e) });
     }
   }
 

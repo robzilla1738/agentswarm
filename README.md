@@ -1,5 +1,9 @@
 # agentswarm
 
+[![npm](https://img.shields.io/npm/v/@robzilla1738/agentswarm)](https://www.npmjs.com/package/@robzilla1738/agentswarm)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![node](https://img.shields.io/badge/node-%E2%89%A520.10-brightgreen)](package.json)
+
 A local agent-swarm orchestrator with a terminal dashboard and a localhost web UI. Works with DeepSeek, OpenAI, Anthropic, xAI, MiniMax, OpenRouter, Ollama, LM Studio, or any OpenAI-compatible endpoint.
 
 You give it a mission. A conductor model breaks the mission into tasks and hands them to worker agents that run in parallel, share findings on a blackboard, and get checked by an adversarial verifier. The run ends with a synthesized report plus whatever files the agents produced. Everything runs on your machine with your own API key, or fully offline against a local model.
@@ -136,6 +140,10 @@ Boots a mock model server and drives real missions through the engine, offline, 
 - Use `--cwd <path>` (or Workspace → "A directory on disk" in the UI) to let agents touch a real project. Those runs always execute on the host, since touching your real files is the point.
 - Costs are estimates based on list prices and the token counts the API reports. Models without pricing data show $0. Set a `--budget` either way.
 - Keys are stored in `~/.agentswarm/config.json` (chmod 600) and are only sent to the APIs you configured.
+
+## Author
+
+Built by [Robert Courson](https://robertcourson.com). If agentswarm saves you time, you can [buy me a coffee](https://buymeacoffee.com/robcourson).
 
 ## License
 

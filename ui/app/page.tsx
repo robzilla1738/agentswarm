@@ -4,7 +4,7 @@ import { useMemo } from "react";
 import { MissionComposer } from "@/components/MissionComposer";
 import { RunCard } from "@/components/RunCard";
 import { TopBar } from "@/components/TopBar";
-import { EmptyState } from "@/components/atoms";
+import { EmptyState, LogoMark } from "@/components/atoms";
 import { fmtMoney, fmtTokens } from "@/lib/format";
 import { useConfig, useNow, useRuns } from "@/lib/hooks";
 
@@ -30,11 +30,20 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-screen">
-      <TopBar />
-      <main className="max-w-6xl mx-auto px-5 sm:px-8 py-10">
-        <h1 className="sr-only">agentswarm</h1>
-
-        <MissionComposer config={config} />
+      <TopBar hideLogo />
+      <main className="max-w-6xl mx-auto px-5 sm:px-8 pb-10">
+        <div
+          className="max-w-3xl mx-auto flex flex-col justify-center"
+          style={runs.length === 0 ? { minHeight: "calc(100vh - 3.5rem)" } : { paddingTop: 40 }}
+        >
+          <div className="flex flex-col items-center gap-3 mb-8" style={{ animation: "var(--animate-rise)" }}>
+            <LogoMark size={64} />
+            <h1 className="font-bold tracking-tight" style={{ fontSize: 26 }}>
+              agentswarm
+            </h1>
+          </div>
+          <MissionComposer config={config} />
+        </div>
 
         {error && (
           <div className="panel p-4 mt-6 text-sm text-ink-dim">
@@ -43,7 +52,7 @@ export default function Dashboard() {
         )}
 
         {live.length > 0 && (
-          <section className="mt-12">
+          <section className="mt-8">
             <h2 className="label mb-4 flex items-center gap-2">
               <span className="rounded-full bg-ink" style={{ width: 7, height: 7, boxShadow: "0 0 8px var(--color-ink)" }} />
               Live now · {live.length}

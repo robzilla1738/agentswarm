@@ -66,6 +66,62 @@
   to { opacity: 1; transform: translateX(0); }
 }
 
+/*
+ * Theme channels. --hi is the "highlight" RGB channel every translucent
+ * accent is built from: white in dark mode, black in light mode, so all
+ * rgb(var(--hi) / a) borders, washes and glows invert automatically.
+ */
+:root {
+  --hi: 255 255 255;
+  --ink-hi: #ffffff;
+  --input-bg: rgba(0, 0, 0, 0.35);
+  --input-bg-focus: rgba(0, 0, 0, 0.5);
+  --status-warm: #e0e0e0;
+  --status-cool: #c9c9c9;
+  --logo-filter: none;
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  --color-bg: #f7f7f5;
+  --color-bg-soft: #efefed;
+  --color-panel: #ffffff;
+  --color-border: #d6d6d3;
+  --color-border-soft: #e6e6e3;
+  --color-ink: #161616;
+  --color-ink-dim: #4d4d4d;
+  --color-ink-faint: #6f6f6f;
+  --hi: 0 0 0;
+  --ink-hi: #000000;
+  --input-bg: rgba(0, 0, 0, 0.04);
+  --input-bg-focus: rgba(0, 0, 0, 0.02);
+  --status-warm: #333333;
+  --status-cool: #555555;
+  --logo-filter: invert(1);
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    --color-bg: #f7f7f5;
+    --color-bg-soft: #efefed;
+    --color-panel: #ffffff;
+    --color-border: #d6d6d3;
+    --color-border-soft: #e6e6e3;
+    --color-ink: #161616;
+    --color-ink-dim: #4d4d4d;
+    --color-ink-faint: #6f6f6f;
+    --hi: 0 0 0;
+    --ink-hi: #000000;
+    --input-bg: rgba(0, 0, 0, 0.04);
+    --input-bg-focus: rgba(0, 0, 0, 0.02);
+    --status-warm: #333333;
+    --status-cool: #555555;
+    --logo-filter: invert(1);
+    color-scheme: light;
+  }
+}
+
 * {
   box-sizing: border-box;
 }
@@ -82,18 +138,18 @@ html, body {
 
 body {
   background:
-    radial-gradient(900px 460px at 50% -14%, rgba(255, 255, 255, 0.05), transparent 60%),
+    radial-gradient(900px 460px at 50% -14%, rgb(var(--hi) / 0.05), transparent 60%),
     var(--color-bg);
   min-height: 100vh;
 }
 
 ::selection {
-  background: rgba(255, 255, 255, 0.25);
+  background: rgb(var(--hi) / 0.25);
 }
 
 /* Keyboard a11y: a visible ring on focus-visible only, never on click. */
 :focus-visible {
-  outline: 2px solid rgba(255, 255, 255, 0.55);
+  outline: 2px solid rgb(var(--hi) / 0.55);
   outline-offset: 2px;
   border-radius: 6px;
 }
@@ -113,19 +169,19 @@ body {
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.13);
+  background: rgb(var(--hi) / 0.13);
   border-radius: 8px;
   border: 2px solid transparent;
   background-clip: padding-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.24);
+  background: rgb(var(--hi) / 0.24);
   background-clip: padding-box;
 }
 
 @layer components {
   .panel {
-    background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0));
+    background: linear-gradient(180deg, rgb(var(--hi) / 0.02), rgb(var(--hi) / 0));
     background-color: var(--color-panel);
     border: 1px solid var(--color-border-soft);
     border-radius: var(--radius-xl);
@@ -134,11 +190,11 @@ body {
     transition: border-color 0.2s, transform 0.2s, box-shadow 0.2s;
   }
   .panel-hover:hover {
-    border-color: rgba(255, 255, 255, 0.22);
-    box-shadow: 0 12px 40px -24px rgba(255, 255, 255, 0.25);
+    border-color: rgb(var(--hi) / 0.22);
+    box-shadow: 0 12px 40px -24px rgb(var(--hi) / 0.25);
   }
   .tile {
-    background: rgba(255, 255, 255, 0.02);
+    background: rgb(var(--hi) / 0.02);
     border: 1px solid var(--color-border-soft);
     border-radius: 10px;
   }
@@ -147,7 +203,7 @@ body {
     transition: border-color 0.16s, background 0.16s;
   }
   .tile-hover:hover {
-    border-color: rgba(255, 255, 255, 0.3);
+    border-color: rgb(var(--hi) / 0.3);
   }
   /* The uppercase micro-heading used across panels and sections. */
   .label {
@@ -178,14 +234,14 @@ body {
     transition: border-color 0.15s, color 0.15s;
   }
   a.chip:hover, button.chip:hover {
-    border-color: rgba(255, 255, 255, 0.35);
+    border-color: rgb(var(--hi) / 0.35);
     color: var(--color-ink);
   }
   /* Monochrome alarm: the only "loud" treatment is full inversion. */
   .chip-solid {
-    background: #f2f2f2;
-    border-color: #f2f2f2;
-    color: #0a0a0a;
+    background: var(--color-ink);
+    border-color: var(--color-ink);
+    color: var(--color-bg);
     font-weight: 700;
   }
   /* Underline tab — the one tab style, used everywhere. */
@@ -227,41 +283,41 @@ body {
     border-radius: 9px;
     border: 1px solid var(--color-border);
     color: var(--color-ink);
-    background: rgba(255, 255, 255, 0.02);
+    background: rgb(var(--hi) / 0.02);
     cursor: pointer;
     transition: border-color 0.16s, background 0.16s, color 0.16s, filter 0.16s, transform 0.06s;
     user-select: none;
     white-space: nowrap;
   }
-  .btn:hover { border-color: rgba(255, 255, 255, 0.35); }
+  .btn:hover { border-color: rgb(var(--hi) / 0.35); }
   .btn:active { transform: translateY(1px); }
   .btn:disabled { opacity: 0.35; cursor: not-allowed; transform: none; }
   .btn-primary {
     background: var(--color-ink);
     border-color: transparent;
-    color: #0a0a0a;
-    box-shadow: 0 8px 28px -14px rgba(255, 255, 255, 0.5);
+    color: var(--color-bg);
+    box-shadow: 0 8px 28px -14px rgb(var(--hi) / 0.5);
   }
-  .btn-primary:hover { background: #ffffff; border-color: transparent; }
+  .btn-primary:hover { background: var(--ink-hi); border-color: transparent; }
   .btn-ghost {
     background: transparent;
     border-color: transparent;
     color: var(--color-ink-dim);
   }
   .btn-ghost:hover {
-    background: rgba(255, 255, 255, 0.05);
+    background: rgb(var(--hi) / 0.05);
     border-color: transparent;
     color: var(--color-ink);
   }
   .btn-danger:hover {
-    border-color: rgba(255, 255, 255, 0.6);
-    color: #ffffff;
-    background: rgba(255, 255, 255, 0.06);
+    border-color: rgb(var(--hi) / 0.6);
+    color: var(--ink-hi);
+    background: rgb(var(--hi) / 0.06);
   }
   .btn-sm { padding: 5px 10px; font-size: var(--text-xs); border-radius: 7px; }
   .input {
     width: 100%;
-    background: rgba(0, 0, 0, 0.35);
+    background: var(--input-bg);
     border: 1px solid var(--color-border);
     border-radius: 9px;
     padding: 10px 13px;
@@ -271,15 +327,15 @@ body {
     outline: none;
     transition: border-color 0.16s, box-shadow 0.16s, background 0.16s;
   }
-  .input:hover { border-color: #333333; }
+  .input:hover { border-color: color-mix(in srgb, var(--color-ink) 28%, transparent); }
   .input:focus {
-    border-color: rgba(255, 255, 255, 0.45);
-    box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.07);
-    background: rgba(0, 0, 0, 0.5);
+    border-color: rgb(var(--hi) / 0.45);
+    box-shadow: 0 0 0 3px rgb(var(--hi) / 0.07);
+    background: var(--input-bg-focus);
   }
   .input::placeholder { color: var(--color-ink-faint); }
   .skeleton {
-    background: linear-gradient(90deg, rgba(255,255,255,0.03), rgba(255,255,255,0.07), rgba(255,255,255,0.03));
+    background: linear-gradient(90deg, rgb(var(--hi) / 0.03), rgb(var(--hi) / 0.07), rgb(var(--hi) / 0.03));
     background-size: 480px 100%;
     animation: var(--animate-shimmer);
   }
@@ -289,7 +345,7 @@ body {
     place-items: center;
     font-family: var(--font-mono);
     color: var(--color-ink-dim);
-    background: rgba(255, 255, 255, 0.03);
+    background: rgb(var(--hi) / 0.03);
     border: 1px solid var(--color-border-soft);
     border-radius: 8px;
   }
@@ -322,13 +378,13 @@ body {
 .prose-report code {
   font-family: var(--font-mono);
   font-size: 0.85em;
-  background: rgba(255, 255, 255, 0.07);
+  background: rgb(var(--hi) / 0.07);
   color: var(--color-ink);
   padding: 1.5px 6px;
   border-radius: 5px;
 }
 .prose-report pre {
-  background: rgba(0, 0, 0, 0.45);
+  background: var(--input-bg);
   border: 1px solid var(--color-border-soft);
   border-radius: 10px;
   padding: 14px 16px;
@@ -336,8 +392,8 @@ body {
   margin: 0.9em 0;
 }
 .prose-report pre code { background: none; color: var(--color-ink-dim); padding: 0; }
-.prose-report a { color: var(--color-ink); text-decoration: underline; text-underline-offset: 3px; text-decoration-color: rgba(255,255,255,0.35); }
-.prose-report a:hover { text-decoration-color: #ffffff; }
+.prose-report a { color: var(--color-ink); text-decoration: underline; text-underline-offset: 3px; text-decoration-color: rgb(var(--hi) / 0.35); }
+.prose-report a:hover { text-decoration-color: var(--ink-hi); }
 .prose-report table {
   border-collapse: collapse;
   margin: 0.9em 0;
@@ -347,11 +403,11 @@ body {
   overflow-x: auto;
 }
 .prose-report th, .prose-report td { border: 1px solid var(--color-border); padding: 7px 11px; text-align: left; }
-.prose-report th { background: rgba(255, 255, 255, 0.04); white-space: nowrap; font-family: var(--font-mono); font-size: 0.9em; }
+.prose-report th { background: rgb(var(--hi) / 0.04); white-space: nowrap; font-family: var(--font-mono); font-size: 0.9em; }
 .prose-report td { color: var(--color-ink-dim); }
-.prose-report tr:nth-child(even) td { background: rgba(255, 255, 255, 0.015); }
+.prose-report tr:nth-child(even) td { background: rgb(var(--hi) / 0.015); }
 .prose-report blockquote {
-  border-left: 2px solid #3a3a3a;
+  border-left: 2px solid var(--color-border);
   margin: 0.8em 0;
   padding-left: 14px;
   color: var(--color-ink-dim);

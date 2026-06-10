@@ -94,6 +94,10 @@ export const api = {
   validate: () => jget<{ status: "ok" | "invalid" | "unknown"; message?: string }>("/api/validate"),
   sandboxTest: (runtime?: string) =>
     jpost<{ kind: string; ok: boolean; detail: string }>("/api/sandbox/test", runtime ? { runtime } : {}),
+  listDirs: (path?: string) =>
+    jget<{ path: string; parent: string | null; home: string; dirs: { name: string; path: string }[] }>(
+      `/api/fs/dirs${path ? `?path=${encodeURIComponent(path)}` : ""}`
+    ),
   listRuns: () => jget<{ runs: RunSummary[] }>("/api/runs"),
   createRun: (body: { mission: string; sandbox?: boolean; cwd?: string; options?: Record<string, unknown> }) =>
     jpost<{ id: string }>("/api/runs", body),

@@ -29,7 +29,7 @@ export function SideRail({
   ];
 
   return (
-    <div className="panel flex flex-col h-[480px] lg:h-[calc(100vh-150px)] lg:max-h-[860px] lg:sticky lg:top-[84px]">
+    <div className="panel flex flex-col h-[480px] lg:h-[calc(100vh-88px)] lg:sticky lg:top-[72px]">
       <div className="flex items-center gap-5 px-4 border-b border-border-soft shrink-0">
         {tabs.map((t) => (
           <button key={t.id} className="tab" data-active={tab === t.id} onClick={() => setTab(t.id)}>
@@ -83,7 +83,7 @@ function ActivityFeed({ activity, now }: { activity: ActivityItem[]; now: number
           className="absolute bottom-3 left-1/2 -translate-x-1/2 btn btn-sm"
           style={{
             background: "color-mix(in oklab, var(--color-panel) 92%, transparent)",
-            borderColor: "rgba(255,255,255,0.35)",
+            borderColor: "rgb(var(--hi) / 0.35)",
             boxShadow: "0 6px 20px -6px rgba(0,0,0,0.6)",
           }}
         >
@@ -107,7 +107,7 @@ function ActivityRow({ item }: { item: ActivityItem }) {
 
   if (item.kind === "tool") {
     head = (
-      <span className="mono font-medium text-ink mr-1.5">
+      <span className="mono font-medium text-ink mr-1.5 whitespace-nowrap">
         <ToolIcon name={item.name} /> {item.name}
       </span>
     );
@@ -136,7 +136,7 @@ function ActivityRow({ item }: { item: ActivityItem }) {
       <span className="flex items-center gap-1.5 shrink-0 w-[56px]" style={{ marginTop: 1 }}>
         {item.taskId ? (
           <>
-            <PixelAvatar seed={item.taskId} size={14} />
+            <PixelAvatar seed={item.taskId} size={18} />
             <span className="mono text-2xs text-ink-faint">{item.taskId}</span>
           </>
         ) : (
@@ -177,7 +177,7 @@ function ConductorFeed({ log, operatorNotes, now }: { log: ConductorSay[]; opera
           {m.kind === "op" ? (
             <div
               className="rounded-lg p-2.5 text-xs"
-              style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.18)" }}
+              style={{ background: "rgb(var(--hi) / 0.05)", border: "1px solid rgb(var(--hi) / 0.18)" }}
             >
               <div className="label mb-1 text-ink" style={{ letterSpacing: "0.12em" }}>
                 you · {fmtAgo(m.t, now)}
@@ -205,14 +205,13 @@ function Blackboard({ notes, now }: { notes: BlackboardNote[]; now: number }) {
   return (
     <div className="h-full overflow-y-auto px-3.5 py-3 space-y-2">
       {[...notes].reverse().map((n, i) => (
-        <div key={i} className="tile p-2.5 text-xs" style={{ animation: "var(--animate-rise)" }}>
-          <div className="flex items-center gap-2 mb-1 text-2xs text-ink-faint">
-            <span className="text-ink-dim">✦</span>
-            {n.key && <span className="mono font-bold text-ink-dim">{n.key}</span>}
-            {n.taskId && <span className="mono">{n.taskId}</span>}
-            <span className="ml-auto">{fmtAgo(n.t, now)}</span>
+        <div key={i} className="tile p-3 text-xs" style={{ animation: "var(--animate-rise)" }}>
+          <div className="flex items-baseline gap-2 mb-1.5 text-2xs text-ink-faint">
+            {n.key && <span className="mono font-semibold text-ink truncate">{n.key.replace(/[_-]+/g, " ")}</span>}
+            {n.taskId && <span className="mono shrink-0">{n.taskId}</span>}
+            <span className="ml-auto shrink-0">{fmtAgo(n.t, now)}</span>
           </div>
-          <div className="text-ink-dim">{n.text}</div>
+          <div className="text-ink-dim leading-relaxed">{n.text}</div>
         </div>
       ))}
     </div>

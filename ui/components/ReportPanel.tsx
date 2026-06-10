@@ -80,7 +80,7 @@ export function ReportPanel({ id, hasFinal, live }: { id: string; hasFinal: bool
           <>
             <div
               className="flex items-center justify-between gap-3 px-5 sm:px-7 py-3 border-b border-border-soft"
-              style={{ background: "rgba(255,255,255,0.015)" }}
+              style={{ background: "rgb(var(--hi) / 0.015)" }}
             >
               <span className="label">Final report</span>
               <div className="flex items-center gap-1.5">
@@ -147,7 +147,7 @@ function ExtBadge({ name }: { name: string }) {
         width: 34,
         height: 20,
         borderRadius: 5,
-        background: "rgba(255,255,255,0.05)",
+        background: "rgb(var(--hi) / 0.05)",
         border: "1px solid var(--color-border)",
       }}
     >

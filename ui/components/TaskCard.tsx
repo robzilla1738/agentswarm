@@ -42,12 +42,12 @@ export function TaskCard({
       className="panel panel-hover text-left p-3.5 w-full relative overflow-hidden flex flex-col"
       style={{
         animation: "var(--animate-rise)",
-        borderColor: active ? "rgba(255,255,255,0.16)" : undefined,
+        borderColor: active ? "rgb(var(--hi) / 0.16)" : undefined,
         opacity: task.status === "pending" ? 0.75 : 1,
       }}
     >
       <div className="flex items-center gap-2 mb-1.5 w-full">
-        <PixelAvatar seed={task.id} size={16} />
+        <PixelAvatar seed={task.id} size={26} />
         <span className="mono text-2xs font-bold shrink-0" style={{ color }}>{task.id}</span>
         <span className="text-2xs font-medium shrink-0 text-ink-dim">{personaName(task.id)}</span>
         <span className="text-2xs shrink-0 text-ink-faint">· {role}</span>

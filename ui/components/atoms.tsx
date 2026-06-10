@@ -13,7 +13,7 @@ export function LogoMark({ size = 30 }: { size?: number }) {
       alt=""
       aria-hidden
       className="shrink-0 select-none"
-      style={{ height: size, width: "auto" }}
+      style={{ height: size, width: "auto", filter: "var(--logo-filter)" }}
       draggable={false}
     />
   );
@@ -67,7 +67,7 @@ export function BudgetBar({ spent, cap, height = 5 }: { spent: number; cap: numb
   const pct = cap > 0 ? Math.min(100, (spent / cap) * 100) : 0;
   const hot = pct > 85;
   return (
-    <div className="w-full rounded-full overflow-hidden" style={{ height, background: "rgba(255,255,255,0.07)" }}>
+    <div className="w-full rounded-full overflow-hidden" style={{ height, background: "rgb(var(--hi) / 0.07)" }}>
       <div
         className="h-full rounded-full bg-ink transition-all duration-500"
         style={{ width: `${pct}%`, animation: hot ? "var(--animate-pulse-soft)" : undefined }}
@@ -83,8 +83,8 @@ export function Spinner({ size = 14, dark }: { size?: number; dark?: boolean }) 
       style={{
         width: size,
         height: size,
-        border: dark ? "1.5px solid rgba(0,0,0,0.25)" : "1.5px solid rgba(255,255,255,0.18)",
-        borderTopColor: dark ? "#0a0a0a" : "#ffffff",
+        border: dark ? "1.5px solid color-mix(in srgb, var(--color-bg) 25%, transparent)" : "1.5px solid rgb(var(--hi) / 0.18)",
+        borderTopColor: dark ? "var(--color-bg)" : "var(--ink-hi)",
       }}
     />
   );

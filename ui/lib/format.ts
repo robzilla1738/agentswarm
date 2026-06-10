@@ -47,13 +47,13 @@ export function fmtClock(t: number): string {
 /* Monochrome: state is carried by brightness + glyph, not hue. */
 export const STATUS_COLOR: Record<string, string> = {
   pending: "var(--color-ink-faint)",
-  running: "#ffffff",
-  verifying: "#e0e0e0",
+  running: "var(--ink-hi)",
+  verifying: "var(--status-warm)",
   done: "var(--color-ink-dim)",
-  failed: "#ffffff",
-  blocked: "#c9c9c9",
-  planning: "#ffffff",
-  synthesizing: "#e0e0e0",
+  failed: "var(--ink-hi)",
+  blocked: "var(--status-cool)",
+  planning: "var(--ink-hi)",
+  synthesizing: "var(--status-warm)",
   cancelled: "var(--color-ink-dim)",
 };
 

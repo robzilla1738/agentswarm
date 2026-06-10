@@ -491,7 +491,7 @@ function Toggle({ on, onChange, label }: { on: boolean; onChange: (v: boolean) =
       >
         <span
           className="absolute rounded-full transition-all"
-          style={{ width: 16, height: 16, top: 3, left: on ? 19 : 3, background: on ? "#0a0a0a" : "#8a8a8a" }}
+          style={{ width: 16, height: 16, top: 3, left: on ? 19 : 3, background: on ? "var(--color-bg)" : "var(--color-ink-faint)" }}
         />
       </span>
     </button>

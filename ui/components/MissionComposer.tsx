@@ -148,6 +148,11 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
             {tag}
           </button>
         ))}
+        {workspace === "sandbox" && (
+          <button className="chip" title="Run the swarm inside an existing project or folder" onClick={() => setWorkspace("dir")}>
+            ＋ Folder
+          </button>
+        )}
         <button
           className="btn btn-ghost btn-sm ml-auto"
           aria-expanded={advanced}
@@ -158,6 +163,14 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
           <span style={{ fontSize: 9, transform: advanced ? "rotate(180deg)" : "none", transition: "transform 0.15s" }}>▼</span>
         </button>
       </div>
+
+      {workspace === "dir" && (
+        <FolderBrowser
+          cwd={cwd}
+          onPick={setCwd}
+          onClose={() => { setWorkspace("sandbox"); setCwd(""); }}
+        />
+      )}
 
       {advanced && (
         <div className="mt-4 pt-4 space-y-4 border-t border-border-soft">
@@ -234,16 +247,6 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
                 <option value="dir">A directory on disk</option>
               </select>
             </Field>
-            {workspace === "dir" && (
-              <Field label="Directory" hint="absolute path">
-                <input
-                  className="input mono text-sm"
-                  placeholder="/path/to/project"
-                  value={cwd}
-                  onChange={(e) => setCwd(e.target.value)}
-                />
-              </Field>
-            )}
           </div>
           {workspace === "dir" && (
             <p className="tile text-xs leading-relaxed text-ink-dim px-3 py-2.5">
@@ -255,7 +258,7 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
       )}
 
       {error && (
-        <div className="mt-3 text-sm text-ink px-3 py-2 rounded-lg" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.2)" }}>
+        <div className="mt-3 text-sm text-ink px-3 py-2 rounded-lg" style={{ background: "rgb(var(--hi) / 0.06)", border: "1px solid rgb(var(--hi) / 0.2)" }}>
           {error}
         </div>
       )}
@@ -286,13 +289,86 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
   );
 }
 
+/** Browse server-side directories and pick one as the swarm's working folder. */
+function FolderBrowser({ cwd, onPick, onClose }: { cwd: string; onPick: (p: string) => void; onClose: () => void }) {
+  const [open, setOpen] = useState(!cwd);
+  const [listing, setListing] = useState<{ path: string; parent: string | null; dirs: { name: string; path: string }[] } | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const browse = (path?: string) =>
+    api
+      .listDirs(path)
+      .then((l) => { setListing(l); setErr(null); })
+      .catch((e: any) => setErr(e?.message || "can't read directory"));
+
+  useEffect(() => {
+    if (open && !listing) browse(cwd.trim() || undefined);
+  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return (
+    <div className="mt-3">
+      <div className="flex items-center gap-2">
+        <input
+          className="input mono text-sm"
+          placeholder="/path/to/project — agents will work in this folder"
+          value={cwd}
+          onChange={(e) => onPick(e.target.value)}
+        />
+        <button className="btn btn-sm shrink-0" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+          {open ? "Hide" : "Browse"}
+        </button>
+        <button className="btn btn-ghost btn-sm shrink-0" title="Back to an isolated workspace" onClick={onClose}>
+          ✕
+        </button>
+      </div>
+
+      {open && (
+        <div className="tile mt-2 overflow-hidden">
+          {err && <div className="px-3 py-2.5 text-xs text-ink-dim">{err}</div>}
+          {!err && !listing && <div className="px-3 py-2.5 text-xs text-ink-faint">Loading…</div>}
+          {!err && listing && (
+            <>
+              <div className="flex items-center gap-2 px-3 py-2 border-b border-border-soft">
+                <span className="mono text-xs text-ink-dim truncate flex-1" title={listing.path}>{listing.path}</span>
+                <button
+                  className="btn btn-primary btn-sm shrink-0"
+                  onClick={() => { onPick(listing.path); setOpen(false); }}
+                >
+                  Use this folder
+                </button>
+              </div>
+              <div className="max-h-52 overflow-y-auto py-1">
+                {listing.parent && (
+                  <button className="block w-full text-left px-3 py-1.5 text-sm mono text-ink-faint hover:text-ink" onClick={() => browse(listing.parent!)}>
+                    ../
+                  </button>
+                )}
+                {listing.dirs.map((d) => (
+                  <button
+                    key={d.path}
+                    className="block w-full text-left px-3 py-1.5 text-sm mono text-ink-dim hover:text-ink truncate"
+                    onClick={() => browse(d.path)}
+                  >
+                    {d.name}/
+                  </button>
+                ))}
+                {listing.dirs.length === 0 && <div className="px-3 py-1.5 text-xs text-ink-faint">No subfolders</div>}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PresetChip({ active, onClick, title, children }: { active: boolean; onClick: () => void; title: string; children: React.ReactNode }) {
   return (
     <button
       className="chip"
       title={title}
       onClick={onClick}
-      style={active ? { color: "var(--color-ink)", borderColor: "rgba(255,255,255,0.45)", background: "rgba(255,255,255,0.05)" } : undefined}
+      style={active ? { color: "var(--color-ink)", borderColor: "rgb(var(--hi) / 0.45)", background: "rgb(var(--hi) / 0.05)" } : undefined}
     >
       {children}
     </button>

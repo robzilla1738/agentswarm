@@ -66,16 +66,22 @@ export async function runAgent(p: AgentParams): Promise<AgentOutcome> {
   let steps = 0;
   hooks.onTranscript?.(messages);
 
-  const callModel = (opts?: { only?: string }): Promise<ChatResult> =>
-    chat(cfg, {
+  // Wrap-up calls (forced or terminal-only) run with thinking disabled:
+  // DeepSeek's thinking mode hard-400s on a forced function tool_choice, and
+  // the final "summarize into the terminal tool" turn needs no deep reasoning.
+  const callModel = (opts?: { only?: string; terminalOnly?: boolean }): Promise<ChatResult> => {
+    const wrapUp = Boolean(opts?.only || opts?.terminalOnly);
+    return chat(cfg, {
       model: p.model,
       messages,
       tools: opts?.only
         ? allSchemas.filter((s) => s.name === opts.only)
-        : allSchemas,
+        : opts?.terminalOnly
+          ? p.terminal
+          : allSchemas,
       toolChoice: opts?.only,
-      thinking: p.thinking,
-      reasoningEffort: p.thinking ? p.reasoningEffort : undefined,
+      thinking: wrapUp ? false : p.thinking,
+      reasoningEffort: !wrapUp && p.thinking ? p.reasoningEffort : undefined,
       maxTokens: p.maxTokensOut,
       signal: p.signal,
       onDelta: (d) => {
@@ -83,6 +89,7 @@ export async function runAgent(p: AgentParams): Promise<AgentOutcome> {
         if (d.text) hooks.onDelta?.("text", d.text);
       },
     });
+  };
 
   let stopReason: string | null = null;
   while (steps < p.maxSteps) {
@@ -170,19 +177,29 @@ export async function runAgent(p: AgentParams): Promise<AgentOutcome> {
   }
 
   // Step budget exhausted (or stopped early) — force one final terminal call.
+  // Two attempts: a forced tool_choice first, then terminal-only tools with
+  // free choice, since some providers reject or ignore forced choices. The
+  // agent's work must never be discarded because the wrap-up call failed.
   messages.push({ role: "user", content: stopReason ? forcedFinal(stopReason) : STEP_LIMIT_FINAL });
-  try {
-    const res = await callModel({ only: p.terminal[0].name });
-    hooks.onUsage?.(p.model, res.usage);
-    usage = addUsage(usage, res.usage);
-    const call = res.toolCalls.find((c) => terminalNames.has(c.function.name));
-    if (call) {
-      const args = safeJson<Record<string, unknown>>(call.function.arguments) ?? {};
-      return { terminal: { name: call.function.name, args }, finalText: lastText, steps, usage };
+  for (const opts of [{ only: p.terminal[0].name }, { terminalOnly: true }]) {
+    try {
+      const res = await callModel(opts);
+      hooks.onUsage?.(p.model, res.usage);
+      usage = addUsage(usage, res.usage);
+      const call = res.toolCalls.find((c) => terminalNames.has(c.function.name));
+      if (call) {
+        const args = safeJson<Record<string, unknown>>(call.function.arguments) ?? {};
+        return { terminal: { name: call.function.name, args }, finalText: lastText, steps, usage };
+      }
+      if (res.content) {
+        lastText = res.content;
+        // The model answered in prose; keep it and demand the tool call.
+        messages.push({ role: "assistant", content: res.content });
+        messages.push({ role: "user", content: `Call the ${p.terminal[0].name} tool now. Do not reply with text.` });
+      }
+    } catch (e) {
+      hooks.onLog?.("warn", `${p.agentId}: final terminal call failed: ${errMsg(e)}`);
     }
-    if (res.content) lastText = res.content;
-  } catch (e) {
-    hooks.onLog?.("warn", `${p.agentId}: forced final call failed: ${errMsg(e)}`);
   }
   return { terminal: null, finalText: lastText, steps, usage };
 }

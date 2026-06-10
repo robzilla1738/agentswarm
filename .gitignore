@@ -8,3 +8,4 @@ out/
 .env.*
 ui/next-env.d.ts
 *.tgz
+*.tsbuildinfo

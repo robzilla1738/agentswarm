@@ -82,7 +82,7 @@ function ConductorNode({ status, latest, taskCount }: { status: RunStatus; lates
   return (
     <div
       className="panel p-4"
-      style={{ borderColor: thinking ? "rgba(255,255,255,0.25)" : undefined, transition: "border-color 0.4s" }}
+      style={{ borderColor: thinking ? "rgb(var(--hi) / 0.25)" : undefined, transition: "border-color 0.4s" }}
     >
       <div className="flex items-center gap-3.5">
         <div
@@ -91,13 +91,10 @@ function ConductorNode({ status, latest, taskCount }: { status: RunStatus; lates
             width: 38,
             height: 38,
             fontSize: 13,
-            boxShadow: thinking ? "0 0 22px -6px rgba(255,255,255,0.5)" : "none",
+            boxShadow: thinking ? "0 0 22px -6px rgb(var(--hi) / 0.5)" : "none",
             transition: "box-shadow 0.4s",
           }}
         >
-          {thinking && (
-            <span className="absolute inset-0 rounded-[8px] animate-ping" style={{ border: "1px solid rgba(255,255,255,0.3)" }} />
-          )}
           ◉
         </div>
         <div className="min-w-0 flex-1">

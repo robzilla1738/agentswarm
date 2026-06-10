@@ -50,13 +50,24 @@ export function PixelAvatar({ seed, size = 14, className }: { seed: string; size
   if (cells.length === 0) cells.push({ x: 2, y: 1, o: 0.95 }, { x: 2, y: 2, o: 0.45 }, { x: 2, y: 3, o: 0.95 });
   return (
     <span
-      className={`inline-grid place-items-center rounded-[4px] shrink-0 ${className ?? ""}`}
-      style={{ width: size, height: size, background: "rgba(255,255,255,0.05)", border: "1px solid var(--color-border-soft)" }}
+      className={`inline-grid place-items-center shrink-0 ${className ?? ""}`}
+      style={{
+        width: size,
+        height: size,
+        borderRadius: Math.max(4, Math.round(size * 0.22)),
+        background: "rgb(var(--hi) / 0.05)",
+        border: "1px solid var(--color-border-soft)",
+      }}
       aria-hidden
     >
-      <svg width={size - 4} height={size - 4} viewBox="0 0 5 5">
+      <svg
+        width={Math.round(size * 0.62)}
+        height={Math.round(size * 0.62)}
+        viewBox="0 0 5 5"
+        shapeRendering="crispEdges"
+      >
         {cells.map((c, i) => (
-          <rect key={i} x={c.x} y={c.y} width={1} height={1} fill="#ffffff" opacity={c.o} />
+          <rect key={i} x={c.x} y={c.y} width={1} height={1} fill="var(--color-ink)" opacity={c.o} />
         ))}
       </svg>
     </span>

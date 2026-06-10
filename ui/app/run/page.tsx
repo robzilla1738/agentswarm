@@ -129,7 +129,8 @@ function RunView() {
         }
       />
 
-      <main className="max-w-[1400px] mx-auto px-4 sm:px-6 py-6">
+      <main className="max-w-[1400px] mx-auto px-4 sm:px-6 py-5 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_380px] gap-5 items-start">
+        <div className="min-w-0">
         {failed && (
           <Banner glyph="✕" title="This run failed">
             {data.statusReason || "The run ended without completing."}
@@ -152,10 +153,10 @@ function RunView() {
         )}
 
         {/* Header */}
-        <div className="panel p-5 mb-6">
+        <div className="panel p-4 mb-4">
           <div className="flex items-start justify-between gap-4 flex-wrap">
             <div className="min-w-0 flex-1">
-              <h1 className="text-lg font-semibold leading-snug mb-2 text-ink">{meta.mission}</h1>
+              <h1 className="text-base font-semibold leading-snug mb-1.5 text-ink">{meta.mission}</h1>
               <div className="flex items-center gap-x-3 gap-y-1.5 flex-wrap">
                 <StatusBadge status={data.status} />
                 <span className="mono text-2xs text-ink-faint">{metaLine}</span>
@@ -179,7 +180,7 @@ function RunView() {
             </div>
           </div>
 
-          <div className="flex flex-wrap gap-x-10 gap-y-4 mt-6">
+          <div className="flex flex-wrap gap-x-8 gap-y-3 mt-4">
             <Stat
               label="Tasks"
               value={`${counts.done}/${counts.total}`}
@@ -192,7 +193,7 @@ function RunView() {
             <Stat label="Elapsed" value={elapsed} sub={live && !interrupted ? "running" : "total"} />
           </div>
 
-          <div className="mt-5">
+          <div className="mt-3.5">
             <BudgetBar spent={spent} cap={cap} />
             <div className="flex justify-between mt-1.5 mono text-2xs text-ink-faint">
               <span>budget · {fmtTokens(spent)} of {fmtTokens(cap)}</span>
@@ -201,14 +202,14 @@ function RunView() {
           </div>
 
           {live && !interrupted && (
-            <div className="mt-4">
+            <div className="mt-3">
               <NoteComposer id={id} />
             </div>
           )}
         </div>
 
         {/* Tab switch */}
-        <div className="flex items-center gap-6 mb-5 border-b border-border-soft">
+        <div className="flex items-center gap-6 mb-4 border-b border-border-soft">
           <button className="tab" data-active={tab === "swarm"} onClick={() => setTab("swarm")}>
             Swarm
           </button>
@@ -220,34 +221,34 @@ function RunView() {
         </div>
 
         {tab === "swarm" ? (
-          <div className="grid grid-cols-1 lg:grid-cols-[1fr_380px] gap-5 items-start">
-            <div className="min-w-0">
-              {data.finalSummary && (
-                <div className="panel p-4 mb-5" style={{ borderColor: "rgba(255,255,255,0.22)", background: "rgba(255,255,255,0.03)" }}>
-                  <div className="label mb-1.5 text-ink">✓ Mission summary</div>
-                  <p className="text-sm leading-relaxed text-ink-dim">{data.finalSummary}</p>
-                </div>
-              )}
-              <SwarmBoard
-                tasks={data.tasks}
-                agents={data.agents}
-                status={data.status}
-                conductorLatest={conductorLatest}
-                now={now}
-                onSelect={(t: Task) => setSelected(t.id)}
-              />
-            </div>
-            <SideRail
-              activity={data.activity}
-              conductorLog={data.conductorLog}
-              notes={data.notes}
-              operatorNotes={data.operatorNotes}
+          <div className="min-w-0">
+            {data.finalSummary && (
+              <div className="panel p-4 mb-5" style={{ borderColor: "rgb(var(--hi) / 0.22)", background: "rgb(var(--hi) / 0.03)" }}>
+                <div className="label mb-1.5 text-ink">✓ Mission summary</div>
+                <p className="text-sm leading-relaxed text-ink-dim">{data.finalSummary}</p>
+              </div>
+            )}
+            <SwarmBoard
+              tasks={data.tasks}
+              agents={data.agents}
+              status={data.status}
+              conductorLatest={conductorLatest}
               now={now}
+              onSelect={(t: Task) => setSelected(t.id)}
             />
           </div>
         ) : (
           <ReportPanel id={id} hasFinal={!!data.finalSummary} live={live} />
         )}
+        </div>
+
+        <SideRail
+          activity={data.activity}
+          conductorLog={data.conductorLog}
+          notes={data.notes}
+          operatorNotes={data.operatorNotes}
+          now={now}
+        />
       </main>
 
       <TaskDetail runId={id} task={selectedTask} agents={data.agents} now={now} onClose={() => setSelected(null)} />
@@ -282,8 +283,8 @@ function Banner({ glyph, title, children }: { glyph: string; title: string; chil
     <div
       className="panel p-4 mb-5 flex items-start gap-3.5"
       style={{
-        borderColor: "rgba(255,255,255,0.28)",
-        background: "rgba(255,255,255,0.03)",
+        borderColor: "rgb(var(--hi) / 0.28)",
+        background: "rgb(var(--hi) / 0.03)",
         animation: "var(--animate-rise)",
       }}
     >
@@ -299,8 +300,8 @@ function Banner({ glyph, title, children }: { glyph: string; title: string; chil
 function Stat({ label, value, sub, alert }: { label: string; value: string; sub?: string; alert?: boolean }) {
   return (
     <div>
-      <div className="label mb-1.5">{label}</div>
-      <div className="text-xl font-bold leading-none mono text-ink">{value}</div>
+      <div className="label mb-1">{label}</div>
+      <div className="text-lg font-bold leading-none mono text-ink">{value}</div>
       {sub && <div className={`mono text-2xs mt-1.5 ${alert ? "text-ink" : "text-ink-faint"}`}>{sub}</div>}
     </div>
   );

@@ -55,7 +55,7 @@ export function TaskDetail({
         >
           <div className="flex items-start justify-between gap-3 mb-2.5">
             <div className="flex items-center gap-2.5 flex-wrap">
-              <PixelAvatar seed={task.id} size={22} />
+              <PixelAvatar seed={task.id} size={30} />
               <span className="mono font-bold text-lg" style={{ color }}>{task.id}</span>
               <span className="text-sm font-medium text-ink-dim">{personaName(task.id)}</span>
               <StatusBadge status={task.status} />
@@ -93,7 +93,7 @@ export function TaskDetail({
             <Section title="Report">
               <div
                 className="rounded-xl px-4 py-3.5 border border-border-soft"
-                style={{ background: "rgba(0,0,0,0.25)" }}
+                style={{ background: "var(--input-bg)" }}
               >
                 <div className="prose-report" style={{ fontSize: 13 }}>
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>{task.report}</ReactMarkdown>
@@ -106,7 +106,7 @@ export function TaskDetail({
             <Section title="Verifier feedback">
               <div
                 className="text-xs leading-relaxed whitespace-pre-wrap rounded-xl p-3.5 text-ink-dim"
-                style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.16)" }}
+                style={{ background: "rgb(var(--hi) / 0.03)", border: "1px solid rgb(var(--hi) / 0.16)" }}
               >
                 {task.feedback}
               </div>
@@ -117,7 +117,7 @@ export function TaskDetail({
             <Section title="Error">
               <div
                 className="text-xs leading-relaxed whitespace-pre-wrap rounded-xl p-3.5 text-ink"
-                style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.22)" }}
+                style={{ background: "rgb(var(--hi) / 0.05)", border: "1px solid rgb(var(--hi) / 0.22)" }}
               >
                 {task.error}
               </div>

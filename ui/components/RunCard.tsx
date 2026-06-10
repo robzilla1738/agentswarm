@@ -61,7 +61,7 @@ export function RunCard({ run, now, onDeleted }: { run: RunSummary; now: number;
               padding: "3px 8px",
               fontSize: 11,
               color: confirming ? "var(--color-ink)" : "var(--color-ink-faint)",
-              borderColor: confirming ? "rgba(255,255,255,0.5)" : "var(--color-border-soft)",
+              borderColor: confirming ? "rgb(var(--hi) / 0.5)" : "var(--color-border-soft)",
             }}
           >
             {confirming ? "delete?" : "✕"}
@@ -81,10 +81,10 @@ export function RunCard({ run, now, onDeleted }: { run: RunSummary; now: number;
           </span>
           <span className="mono">{pct}%</span>
         </div>
-        <div className="w-full rounded-full overflow-hidden" style={{ height: 4, background: "rgba(255,255,255,0.07)" }}>
+        <div className="w-full rounded-full overflow-hidden" style={{ height: 4, background: "rgb(var(--hi) / 0.07)" }}>
           <div
             className="h-full rounded-full transition-all duration-500"
-            style={{ width: `${pct}%`, background: failed ? "rgba(255,255,255,0.45)" : "var(--color-ink)" }}
+            style={{ width: `${pct}%`, background: failed ? "rgb(var(--hi) / 0.45)" : "var(--color-ink)" }}
           />
         </div>
       </div>
