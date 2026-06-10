@@ -24,9 +24,9 @@ You give it a mission. A conductor model breaks the mission into tasks and hands
 ## What it does
 
 - Independent tasks run at the same time, up to a parallelism cap you set. Dependent tasks start the moment their inputs are ready.
-- Runs are built to go long. Each agent compacts its own context when it grows too big, a run-wide token budget is enforced mid-task (agents wrap up and report when it's hit), failed verifications retry with feedback, and every event lands in an append-only journal that survives crashes.
+- Runs are built to go long. Each agent compacts its own context when it grows too big, and the conductor's history is bounded the same way. A run-wide token budget is enforced mid-task; when it's hit, agents wrap up and report instead of dying mid-thought. Failed verifications retry with feedback. Every event lands in an append-only journal that survives crashes.
 - Interrupted runs resume. `swarm resume <id>`, or a button in the UI, keeps completed work, re-runs whatever was in flight, and carries the token spend over.
-- Shell commands execute in a real sandbox when one is available: E2B, Modal, or Vercel if you've added keys, otherwise a local Docker/OrbStack container, otherwise a confined workspace on the host. `swarm sandbox test` boots whichever is active and tells you whether it works.
+- Runs execute in an isolated per-run workspace on your machine by default. Nothing extra to install, no daemon to start. Want stronger isolation? Run in a Docker container or an E2B/Modal/Vercel cloud sandbox, per run (`--sandbox docker`) or as your default (`swarm config set sandboxRuntime auto` picks the strongest one you've configured). `swarm sandbox test` boots whichever is active and tells you whether it works.
 - Tasks flagged `verify` get a second agent whose whole job is to prove the first one wrong. Failures bounce back for a retry with the verifier's feedback attached.
 - You can steer a live run. `swarm note <id> "skip the pricing section"` and the conductor re-plans on its next tick.
 - Workers get real tools: shell, file read/write/patch, web search and fetch, the blackboard, and an artifacts folder that lands on your disk. Search uses [SearchKit](https://github.com/robzilla1738/script-search) if it's installed (local, returns quotable passages; agents can pass `deep=true` when they need grounded sources), TinyFish if you have a key, DuckDuckGo otherwise.
@@ -39,13 +39,11 @@ Requires Node 20 or newer.
 
 ```bash
 cd agentswarm
-npm install          # engine deps
-npm run build        # compile the TypeScript engine → dist/
-cd ui && npm install && npm run build && cd ..   # build the web UI → ui/out/
+npm run setup        # installs deps + builds the engine and the web UI
 npm link             # optional: puts `swarm` on your PATH
 ```
 
-Without `npm link`, replace `swarm` below with `node bin/swarm.js`.
+Without `npm link`, replace `swarm` below with `node bin/swarm.js`. (`npm install` alone also builds the engine; `npm run setup` additionally builds the web UI.)
 
 ## First run
 
@@ -70,16 +68,16 @@ swarm run "Research the best open-source vector DBs in 2026 and write a recommen
 | `swarm serve [--port 7777] [--open]` | Start the web UI + REST API. |
 | `swarm watch <id>` | Re-attach a live dashboard to any run. |
 | `swarm resume <id>` | Resume an interrupted run. Done tasks keep their results, in-flight tasks re-run. |
-| `swarm sandbox [test\|<runtime>]` | Show the resolved sandbox runtime, or boot and smoke-test one (docker, e2b, modal, vercel). |
+| `swarm sandbox [test\|<runtime>]` | Show the resolved shell runtime, or boot and smoke-test one (host, docker, e2b, modal, vercel). |
 | `swarm ls` | List runs (status, tasks, tokens, cost). |
 | `swarm report <id> [--open]` | Print or open a run's final report. |
 | `swarm note <id> "<text>"` | Steer a live run. The conductor reads it. |
 | `swarm cancel <id>` | Stop a run. It still synthesizes a report from completed work. |
 | `swarm config [list\|get\|set …]` | Manage `~/.agentswarm/config.json`. |
 | `swarm models` | List models from the active provider. |
-| `swarm demo` | Run a self-contained demo mission in a sandbox. |
+| `swarm demo` | Run a self-contained demo mission in an isolated workspace. |
 
-Run options (also on the UI launch form under Options): `--workers N` (parallelism), `--tasks N`, `--steps N` (tool steps per task), `--budget N` (token cap), `--model`, `--conductor`, `--verify off|normal|strict`, `--effort low|medium|high|max`, `--no-thinking`, `--cwd <path>` (run against a real directory instead of a sandbox), `--fg` (foreground in this process).
+Run options (also on the UI launch form under Options): `--workers N` (parallelism), `--tasks N`, `--steps N` (tool steps per task), `--budget N` (token cap), `--model`, `--conductor`, `--verify off|normal|strict`, `--effort low|medium|high|max`, `--no-thinking`, `--sandbox host|docker|e2b|modal|vercel|auto` (shell runtime for this run), `--cwd <path>` (run against a real directory instead of an isolated workspace), `--fg` (foreground in this process).
 
 ## How it works
 
@@ -121,12 +119,13 @@ test/           end-to-end test with a scripted mock model (no API key needed)
 node test/e2e.js
 ```
 
-Boots a mock model server and drives full missions through the real engine, offline. Covers parallel execution, dependency ordering, real tool calls, verification, cost tracking, report synthesis, loud failure on bad keys, resume after an interrupt, and (when a docker daemon is reachable) a run inside a container.
+Boots a mock model server and drives real missions through the engine, offline, no API key needed. The happy path covers parallel execution, dependency order, tool calls, verification, and synthesis. The rest covers what goes wrong: bad keys fail loudly instead of producing a phantom run, interrupted runs resume without losing work, a tiny token budget still ends with a report, a failed verification retries with feedback and then passes, a live run can be steered with a note and cancelled, and agents compact their context when it grows too big. There's also a hub API phase and, when a docker daemon is reachable, a full run inside a container.
 
 ## Safety notes
 
 - Safe mode is on by default. It blocks obviously destructive shell commands and confines writes to the working directory. `--no-safe` turns it off for a run; only do that when you trust the mission.
-- UI-launched runs are sandboxed by default. Use `--cwd <path>` (or Workspace → "A directory on disk" in the UI) to let agents touch a real project.
+- Runs default to an isolated per-run workspace on this machine. That's a private directory, not a container. Agents still execute with your user's permissions; the engine strips API keys and sandbox credentials from their environment, and safe mode constrains commands and writes. For untrusted or risky missions, use `--sandbox docker` or a cloud runtime.
+- Use `--cwd <path>` (or Workspace → "A directory on disk" in the UI) to let agents touch a real project. Those runs always execute on the host, since touching your real files is the point.
 - Costs are estimates based on list prices and the token counts the API reports. Models without pricing data show $0. Set a `--budget` either way.
 - Keys are stored in `~/.agentswarm/config.json` (chmod 600) and are only sent to the APIs you configured.
 

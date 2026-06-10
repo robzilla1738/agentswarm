@@ -180,9 +180,13 @@ export class RunState {
           key: ev.key as string | undefined,
           text: ev.text as string,
         });
+        // Reduced state is held live by the hub and the resume seed — keep
+        // only the tail that digests/views actually use.
+        if (this.notes.length > 1000) this.notes.splice(0, this.notes.length - 1000);
         break;
       case "conductor.say":
         this.conductorLog.push({ t: ev.t, text: ev.text as string });
+        if (this.conductorLog.length > 300) this.conductorLog.splice(0, this.conductorLog.length - 300);
         break;
       case "operator.note":
         this.operatorNotes.push({ t: ev.t, text: ev.text as string, consumed: false });

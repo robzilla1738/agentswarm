@@ -11,23 +11,33 @@ export function ReportPanel({ id, hasFinal, live }: { id: string; hasFinal: bool
   const [report, setReport] = useState<string | null>(null);
   const [artifacts, setArtifacts] = useState<{ name: string; size: number }[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [retryNonce, setRetryNonce] = useState(0);
 
   useEffect(() => {
     let alive = true;
     setLoading(true);
+    setError(null);
     Promise.all([
-      fetch(api.reportUrl(id)).then((r) => (r.ok ? r.text() : null)).catch(() => null),
-      api.artifacts(id).then((a) => a.artifacts).catch(() => [] as { name: string; size: number }[]),
-    ]).then(([rep, arts]) => {
-      if (!alive) return;
-      setReport(rep);
-      setArtifacts(arts);
-      setLoading(false);
-    });
+      // 404 = no report (yet) — an expected state, not an error.
+      fetch(api.reportUrl(id)).then((r) => (r.ok ? r.text() : r.status === 404 ? null : Promise.reject(new Error(`HTTP ${r.status}`)))),
+      api.artifacts(id).then((a) => a.artifacts),
+    ])
+      .then(([rep, arts]) => {
+        if (!alive) return;
+        setReport(rep);
+        setArtifacts(arts);
+        setLoading(false);
+      })
+      .catch((e) => {
+        if (!alive) return;
+        setError(e?.message || "request failed");
+        setLoading(false);
+      });
     return () => {
       alive = false;
     };
-  }, [id, hasFinal]);
+  }, [id, hasFinal, retryNonce]);
 
   const download = () => {
     if (!report) return;
@@ -44,6 +54,21 @@ export function ReportPanel({ id, hasFinal, live }: { id: string; hasFinal: bool
     return (
       <div className="panel p-10 flex items-center justify-center gap-3 text-ink-faint">
         <Spinner /> loading report…
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="panel">
+        <EmptyState
+          glyph="⚠"
+          title="Couldn't load the report"
+          sub={`The hub didn't answer (${error}). Check that swarm serve is still running, then retry.`}
+        />
+        <div className="flex justify-center pb-8 -mt-2">
+          <button className="btn btn-sm" onClick={() => setRetryNonce((n) => n + 1)}>Retry</button>
+        </div>
       </div>
     );
   }

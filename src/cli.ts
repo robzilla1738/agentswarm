@@ -30,6 +30,7 @@ import {
   writePid,
 } from "./run";
 import { Executor } from "./executor";
+import { SANDBOX_KINDS, SandboxKind, dockerAvailable, resolveSandboxKind, testSandbox } from "./sandbox";
 import { TerminalRenderer, watchRun } from "./terminal";
 import { RunMeta, RunOptions } from "./types";
 import { ansi, errMsg, fmtMoney, fmtTokens } from "./util";
@@ -41,6 +42,10 @@ interface Args {
   flags: Record<string, string | boolean>;
 }
 
+/** Flags that never take a value — they must not swallow the next positional
+ *  (`swarm run --fg "mission"` would otherwise eat the mission). */
+const BOOL_FLAGS = new Set(["fg", "open", "resume"]);
+
 function parseArgs(argv: string[]): Args {
   const _: string[] = [];
   const flags: Record<string, string | boolean> = {};
@@ -51,7 +56,7 @@ function parseArgs(argv: string[]): Args {
       const next = argv[i + 1];
       if (key.startsWith("no-")) {
         flags[key.slice(3)] = false;
-      } else if (next !== undefined && !next.startsWith("--")) {
+      } else if (!BOOL_FLAGS.has(key) && next !== undefined && !next.startsWith("--")) {
         flags[key] = next;
         i++;
       } else {
@@ -130,7 +135,7 @@ export async function main(): Promise<void> {
 
 // ---------------------------------------------------------------- run
 
-function optionOverrides(flags: Args["flags"]): Partial<RunOptions> {
+function optionOverrides(flags: Args["flags"], cfg: SwarmConfig): Partial<RunOptions> {
   const o: Partial<RunOptions> = {};
   if (flags.workers) o.maxWorkers = Number(flags.workers);
   if (flags.steps) o.maxStepsPerTask = Number(flags.steps);
@@ -142,10 +147,20 @@ function optionOverrides(flags: Args["flags"]): Partial<RunOptions> {
     o.verification = flags.verify as RunOptions["verification"];
   }
   if (flags.thinking === false) o.thinking = false;
-  if (typeof flags.effort === "string" && ["high", "max"].includes(flags.effort)) {
+  if (typeof flags.effort === "string") {
+    if (!["low", "medium", "high", "max"].includes(flags.effort)) {
+      throw new Error("--effort must be one of: low | medium | high | max");
+    }
     o.reasoningEffort = flags.effort as RunOptions["reasoningEffort"];
   }
   if (flags.safe === false) o.safeMode = false;
+  if (typeof flags.sandbox === "string") {
+    const v = flags.sandbox;
+    if (v !== "auto" && !SANDBOX_KINDS.includes(v as SandboxKind)) {
+      throw new Error(`--sandbox must be one of: ${SANDBOX_KINDS.join(" | ")} | auto`);
+    }
+    o.sandboxRuntime = v === "auto" ? resolveSandboxKind({ ...cfg, sandboxRuntime: "auto" }) : (v as SandboxKind);
+  }
   return o;
 }
 
@@ -155,6 +170,8 @@ async function cmdRun(mission: string, flags: Args["flags"]): Promise<void> {
     process.exit(1);
   }
   const cfg = loadConfig();
+  // Validate flags before any network round-trip so typos fail instantly.
+  const overrides = optionOverrides(flags, cfg);
   if (!cfg.apiKey && PROVIDERS[cfg.provider].keyRequired) {
     console.error(ansi.red(`No ${PROVIDERS[cfg.provider].label} API key set. `) + "Run: swarm config set apiKey <...>");
     process.exit(1);
@@ -168,12 +185,15 @@ async function cmdRun(mission: string, flags: Args["flags"]): Promise<void> {
   }
   process.stdout.write(auth.status === "ok" ? ansi.green("ok\n") : ansi.gray("skipped\n"));
   const sandbox = flags.sandbox !== false && !flags.cwd;
+  if (typeof flags.sandbox === "string" && flags.cwd) {
+    console.log(ansi.yellow("note: ") + "--cwd runs execute directly on the host — --sandbox is ignored");
+  }
   const cwd = typeof flags.cwd === "string" ? flags.cwd : process.cwd();
   const meta = createRun({
     mission: mission.trim(),
     cwd,
     sandbox,
-    options: optionsFromConfig(cfg, optionOverrides(flags)),
+    options: optionsFromConfig(cfg, overrides),
   });
 
   if (flags.fg) {
@@ -208,11 +228,14 @@ async function cmdRun(mission: string, flags: Args["flags"]): Promise<void> {
 
 /** `swarm sandbox [test]` — show the resolved runtime; boot + echo + teardown. */
 async function cmdSandbox(sub?: string): Promise<void> {
-  const { SANDBOX_KINDS, dockerAvailable, resolveSandboxKind, testSandbox } = await import("./sandbox");
   const cfg = loadConfig();
   const resolved = resolveSandboxKind(cfg);
   console.log(`configured: ${cfg.sandboxRuntime} → resolved: ${ansi.bold(resolved)}`);
   console.log(ansi.gray(`docker daemon: ${dockerAvailable() ? "up" : "not reachable"} · e2b key: ${cfg.e2bApiKey ? "set" : "—"} · modal: ${cfg.modalTokenId ? "set" : "—"} · vercel: ${cfg.vercelToken ? "set" : "—"}`));
+  if (resolved === "host") {
+    console.log(ansi.gray("host = the run's isolated workspace on this machine (the default; nothing to install)."));
+    console.log(ansi.gray("for container/cloud isolation: swarm config set sandboxRuntime docker|e2b|modal|vercel|auto"));
+  }
   if (sub === "test" || (sub && SANDBOX_KINDS.includes(sub as never))) {
     const kind = SANDBOX_KINDS.includes(sub as never) ? (sub as (typeof SANDBOX_KINDS)[number]) : resolved;
     process.stdout.write(`testing ${kind}… `);
@@ -367,17 +390,21 @@ async function watchRunUntilSignal(
 
 async function cmdServe(flags: Args["flags"]): Promise<void> {
   const cfg = loadConfig();
-  const port = Number(flags.port) || cfg.hubPort;
+  const port = Number(flags.port) || (flags.port === "0" ? 0 : cfg.hubPort);
   const uiDir = findUiDir();
   const server = startHub({ port, uiDir, binPath: BIN_PATH });
-  const url = `http://localhost:${port}`;
-  console.log(`${ansi.cyan("🐝 agentswarm hub")} ${ansi.gray("·")} ${ansi.bold(url)}`);
-  console.log(ansi.gray(`   api:      ${url}/api`));
-  console.log(ansi.gray(`   ui:       ${uiDir ? "built ✓ (served here)" : "not built — run: cd ui && npm install && npm run build"}`));
-  console.log(ansi.gray(`   api key:  ${cfg.apiKey ? maskKey(cfg.apiKey) + " ✓" : ansi.red("not set — open Settings or: swarm config set apiKey <sk-...>")}`));
-  console.log(ansi.gray("   Ctrl-C to stop the hub (background runs keep going).\n"));
-
-  if (flags.open) openBrowser(url);
+  // Report the port actually bound (matters for --port 0 / collisions).
+  server.on("listening", () => {
+    const addr = server.address();
+    const bound = typeof addr === "object" && addr ? addr.port : port;
+    const url = `http://localhost:${bound}`;
+    console.log(`${ansi.cyan("🐝 agentswarm hub")} ${ansi.gray("·")} ${ansi.bold(url)}`);
+    console.log(ansi.gray(`   api:      ${url}/api`));
+    console.log(ansi.gray(`   ui:       ${uiDir ? "built ✓ (served here)" : "not built — run: npm run setup   (or: npm run build:ui)"}`));
+    console.log(ansi.gray(`   api key:  ${cfg.apiKey ? maskKey(cfg.apiKey) + " ✓" : ansi.red("not set — open Settings or: swarm config set apiKey <sk-...>")}`));
+    console.log(ansi.gray("   Ctrl-C to stop the hub (background runs keep going).\n"));
+    if (flags.open) openBrowser(url);
+  });
   server.on("error", (e) => {
     console.error(ansi.red(`hub failed: ${errMsg(e)}`));
     process.exit(1);
@@ -554,9 +581,9 @@ async function cmdDemo(flags: Args["flags"]): Promise<void> {
     mission,
     cwd: process.cwd(),
     sandbox: true,
-    options: optionsFromConfig(cfg, { maxWorkers: 4, maxTasks: 12, ...optionOverrides(flags) }),
+    options: optionsFromConfig(cfg, { maxWorkers: 4, maxTasks: 12, ...optionOverrides(flags, cfg) }),
   });
-  console.log(ansi.cyan("running demo mission in a sandbox…\n"));
+  console.log(ansi.cyan("running demo mission in an isolated workspace…\n"));
   await execForeground(cfg, meta, true);
 }
 
@@ -607,7 +634,7 @@ ${b("USAGE")}
   swarm note <id> "<text>"            steer a live run (the conductor reads it)
   swarm cancel <id>                   stop a run gracefully (still synthesizes)
   swarm config [list|get|set ...]     manage config (~/.agentswarm/config.json)
-  swarm sandbox [test|<runtime>]      show / smoke-test the sandbox runtime (docker, e2b, modal, vercel)
+  swarm sandbox [test|<runtime>]      show / smoke-test the shell runtime (host, docker, e2b, modal, vercel)
   swarm models                        list models from the active provider
   swarm demo                          run a self-contained demo mission
 
@@ -622,13 +649,15 @@ ${b("RUN OPTIONS")}
   --effort low|medium|high|max  reasoning effort (default ${loadConfig().reasoningEffort})
   --no-thinking      disable thinking mode
   --no-safe          disable command/path safety guards (careful)
-  --cwd <path>       run against a real directory (default: isolated sandbox)
+  --sandbox X        shell runtime for this run: host | docker | e2b | modal | vercel | auto
+                     (default ${loadConfig().sandboxRuntime}; host = isolated workspace, no install needed)
+  --cwd <path>       run against a real directory (default: isolated workspace)
   --fg               run in the foreground in this process (Ctrl-C cancels)
 
 ${b("FIRST RUN")}
   swarm config set apiKey <key>             # key for the active provider (default: DeepSeek)
   swarm config set provider <id>            # deepseek | openai | anthropic | xai | minimax | openrouter | ollama | lmstudio | custom
-  pip install searchkit                     # optional: best-in-class local web search for agents
+  pip install searchkit                     # optional: local, citable web search for agents
   swarm serve --open                        # open the web UI
 `);
 }

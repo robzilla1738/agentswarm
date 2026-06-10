@@ -51,6 +51,18 @@ function events(runDir) {
   return fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
 }
 
+/** Poll until fn() resolves truthy (fn may throw/reject while files appear). */
+async function waitFor(fn, timeoutMs, label) {
+  const t0 = Date.now();
+  for (;;) {
+    let v = null;
+    try { v = await fn(); } catch { /* not ready */ }
+    if (v) return v;
+    if (Date.now() - t0 > timeoutMs) fail(`timeout waiting for ${label}`);
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
 async function phaseHappy() {
   console.log("\n▶ Phase 1: happy path");
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
@@ -271,12 +283,222 @@ async function phaseDocker() {
   fs.rmSync(home, { recursive: true, force: true });
 }
 
+async function phaseBudget() {
+  console.log("\n▶ Phase 5: token budget exhaustion ends the run gracefully");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({});
+  ok(`mock model server on :${port}`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  // Every mock call charges 920 tokens, so a 2000-token budget trips after the
+  // first wave reports — before the dependent T3 can ever start.
+  const res = spawnSync(process.execPath, [SWARM, "run", "Test: scout A and B then synthesize", "--workers", "3", "--budget", "2000"], {
+    env, encoding: "utf8", timeout: 60000,
+  });
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); proc.kill(); fail(`swarm run exited ${res.status}`); }
+  ok("swarm run completed despite the tiny budget");
+
+  const ids = fs.readdirSync(path.join(home, "runs")).filter((d) => d.startsWith("run_"));
+  const runDir = path.join(home, "runs", ids[0]);
+  const evs = events(runDir);
+  const byType = (t) => evs.filter((e) => e.type === t);
+
+  const last = byType("run.status").pop();
+  if (last.status !== "done" || !/token budget/i.test(String(last.reason || ""))) {
+    fail(`expected done + 'token budget' reason, got ${last.status} / ${last.reason}`);
+  }
+  ok("run ended done with a 'token budget reached' reason");
+
+  if (byType("task.status").some((e) => e.taskId === "T3" && e.status === "running")) {
+    fail("T3 must never start once the budget is exhausted");
+  }
+  ok("dependent task T3 was never started after the budget tripped");
+
+  const reportFile = path.join(runDir, "artifacts", "final-report.md");
+  if (!fs.existsSync(reportFile)) fail("budget-capped run must still synthesize a report");
+  ok("final report was still synthesized");
+
+  proc.kill();
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+async function phaseVerifyRetry() {
+  console.log("\n▶ Phase 6: failed verification retries with feedback, then passes");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "verify-retry" });
+  ok(`mock (verify-retry script) on :${port}`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const res = spawnSync(process.execPath, [SWARM, "run", "Test: one verified task", "--workers", "2"], {
+    env, encoding: "utf8", timeout: 60000,
+  });
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); proc.kill(); fail(`swarm run exited ${res.status}`); }
+
+  const ids = fs.readdirSync(path.join(home, "runs")).filter((d) => d.startsWith("run_"));
+  const evs = events(path.join(home, "runs", ids[0]));
+  const byType = (t) => evs.filter((e) => e.type === t);
+
+  const verdicts = byType("verify.result").filter((e) => e.taskId === "T1").map((e) => e.pass);
+  if (JSON.stringify(verdicts) !== JSON.stringify([false, true])) {
+    fail(`expected verdicts [false, true] for T1, got ${JSON.stringify(verdicts)}`);
+  }
+  ok("verifier failed attempt 1 and passed attempt 2");
+
+  if (!byType("task.status").some((e) => e.taskId === "T1" && e.status === "running" && e.attempt === 2)) {
+    fail("T1 should have re-run as attempt 2 after the failed verdict");
+  }
+  ok("task re-ran with attempt=2 carrying the verifier's feedback");
+
+  if (!byType("task.status").some((e) => e.taskId === "T1" && e.status === "done")) fail("T1 should end done");
+  if (byType("run.status").pop().status !== "done") fail("run should end done");
+  ok("run finished with status=done");
+
+  proc.kill();
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+async function phaseNoteCancel() {
+  console.log("\n▶ Phase 7: steer a live run with a note, then cancel it");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "note-cancel" });
+  ok(`mock (note-cancel script) on :${port}`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const idOut = spawnSync(process.execPath, ["-e",
+    `const {createRun,optionsFromConfig}=require(${JSON.stringify(path.join(ROOT, "dist", "run.js"))});` +
+    `const {loadConfig}=require(${JSON.stringify(path.join(ROOT, "dist", "config.js"))});` +
+    `const cfg=loadConfig();const m=createRun({mission:"steer then cancel",cwd:process.cwd(),sandbox:true,options:optionsFromConfig(cfg)});console.log(m.id)`,
+  ], { env, encoding: "utf8" });
+  const id = (idOut.stdout || "").trim();
+  if (!id.startsWith("run_")) { console.error(idOut.stderr); proc.kill(); fail("could not create run"); }
+  const runDir = path.join(home, "runs", id);
+
+  const engine = spawn(process.execPath, [SWARM, "_exec", id], { env, stdio: ["ignore", "ignore", "inherit"] });
+  try {
+    await waitFor(() => events(runDir).some((e) => e.type === "task.status" && e.status === "running"), 20000, "a task to start");
+    ok("run is live with tasks in flight");
+
+    const note = spawnSync(process.execPath, [SWARM, "note", id, "prioritize the quick probe"], { env, encoding: "utf8", timeout: 15000 });
+    if (note.status !== 0) fail(`swarm note exited ${note.status}: ${note.stderr}`);
+    await waitFor(() => events(runDir).some((e) => e.type === "operator.note" && /quick probe/.test(String(e.text || ""))), 10000, "operator.note in the journal");
+    ok("note reached the journal while agents were mid-task");
+
+    await waitFor(() => events(runDir).some((e) => e.type === "operator.note.consumed"), 20000, "the conductor to consume the note");
+    ok("conductor consumed the note on its next decision");
+
+    const cancel = spawnSync(process.execPath, [SWARM, "cancel", id], { env, encoding: "utf8", timeout: 15000 });
+    if (cancel.status !== 0) fail(`swarm cancel exited ${cancel.status}: ${cancel.stderr}`);
+    const last = await waitFor(() => {
+      const s = events(runDir).filter((e) => e.type === "run.status").pop();
+      return s && ["done", "failed", "cancelled"].includes(s.status) ? s : null;
+    }, 30000, "a terminal run status after cancel");
+    if (last.status !== "cancelled") fail(`expected status=cancelled, got ${last.status}`);
+    ok("run ended with status=cancelled");
+
+    if (!fs.existsSync(path.join(runDir, "artifacts", "final-report.md"))) {
+      fail("cancelled run should still synthesize a report from completed work");
+    }
+    ok("cancelled run still produced a final report");
+  } finally {
+    engine.kill("SIGKILL");
+    proc.kill();
+  }
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+async function phaseCompaction() {
+  console.log("\n▶ Phase 8: agent context compaction on a long task");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "compact" });
+  ok(`mock (compact script) on :${port}`);
+  // Small limit so ~15KB tool results trip compaction within a few steps.
+  writeConfig(home, port, { contextTokenLimit: 8000 });
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const res = spawnSync(process.execPath, [SWARM, "run", "Test: bulk reads force compaction", "--workers", "1"], {
+    env, encoding: "utf8", timeout: 90000,
+  });
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); proc.kill(); fail(`swarm run exited ${res.status}`); }
+
+  const ids = fs.readdirSync(path.join(home, "runs")).filter((d) => d.startsWith("run_"));
+  const evs = events(path.join(home, "runs", ids[0]));
+  const byType = (t) => evs.filter((e) => e.type === t);
+
+  if (!byType("log").some((e) => /context compacted/.test(String(e.msg || "")))) {
+    fail("expected a 'context compacted' log event");
+  }
+  ok("agent compacted its context mid-task");
+
+  if (!byType("task.status").some((e) => e.taskId === "T1" && e.status === "done")) fail("T1 should still finish after compaction");
+  if (byType("run.status").pop().status !== "done") fail("run should end done");
+  ok("task completed and run finished after compaction");
+
+  proc.kill();
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+async function phaseHubSmoke() {
+  console.log("\n▶ Phase 9: hub REST surface (serve, launch, stream to done, report)");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({});
+  ok(`mock model server on :${port}`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const hub = spawn(process.execPath, [SWARM, "serve", "--port", "0"], { env, stdio: ["ignore", "pipe", "inherit"] });
+  let hubOut = "";
+  hub.stdout.on("data", (b) => (hubOut += b.toString()));
+  try {
+    const base = await waitFor(() => (/(http:\/\/localhost:\d+)/.exec(hubOut) || [])[1], 15000, "hub to print its URL");
+    ok(`hub bound a real port: ${base}`);
+
+    const health = await (await fetch(`${base}/api/health`)).json();
+    if (!health.ok) fail("health endpoint should report ok");
+    const config = await (await fetch(`${base}/api/config`)).json();
+    if (config.sandboxRuntime !== "host") fail(`default sandboxRuntime should be host, got ${config.sandboxRuntime}`);
+    ok("health + config endpoints answer (sandboxRuntime defaults to host)");
+
+    const launch = await (await fetch(`${base}/api/runs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mission: "Test: scout A and B then synthesize" }),
+    })).json();
+    if (!launch.id) fail(`hub launch failed: ${JSON.stringify(launch)}`);
+    ok(`hub launched a detached run: ${launch.id}`);
+
+    const snap = await waitFor(async () => {
+      const s = await (await fetch(`${base}/api/runs/${launch.id}`)).json();
+      return ["done", "failed", "cancelled"].includes(s.status) ? s : null;
+    }, 60000, "hub-launched run to finish");
+    if (snap.status !== "done") fail(`hub-launched run ended ${snap.status}: ${snap.statusReason || ""}`);
+    ok("hub-launched run finished with status=done");
+
+    const report = await (await fetch(`${base}/api/runs/${launch.id}/report`)).text();
+    if (!/Mission Report/.test(report)) fail("report endpoint should serve the final report");
+    ok("report endpoint serves the synthesized report");
+  } finally {
+    hub.kill("SIGKILL");
+    proc.kill();
+  }
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
 async function main() {
   await phaseHappy();
   await phaseAuthFail();
   await phaseResume();
   await phaseDocker();
-  console.log("\n✅ E2E passed — full pipeline works, bad keys fail loudly, and interrupted runs resume without losing work.");
+  await phaseBudget();
+  await phaseVerifyRetry();
+  await phaseNoteCancel();
+  await phaseCompaction();
+  await phaseHubSmoke();
+  console.log(
+    "\n✅ E2E passed — pipeline, auth failure, resume, budget cap, verify-retry, live steering + cancel, context compaction, and the hub REST surface all work."
+  );
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });

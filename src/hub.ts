@@ -501,9 +501,9 @@ function fallbackPage(): string {
 </head><body>
 <h1>agentswarm hub is running</h1>
 <p>The API is live, but the web UI hasn't been built yet.</p>
-<p>Build it once:</p>
-<p><code>cd ui &amp;&amp; npm install &amp;&amp; npm run build</code></p>
-<p>…then reload this page. Or run the UI in dev mode against this hub:</p>
+<p>Build it once (from the repo root):</p>
+<p><code>npm run setup</code></p>
+<p>…then restart <code>swarm serve</code> and reload this page. (Engine already built? <code>npm run build:ui</code> is enough.) Or run the UI in dev mode against this hub:</p>
 <p><code>npm run dev:ui</code> → open <a href="http://localhost:7780">http://localhost:7780</a></p>
 <p>The REST API is available under <code>/api/*</code>.</p>
 </body></html>`;

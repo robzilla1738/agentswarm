@@ -10,6 +10,9 @@ const http = require("http");
 
 const PORT = Number(process.argv[2]) || 0;
 const AUTH_INVALID = process.env.MOCK_AUTH === "invalid";
+// Alternate scripts: default | verify-retry | note-cancel | compact
+const SCENARIO = process.env.MOCK_SCENARIO || "default";
+let verdictCalls = 0;
 
 function unauthorized(res) {
   res.writeHead(401, { "content-type": "application/json" });
@@ -78,7 +81,35 @@ const server = http.createServer((req, res) => {
 
     // Conductor
     if (names.has("spawn_tasks")) {
-      if (lastUser(messages).includes("No tasks exist yet")) {
+      const update = lastUser(messages);
+      if (update.includes("No tasks exist yet")) {
+        if (SCENARIO === "verify-retry") {
+          return sse(res, [
+            textChunk("Spawning one verified task."),
+            ...toolChunks("spawn_tasks", {
+              tasks: [{ title: "Build summary", objective: "Summarize the topic. Done when written.", role: "writer", verify: true }],
+            }),
+          ]);
+        }
+        if (SCENARIO === "note-cancel") {
+          return sse(res, [
+            textChunk("Spawning two probes."),
+            ...toolChunks("spawn_tasks", {
+              tasks: [
+                { title: "Quick probe", objective: "QUICKTASK: probe fast. Done when output captured.", role: "researcher" },
+                { title: "Slow probe", objective: "SLOWTASK: probe slowly. Done when output captured.", role: "researcher" },
+              ],
+            }),
+          ]);
+        }
+        if (SCENARIO === "compact") {
+          return sse(res, [
+            textChunk("Spawning one data-heavy task."),
+            ...toolChunks("spawn_tasks", {
+              tasks: [{ title: "Bulk reader", objective: "Read large outputs repeatedly. Done when reported.", role: "researcher" }],
+            }),
+          ]);
+        }
         return sse(res, [
           thinkChunk("Decompose into two scouts and a synthesis step."),
           textChunk("Spawning the first wave."),
@@ -91,17 +122,25 @@ const server = http.createServer((req, res) => {
           }),
         ]);
       }
-      // Finish only once the final dependent task (T3) is done; otherwise wait
-      // so the swarm runs the full wave-2 synthesis task.
-      if (/T3 \[done/.test(lastUser(messages))) {
+      // note-cancel: never finish — the operator's cancel is the only exit.
+      if (SCENARIO === "note-cancel") {
+        return sse(res, [...toolChunks("wait", { reason: "monitoring the probes" })]);
+      }
+      // Single-task scenarios finish once T1 is done.
+      if ((SCENARIO === "verify-retry" || SCENARIO === "compact") && /T1 \[done/.test(update)) {
+        return sse(res, [...toolChunks("finish", { notes: "Task complete." })]);
+      }
+      // Default: finish only once the final dependent task (T3) is done;
+      // otherwise wait so the swarm runs the full wave-2 synthesis task.
+      if (SCENARIO === "default" && /T3 \[done/.test(update)) {
         return sse(res, [
           thinkChunk("All reports are in and look complete."),
           ...toolChunks("finish", { notes: "Combine the two scouts' findings; highlight the synthesis." }),
         ]);
       }
       return sse(res, [
-        thinkChunk("Wave 1 is reporting; the synthesis task still needs to run."),
-        ...toolChunks("wait", { reason: "waiting on the dependent synthesis task" }),
+        thinkChunk("Work is still in flight."),
+        ...toolChunks("wait", { reason: "waiting on running tasks" }),
       ]);
     }
 
@@ -118,6 +157,13 @@ const server = http.createServer((req, res) => {
 
     // Verifier
     if (names.has("verdict")) {
+      verdictCalls++;
+      if (SCENARIO === "verify-retry" && verdictCalls === 1) {
+        return sse(res, [
+          thinkChunk("The report is missing required evidence."),
+          ...toolChunks("verdict", { pass: false, feedback: "Missing a Sources section — add it and report again." }),
+        ]);
+      }
       return sse(res, [
         thinkChunk("Checking the claim against the report."),
         ...toolChunks("verdict", { pass: true, feedback: "Report matches the objective; evidence checks out." }),
@@ -126,6 +172,26 @@ const server = http.createServer((req, res) => {
 
     // Worker: run one real shell tool, then report on the next turn.
     if (names.has("report")) {
+      const system = String((messages[0] && messages[0].content) || "");
+      if (SCENARIO === "note-cancel" && !hasToolResult(messages)) {
+        // Long-running shells give the operator time to steer and cancel.
+        const secs = /SLOWTASK/.test(system) ? 15 : 2;
+        return sse(res, [...toolChunks("shell", { command: `sleep ${secs} && echo probe-ok` })]);
+      }
+      if (SCENARIO === "compact") {
+        const compacted = messages.some(
+          (m) => typeof m.content === "string" && m.content.includes("Context was compacted")
+        );
+        const toolResults = messages.filter((m) => m.role === "tool").length;
+        if (!compacted && toolResults < 8) {
+          // ~15KB per result inflates the context until compaction triggers.
+          return sse(res, [...toolChunks("shell", { command: "head -c 15000 /dev/zero | tr '\\0' x" })]);
+        }
+        return sse(res, [
+          textChunk("Done."),
+          ...toolChunks("report", { status: "done", report: "Read bulk outputs; context stayed manageable.", artifacts: [] }),
+        ]);
+      }
       if (hasToolResult(messages)) {
         return sse(res, [
           textChunk("Done."),

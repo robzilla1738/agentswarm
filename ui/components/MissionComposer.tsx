@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { api, PublicConfig } from "@/lib/api";
@@ -229,7 +230,7 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
                 value={workspace}
                 onChange={(e) => { markTouched(); setWorkspace(e.target.value as "sandbox" | "dir"); }}
               >
-                <option value="sandbox">Isolated sandbox</option>
+                <option value="sandbox">Isolated workspace</option>
                 <option value="dir">A directory on disk</option>
               </select>
             </Field>
@@ -262,13 +263,17 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
       <div className="flex items-center justify-between gap-3 mt-4">
         <div className="text-2xs">
           {noKey ? (
-            <span className="text-ink">Set up a provider in Settings first.</span>
+            <Link href="/settings" className="text-ink underline underline-offset-2">
+              Set up a provider in Settings first →
+            </Link>
           ) : needsCwd ? (
             <span className="text-ink">Enter the directory the swarm should work in.</span>
           ) : (
             <span className="text-ink-faint">
               {workspace === "sandbox"
-                ? `Isolated sandbox · ${config?.sandboxResolved ?? "host"}`
+                ? config?.sandboxResolved && config.sandboxResolved !== "host"
+                  ? `Isolated · ${config.sandboxResolved} sandbox`
+                  : "Isolated workspace on this machine"
                 : "Runs against your directory"} · ⌘↵ to launch
             </span>
           )}

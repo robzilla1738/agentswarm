@@ -34,8 +34,11 @@ export interface SwarmConfig {
   /** SearchKit CLI command (from github script-search; `pip install searchkit`). */
   searchkitCmd: string;
   /**
-   * Where sandboxed runs execute. "auto" prefers configured cloud sandboxes
-   * (E2B → Modal → Vercel), then a local container daemon, then the host.
+   * Where isolated runs execute. Default "host": the run's private workspace
+   * directory on this machine — works out of the box, no Docker or cloud
+   * account needed. "auto" opts into auto-detection: configured cloud
+   * sandboxes (E2B → Modal → Vercel), then a local container daemon, then
+   * the host.
    */
   sandboxRuntime: "auto" | "host" | "docker" | "e2b" | "modal" | "vercel";
   /** Container image for docker/modal sandboxes. */
@@ -92,7 +95,7 @@ export const DEFAULTS: SwarmConfig = {
   tinyfishApiKey: "",
   searchBackend: "auto",
   searchkitCmd: "searchkit",
-  sandboxRuntime: "auto",
+  sandboxRuntime: "host",
   sandboxImage: "node:22-bookworm",
   e2bApiKey: "",
   e2bTemplate: "base",
@@ -109,6 +112,24 @@ export const DEFAULTS: SwarmConfig = {
   uiPort: 7780,
   pricing: DEFAULT_PRICING,
 };
+
+/**
+ * Env vars that must never leak into agent shell commands when they execute
+ * directly on the host: every provider key env plus the search/sandbox
+ * credentials the engine itself understands.
+ */
+export const SECRET_ENV_KEYS: string[] = [
+  ...new Set([
+    ...Object.values(PROVIDERS)
+      .map((p) => p.keyEnv)
+      .filter((k): k is string => Boolean(k)),
+    "TINYFISH_API_KEY",
+    "E2B_API_KEY",
+    "MODAL_TOKEN_ID",
+    "MODAL_TOKEN_SECRET",
+    "VERCEL_SANDBOX_TOKEN",
+  ]),
+];
 
 export function home(): string {
   return process.env.AGENTSWARM_HOME || path.join(os.homedir(), ".agentswarm");

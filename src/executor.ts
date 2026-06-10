@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { runAgent } from "./agent";
+import { estimateMessages, runAgent } from "./agent";
 import { SwarmConfig, runDir } from "./config";
 import { ControlReader } from "./control";
 import { ChatMsg, ChatResult, chat, isFatalAuthError, validateAuth } from "./deepseek";
@@ -278,6 +278,9 @@ export class Executor {
 
   private async conductorTurn(): Promise<void> {
     if (this.finishing) return;
+    // Re-bound the history every turn — the nudge loop and tool-result pushes
+    // below grow it outside appendConductorUpdate's trim.
+    this.trimConductorHistory();
     const tools = [SPAWN_TASKS_TOOL, WAIT_TOOL, FINISH_TOOL];
     for (let attempt = 0; attempt < 3; attempt++) {
       let res: ChatResult;
@@ -448,16 +451,27 @@ export class Executor {
 
   private trimConductorHistory(): void {
     const MAX = 60;
-    if (this.conductorMessages.length <= MAX) return;
-    const system = this.conductorMessages[0];
-    const tail = this.conductorMessages.slice(-(MAX - 2));
-    // Don't begin the tail on an orphic tool result.
-    while (tail.length && tail[0].role === "tool") tail.shift();
-    this.conductorMessages = [
-      system,
-      { role: "user", content: "[Earlier orchestration history was trimmed. Current swarm state is below.]" },
-      ...tail,
-    ];
+    const TRIM_NOTICE = "[Earlier orchestration history was trimmed. Current swarm state is below.]";
+    if (this.conductorMessages.length > MAX) {
+      const system = this.conductorMessages[0];
+      const tail = this.conductorMessages.slice(-(MAX - 2));
+      // Don't begin the tail on an orphic tool result.
+      while (tail.length && tail[0].role === "tool") tail.shift();
+      this.conductorMessages = [system, { role: "user", content: TRIM_NOTICE }, ...tail];
+    }
+    // Count alone doesn't bound size: every update embeds the full task table,
+    // so a deep run can blow the model window long before 60 messages. The
+    // mission itself lives in the system message and always survives.
+    const budget = Math.floor(this.cfg.contextTokenLimit * 0.75);
+    if (estimateMessages(this.conductorMessages) <= budget) return;
+    if (this.conductorMessages[1]?.content !== TRIM_NOTICE) {
+      this.conductorMessages.splice(1, 0, { role: "user", content: TRIM_NOTICE });
+    }
+    while (estimateMessages(this.conductorMessages) > budget && this.conductorMessages.length > 10) {
+      this.conductorMessages.splice(2, 1);
+      // Never leave tool results whose assistant turn was dropped.
+      while (this.conductorMessages[2]?.role === "tool") this.conductorMessages.splice(2, 1);
+    }
   }
 
   // ---------------------------------------------------------------- scheduling
@@ -543,12 +557,18 @@ export class Executor {
       signal: this.ac.signal,
       addNote: (text, key) => {
         this.notes.push({ taskId: task?.id, key, text });
+        // Only the recent tail ever feeds digests; without a cap a multi-day
+        // run accumulates every note in memory.
+        if (this.notes.length > 2000) this.notes.splice(0, this.notes.length - 2000);
         this.journal.append("note.added", { taskId: task?.id, agentId, key, text: clip(text, 1200) });
       },
       addArtifact: (rel) => {
         if (task && !task.artifacts.includes(rel)) task.artifacts.push(rel);
       },
       readBlackboard: () => this.blackboardDigest(),
+      log: (level, msg) => {
+        this.journal.append("log", { level, msg, agentId, taskId: task?.id });
+      },
     };
   }
 

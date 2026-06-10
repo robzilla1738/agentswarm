@@ -23,6 +23,15 @@ function RunView() {
   const [selected, setSelected] = useState<string | null>(null);
   const [tab, setTab] = useState<"swarm" | "report">("swarm");
   const [autoSwitched, setAutoSwitched] = useState(false);
+  const [connectingSlow, setConnectingSlow] = useState(false);
+
+  // If the first events never arrive, say so instead of spinning forever
+  // (bad run id, or the hub isn't running).
+  useEffect(() => {
+    setConnectingSlow(false);
+    const t = setTimeout(() => setConnectingSlow(true), 8000);
+    return () => clearTimeout(t);
+  }, [id]);
 
   const terminal = data ? ["done", "failed", "cancelled"].includes(data.status) : false;
   useEffect(() => {
@@ -60,8 +69,21 @@ function RunView() {
     return (
       <div className="min-h-screen">
         <TopBar />
-        <div className="max-w-3xl mx-auto p-16 flex items-center justify-center gap-3 text-ink-faint">
-          <Spinner /> connecting to run…
+        <div className="max-w-3xl mx-auto p-16 text-center">
+          <div className="flex items-center justify-center gap-3 text-ink-faint">
+            <Spinner /> connecting to run…
+          </div>
+          {connectingSlow && (
+            <div className="mt-6 text-sm leading-relaxed text-ink-dim" style={{ animation: "var(--animate-rise)" }}>
+              Still connecting. This run id may not exist, or the hub isn&apos;t reachable — check that{" "}
+              <span className="mono text-ink">swarm serve</span> is running.
+              <div className="mt-3">
+                <Link href="/" className="btn btn-sm" style={{ display: "inline-flex" }}>
+                  Back to dashboard
+                </Link>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -91,7 +113,7 @@ function RunView() {
 
   const metaLine = [
     meta.options.model,
-    meta.sandbox ? "sandbox" : "real directory",
+    meta.sandbox ? "isolated workspace" : "real directory",
     `${meta.options.maxWorkers}× parallel`,
     ...(meta.options.verification !== "off" ? [`verify ${meta.options.verification}`] : []),
   ].join(" · ");

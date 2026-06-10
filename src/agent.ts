@@ -195,7 +195,7 @@ function redact(args: Record<string, unknown>): Record<string, unknown> {
   return out;
 }
 
-function estimateMessages(messages: ChatMsg[]): number {
+export function estimateMessages(messages: ChatMsg[]): number {
   let chars = 0;
   for (const m of messages) {
     chars += m.content?.length ?? 0;

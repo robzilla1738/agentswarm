@@ -2,7 +2,7 @@
   "name": "agentswarm",
   "version": "0.1.0",
   "private": true,
-  "description": "Local agent swarm: a conductor model splits missions into parallel sub-agents with real tools, sandboxes, and a localhost web UI. Works with DeepSeek, OpenAI, Anthropic, Grok, MiniMax, OpenRouter, Ollama, and LM Studio.",
+  "description": "Local agent swarm: a conductor model splits missions into parallel sub-agents with real tools, optional sandboxes, and a localhost web UI. Works with DeepSeek, OpenAI, Anthropic, Grok, MiniMax, OpenRouter, Ollama, and LM Studio.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -27,6 +27,7 @@
   "main": "dist/cli.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
     "build:ui": "npm --prefix ui run build",
     "build:all": "npm run build && npm --prefix ui install --no-fund --no-audit && npm run build:ui",
     "setup": "npm install --no-fund --no-audit && npm run build:all",

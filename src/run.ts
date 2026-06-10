@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { SwarmConfig, runDir, runsDir } from "./config";
 import { Executor } from "./executor";
-import { Journal, eventsFile, readEvents } from "./journal";
+import { Journal, TailState, eventsFile, readEvents, readNewEvents } from "./journal";
 import { resolveSandboxKind } from "./sandbox";
 import { RunState } from "./state";
 import { RunMeta, RunOptions, RunSummary } from "./types";
@@ -84,6 +84,12 @@ export async function executeRun(cfg: SwarmConfig, meta: RunMeta, journal: Journ
  */
 const summaryCache = new Map<string, { size: number; mtimeMs: number; summary: RunSummary }>();
 
+/**
+ * Live runs additionally tail their journal incrementally: a multi-hour run's
+ * growing events.jsonl costs O(new bytes) per poll instead of a full re-parse.
+ */
+const liveCache = new Map<string, { state: RunState; tail: TailState }>();
+
 const TERMINAL_STATUSES = ["done", "failed", "cancelled"];
 
 /** Grace before a silent, pid-less run is presumed dead (engine startup, fs lag). */
@@ -126,15 +132,21 @@ export function listRuns(pricing: SwarmConfig["pricing"]): RunSummary[] {
     if (cached && stat && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
       pure = cached.summary;
     } else {
-      const state = new RunState(pricing);
-      for (const ev of readEvents(runDir(id))) state.apply(ev);
-      if (!state.meta) state.meta = meta;
-      pure = state.summary();
+      let live = liveCache.get(id);
+      if (!live) {
+        live = { state: new RunState(pricing), tail: { offset: 0, carry: "" } };
+        liveCache.set(id, live);
+      }
+      for (const ev of readNewEvents(eventsFile(runDir(id)), live.tail)) live.state.apply(ev);
+      if (!live.state.meta) live.state.meta = meta;
+      pure = live.state.summary();
       pure.id = id;
       pure.mission = meta.mission;
       pure.model = meta.options.model;
       pure.createdAt = meta.createdAt;
       if (stat) summaryCache.set(id, { size: stat.size, mtimeMs: stat.mtimeMs, summary: pure });
+      // Terminal runs never change again — the frozen summary suffices.
+      if (TERMINAL_STATUSES.includes(pure.status)) liveCache.delete(id);
     }
     const s: RunSummary = { ...pure, tasks: { ...pure.tasks } };
     s.pid = readPid(id);
@@ -161,6 +173,7 @@ export function deleteRun(id: string): void {
   }
   fs.rmSync(runDir(id), { recursive: true, force: true });
   summaryCache.delete(id);
+  liveCache.delete(id);
 }
 
 /**

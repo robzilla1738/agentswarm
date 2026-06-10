@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
-import { SwarmConfig } from "./config";
+import { SECRET_ENV_KEYS, SwarmConfig } from "./config";
 import { SandboxRuntimeKind } from "./types";
 import { ensureDir, errMsg } from "./util";
 
@@ -77,8 +77,10 @@ export function dockerAvailable(refresh = false): boolean {
 }
 
 /**
- * Pick the best runtime. Cloud sandboxes take priority when configured
- * (e2b → modal → vercel), then a local container daemon, then the host.
+ * Resolve the configured runtime. The default config is "host" — the run's
+ * isolated workspace on this machine, no sandbox required. "auto" is the
+ * opt-in auto-detect: cloud sandboxes when configured (e2b → modal → vercel),
+ * then a local container daemon, then the host.
  */
 export function resolveSandboxKind(cfg: SwarmConfig): SandboxKind {
   if (cfg.sandboxRuntime !== "auto") return cfg.sandboxRuntime;
@@ -205,11 +207,7 @@ class HostRuntime implements SandboxRuntime {
 
   exec(command: string, opts: ExecOpts): Promise<ExecResult> {
     const env = { ...process.env };
-    delete env.DEEPSEEK_API_KEY;
-    delete env.TINYFISH_API_KEY;
-    delete env.OPENAI_API_KEY;
-    delete env.ANTHROPIC_API_KEY;
-    delete env.E2B_API_KEY;
+    for (const k of SECRET_ENV_KEYS) delete env[k];
     return spawnCollect(command, [], {
       shell: "/bin/bash",
       cwd: opts.cwd ?? this.workdir,

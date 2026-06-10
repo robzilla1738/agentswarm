@@ -71,7 +71,7 @@ export default function Dashboard() {
             <EmptyState
               glyph="◇"
               title="No missions yet"
-              sub="Describe one above and launch your first swarm — it runs in an isolated sandbox by default."
+              sub="Describe one above and launch your first swarm. It runs in an isolated workspace on this machine by default."
             />
           </section>
         )}

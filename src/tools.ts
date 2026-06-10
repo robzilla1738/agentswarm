@@ -20,6 +20,8 @@ export interface ToolCtx {
   addNote: (text: string, key?: string) => void;
   addArtifact: (relPath: string) => void;
   readBlackboard: () => string;
+  /** Journal an operator-visible diagnostic (tool infrastructure problems). */
+  log?: (level: "info" | "warn" | "error", msg: string) => void;
 }
 
 export interface ToolDef {
@@ -278,7 +280,9 @@ export function workerToolset(): Record<string, ToolDef> {
     },
     run: async (args, ctx) => {
       const count = Math.min(Math.max(Number(args.count) || 6, 1), 10);
-      const hits = await webSearch(ctx.cfg, String(args.query), count, ctx.signal, Boolean(args.deep));
+      const hits = await webSearch(ctx.cfg, String(args.query), count, ctx.signal, Boolean(args.deep), (msg) =>
+        ctx.log?.("warn", msg)
+      );
       if (!hits.length) return "no results";
       return hits
         .map((h, i) => {

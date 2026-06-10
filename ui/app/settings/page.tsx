@@ -269,27 +269,27 @@ export default function SettingsPage() {
 
         <Card
           title="Sandbox"
-          sub="Where agents execute shell commands for isolated runs. Auto prefers your cloud sandboxes (E2B → Modal → Vercel), then a local Docker/OrbStack container, then the host."
+          sub="Where agents execute shell commands for isolated runs. The default is a private per-run workspace on this machine, with nothing to install. Pick a container or cloud runtime for stronger isolation, or Auto to use the strongest one you've configured (E2B → Modal → Vercel → Docker → host)."
         >
           <Field
             label="Runtime"
             hint={
-              (form.sandboxRuntime ?? "auto") === "auto"
+              (form.sandboxRuntime ?? "host") === "auto"
                 ? `currently resolves to: ${config.sandboxResolved}`
                 : undefined
             }
           >
             <select
               className="input"
-              value={form.sandboxRuntime ?? "auto"}
+              value={form.sandboxRuntime ?? "host"}
               onChange={(e) => setForm({ ...form, sandboxRuntime: e.target.value })}
             >
-              <option value="auto">Auto — best available</option>
+              <option value="host">This machine — isolated workspace (default)</option>
               <option value="docker">Local container (Docker){config.dockerUp ? " · daemon up" : " · daemon not running"}</option>
               <option value="e2b">E2B cloud{config.e2bKeySet ? " · key saved" : ""}</option>
               <option value="modal">Modal cloud{config.modalConfigured ? " · configured" : ""}</option>
               <option value="vercel">Vercel sandbox{config.vercelConfigured ? " · configured" : ""}</option>
-              <option value="host">Host process — no isolation</option>
+              <option value="auto">Auto — strongest available</option>
             </select>
           </Field>
 

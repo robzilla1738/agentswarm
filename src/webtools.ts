@@ -1,6 +1,6 @@
 import { execFile } from "child_process";
 import { SwarmConfig } from "./config";
-import { decodeEntities, htmlToText, truncateMiddle } from "./util";
+import { decodeEntities, errMsg, htmlToText, truncateMiddle } from "./util";
 
 export interface SearchHit {
   title: string;
@@ -27,7 +27,8 @@ export async function webSearch(
   query: string,
   count: number,
   signal?: AbortSignal,
-  deep = false
+  deep = false,
+  warn?: (msg: string) => void
 ): Promise<SearchHit[]> {
   if (cfg.searchBackend === "auto" && searchkitOk !== false) {
     try {
@@ -37,6 +38,14 @@ export async function webSearch(
     } catch (e: any) {
       // Not installed → stop probing for the rest of this process.
       if (e?.code === "ENOENT") searchkitOk = false;
+      else if (!searchkitWarned) {
+        // Installed but failing — say so once instead of silently degrading.
+        searchkitWarned = true;
+        warn?.(
+          `searchkit failed (${errMsg(e)}); falling back to ${cfg.tinyfishApiKey ? "TinyFish" : "DuckDuckGo"}. ` +
+            `Set searchBackend=ddg to skip searchkit.`
+        );
+      }
       /* fall through */
     }
   }
@@ -53,6 +62,7 @@ export async function webSearch(
 // ---------------------------------------------------------------- searchkit
 
 let searchkitOk: boolean | null = null;
+let searchkitWarned = false;
 
 function runCli(cmd: string, args: string[], timeoutMs: number, signal?: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -109,37 +119,69 @@ async function tinyfishSearch(
   }));
 }
 
+/**
+ * DuckDuckGo serves two scrape-friendly endpoints with different markup.
+ * A parse miss on one falls through to the other, so a DDG layout change has
+ * to break both before search goes dark. Link regexes tolerate either quote
+ * style and either attribute order (groups 1+2 or 3+4).
+ */
+const DDG_ENDPOINTS = [
+  {
+    url: "https://html.duckduckgo.com/html/?q=",
+    linkRe: () =>
+      /<a[^>]+class=['"]result__a['"][^>]+href=['"]([^'"]+)['"][^>]*>([\s\S]*?)<\/a>|<a[^>]+href=['"]([^'"]+)['"][^>]+class=['"]result__a['"][^>]*>([\s\S]*?)<\/a>/g,
+  },
+  {
+    url: "https://lite.duckduckgo.com/lite/?q=",
+    linkRe: () =>
+      /<a[^>]+class=['"]result-link['"][^>]+href=['"]([^'"]+)['"][^>]*>([\s\S]*?)<\/a>|<a[^>]+href=['"]([^'"]+)['"][^>]+class=['"]result-link['"][^>]*>([\s\S]*?)<\/a>/g,
+  },
+];
+
 async function ddgSearch(
   query: string,
   count: number,
   signal?: AbortSignal
 ): Promise<SearchHit[]> {
-  const res = await fetch(
-    `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
-    {
-      headers: { "user-agent": UA },
-      signal: signal ?? AbortSignal.timeout(20000),
+  let firstErr: unknown = null;
+  let reachedAny = false;
+  for (const ep of DDG_ENDPOINTS) {
+    try {
+      const res = await fetch(ep.url + encodeURIComponent(query), {
+        headers: { "user-agent": UA },
+        signal: signal ?? AbortSignal.timeout(20000),
+      });
+      if (!res.ok) throw new Error(`search failed: HTTP ${res.status}`);
+      reachedAny = true;
+      const hits = parseDdgHtml(await res.text(), count, ep.linkRe());
+      if (hits.length) return hits;
+    } catch (e) {
+      firstErr = firstErr ?? e;
     }
-  );
-  if (!res.ok) throw new Error(`search failed: HTTP ${res.status}`);
-  const html = await res.text();
+  }
+  // Only fail when no endpoint even answered; an endpoint that answered with
+  // zero parsed results is a genuine "no results".
+  if (!reachedAny && firstErr) throw firstErr;
+  return [];
+}
+
+function parseDdgHtml(html: string, count: number, linkRe: RegExp): SearchHit[] {
   const hits: SearchHit[] = [];
-  const linkRe =
-    /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
   const snippetRe =
-    /<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>|<td[^>]+class="result-snippet"[^>]*>([\s\S]*?)<\/td>/g;
+    /<a[^>]+class=['"]result__snippet['"][^>]*>([\s\S]*?)<\/a>|<td[^>]+class=['"]result-snippet['"][^>]*>([\s\S]*?)<\/td>/g;
   const snippets: string[] = [];
   let sm: RegExpExecArray | null;
   while ((sm = snippetRe.exec(html))) snippets.push(strip(sm[1] || sm[2] || ""));
   let m: RegExpExecArray | null;
   while ((m = linkRe.exec(html)) && hits.length < count) {
-    let url = m[1];
+    let url = m[1] ?? m[3] ?? "";
+    const title = strip(m[2] ?? m[4] ?? "");
     const uddg = /[?&]uddg=([^&]+)/.exec(url);
     if (uddg) url = decodeURIComponent(uddg[1]);
     if (url.startsWith("//")) url = "https:" + url;
     if (!/^https?:\/\//.test(url)) continue;
     if (url.includes("duckduckgo.com/y.js")) continue; // ads
-    hits.push({ title: strip(m[2]), url, snippet: snippets[hits.length] || "" });
+    hits.push({ title, url, snippet: snippets[hits.length] || "" });
   }
   return hits;
 }

@@ -76,6 +76,29 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
       s.status = ev.status as RunStatus;
       if (ev.reason) s.statusReason = String(ev.reason);
       break;
+    case "run.resumed": {
+      // Tasks that were in flight when the engine died re-run from scratch;
+      // agents the dead process owned can no longer be running.
+      const resets = Array.isArray(ev.resets) ? (ev.resets as string[]) : [];
+      for (const id of resets) {
+        const t = s.tasks.get(id);
+        if (t) {
+          t.status = "pending";
+          t.startedAt = undefined;
+          t.endedAt = undefined;
+          s.tasks.set(id, { ...t });
+        }
+      }
+      for (const a of s.agents.values()) {
+        if (a.status === "running") {
+          a.status = "done";
+          a.endedAt = ev.t;
+          s.agents.set(a.id, { ...a });
+        }
+      }
+      s.statusReason = "";
+      break;
+    }
     case "task.created": {
       const t = ev.task as Task;
       if (!s.tasks.has(t.id)) s.taskOrder.push(t.id);
@@ -178,6 +201,7 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
         key: ev.key as string | undefined, text: ev.text as string,
       };
       s.notes.push(note);
+      if (s.notes.length > 500) s.notes.splice(0, s.notes.length - 500);
       pushActivity(s, {
         id: `n${ev.seq}`, t: ev.t, agentId: (ev.agentId as string) ?? "", taskId: (ev.taskId as string) ?? "",
         kind: "note", text: (note.key ? `[${note.key}] ` : "") + note.text,
@@ -186,6 +210,7 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
     }
     case "conductor.say":
       s.conductorLog.push({ t: ev.t, text: ev.text as string });
+      if (s.conductorLog.length > 200) s.conductorLog.splice(0, s.conductorLog.length - 200);
       break;
     case "operator.note":
       s.operatorNotes.push({ t: ev.t, text: ev.text as string, consumed: false });
@@ -208,7 +233,9 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
         // actual config) — prefer it over re-deriving from a baked-in table.
         s.cost = ev.cost;
       } else {
-        const price = PRICING[(ev.model as string) ?? ""] ?? PRICING["deepseek-v4-flash"];
+        // Match the engine's semantics: unknown models cost $0 — never guess
+        // another provider's rates.
+        const price = PRICING[(ev.model as string) ?? ""] ?? { inMiss: 0, inHit: 0, out: 0 };
         const miss = u.cacheMissTokens || Math.max(0, u.promptTokens - u.cacheHitTokens);
         s.cost += (miss * price.inMiss + u.cacheHitTokens * price.inHit + u.completionTokens * price.out) / 1e6;
       }
