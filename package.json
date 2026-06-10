@@ -1,0 +1,50 @@
+{
+  "name": "agentswarm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local agent swarm: a conductor model splits missions into parallel sub-agents with real tools, sandboxes, and a localhost web UI. Works with DeepSeek, OpenAI, Anthropic, Grok, MiniMax, OpenRouter, Ollama, and LM Studio.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/robzilla1738/agentswarm.git"
+  },
+  "keywords": [
+    "agents",
+    "agent-swarm",
+    "orchestrator",
+    "llm",
+    "autonomous",
+    "long-horizon",
+    "sandbox",
+    "deepseek",
+    "openai",
+    "anthropic",
+    "ollama"
+  ],
+  "bin": {
+    "swarm": "bin/swarm.js"
+  },
+  "main": "dist/cli.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:ui": "npm --prefix ui run build",
+    "build:all": "npm run build && npm --prefix ui install --no-fund --no-audit && npm run build:ui",
+    "setup": "npm install --no-fund --no-audit && npm run build:all",
+    "dev:ui": "npm --prefix ui run dev",
+    "serve": "node bin/swarm.js serve",
+    "demo": "node bin/swarm.js demo",
+    "test": "node test/e2e.js"
+  },
+  "engines": {
+    "node": ">=20.10"
+  },
+  "optionalDependencies": {
+    "@vercel/sandbox": "*",
+    "e2b": "*",
+    "modal": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}

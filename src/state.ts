@@ -1,0 +1,253 @@
+import {
+  RunMeta,
+  RunStatus,
+  RunSummary,
+  SwarmEvent,
+  Task,
+  Usage,
+  ZERO_USAGE,
+  addUsage,
+  usageCost,
+} from "./types";
+import { ModelPrice } from "./types";
+
+export interface AgentView {
+  id: string;
+  taskId: string;
+  role: string;
+  model: string;
+  purpose: string;
+  status: "running" | "done";
+  steps: number;
+  startedAt: number;
+  endedAt?: number;
+  lastText: string;
+  lastThink: string;
+  lastTool?: string;
+}
+
+export interface BlackboardNote {
+  t: number;
+  taskId?: string;
+  agentId?: string;
+  key?: string;
+  text: string;
+}
+
+/**
+ * Pure reducer over the journal. Both the live executor and the read-only hub
+ * build identical state from the same events — the journal is the truth.
+ */
+export class RunState {
+  meta: RunMeta | null = null;
+  status: RunStatus = "planning";
+  statusReason = "";
+  tasks = new Map<string, Task>();
+  taskOrder: string[] = [];
+  agents = new Map<string, AgentView>();
+  notes: BlackboardNote[] = [];
+  conductorLog: { t: number; text: string }[] = [];
+  operatorNotes: { t: number; text: string; consumed: boolean }[] = [];
+  usageByModel = new Map<string, Usage>();
+  totalUsage: Usage = { ...ZERO_USAGE };
+  cost = 0;
+  finalSummary?: string;
+  finalReportPath?: string;
+  lastSeq = 0;
+  lastT = 0;
+  createdAt = 0;
+  updatedAt = 0;
+
+  private pricing: Record<string, ModelPrice>;
+
+  constructor(pricing: Record<string, ModelPrice> = {}) {
+    this.pricing = pricing;
+  }
+
+  apply(ev: SwarmEvent): void {
+    this.lastSeq = ev.seq;
+    this.lastT = ev.t;
+    this.updatedAt = ev.t;
+    switch (ev.type) {
+      case "run.created": {
+        this.meta = ev.meta as RunMeta;
+        this.createdAt = this.meta.createdAt;
+        if (this.meta.options) {
+          // pricing may be passed through meta for the hub
+        }
+        break;
+      }
+      case "run.status":
+        this.status = ev.status as RunStatus;
+        if (ev.reason) this.statusReason = String(ev.reason);
+        break;
+      case "run.resumed": {
+        // Tasks that were in flight when the engine died re-run from scratch;
+        // agents the dead process owned can no longer be running.
+        const resets = Array.isArray(ev.resets) ? (ev.resets as string[]) : [];
+        for (const id of resets) {
+          const t = this.tasks.get(id);
+          if (t) {
+            t.status = "pending";
+            t.startedAt = undefined;
+            t.endedAt = undefined;
+          }
+        }
+        for (const a of this.agents.values()) {
+          if (a.status === "running") {
+            a.status = "done";
+            a.endedAt = ev.t;
+          }
+        }
+        this.statusReason = "";
+        break;
+      }
+      case "task.created": {
+        const t = ev.task as Task;
+        if (!this.tasks.has(t.id)) this.taskOrder.push(t.id);
+        this.tasks.set(t.id, { ...t });
+        break;
+      }
+      case "task.status": {
+        const t = this.tasks.get(ev.taskId as string);
+        if (t) {
+          t.status = ev.status as Task["status"];
+          if (typeof ev.attempt === "number") t.attempt = ev.attempt;
+          if (ev.status === "running" && !t.startedAt) t.startedAt = ev.t;
+          if (["done", "failed", "blocked"].includes(String(ev.status))) t.endedAt = ev.t;
+          if (ev.reason) t.error = String(ev.reason);
+        }
+        break;
+      }
+      case "task.report": {
+        const t = this.tasks.get(ev.taskId as string);
+        if (t) {
+          t.report = ev.report as string;
+          t.reportStatus = ev.status as "done" | "blocked";
+          t.artifacts = (ev.artifacts as string[]) ?? t.artifacts;
+        }
+        break;
+      }
+      case "verify.result": {
+        const t = this.tasks.get(ev.taskId as string);
+        if (t) t.feedback = ev.feedback as string;
+        break;
+      }
+      case "agent.spawned":
+        this.agents.set(ev.agentId as string, {
+          id: ev.agentId as string,
+          taskId: ev.taskId as string,
+          role: (ev.role as string) ?? "agent",
+          model: (ev.model as string) ?? "",
+          purpose: (ev.purpose as string) ?? "",
+          status: "running",
+          steps: 0,
+          startedAt: ev.t,
+          lastText: "",
+          lastThink: "",
+        });
+        break;
+      case "agent.delta": {
+        const a = this.agents.get(ev.agentId as string);
+        if (a) {
+          if (ev.channel === "text") a.lastText = clipTail(a.lastText + (ev.text as string), 4000);
+          else a.lastThink = clipTail(a.lastThink + (ev.text as string), 4000);
+        }
+        break;
+      }
+      case "agent.done": {
+        const a = this.agents.get(ev.agentId as string);
+        if (a) {
+          a.status = "done";
+          a.endedAt = ev.t;
+          a.steps = (ev.steps as number) ?? a.steps;
+        }
+        break;
+      }
+      case "tool.call": {
+        const a = this.agents.get(ev.agentId as string);
+        if (a) {
+          a.lastTool = ev.name as string;
+          a.steps++;
+        }
+        break;
+      }
+      case "note.added":
+        this.notes.push({
+          t: ev.t,
+          taskId: ev.taskId as string | undefined,
+          agentId: ev.agentId as string | undefined,
+          key: ev.key as string | undefined,
+          text: ev.text as string,
+        });
+        break;
+      case "conductor.say":
+        this.conductorLog.push({ t: ev.t, text: ev.text as string });
+        break;
+      case "operator.note":
+        this.operatorNotes.push({ t: ev.t, text: ev.text as string, consumed: false });
+        break;
+      case "operator.note.consumed": {
+        const idx = this.operatorNotes.findIndex((n) => !n.consumed);
+        if (idx >= 0) this.operatorNotes[idx].consumed = true;
+        break;
+      }
+      case "usage": {
+        const u = ev.usage as Usage;
+        const model = (ev.model as string) ?? "unknown";
+        this.usageByModel.set(model, addUsage(this.usageByModel.get(model) ?? { ...ZERO_USAGE }, u));
+        this.totalUsage = addUsage(this.totalUsage, u);
+        this.cost += usageCost(u, this.pricing[model]);
+        break;
+      }
+      case "run.final":
+        this.finalSummary = ev.summary as string;
+        this.finalReportPath = ev.reportPath as string | undefined;
+        break;
+    }
+  }
+
+  taskList(): Task[] {
+    return this.taskOrder.map((id) => this.tasks.get(id)!).filter(Boolean);
+  }
+
+  activeAgents(): AgentView[] {
+    return [...this.agents.values()].filter((a) => a.status === "running");
+  }
+
+  pendingOperatorNotes(): string[] {
+    return this.operatorNotes.filter((n) => !n.consumed).map((n) => n.text);
+  }
+
+  summary(): RunSummary {
+    const tasks = this.taskList();
+    const count = (s: Task["status"]) => tasks.filter((t) => t.status === s).length;
+    return {
+      id: this.meta?.id ?? "",
+      mission: this.meta?.mission ?? "",
+      status: this.status,
+      statusReason: this.statusReason || undefined,
+      createdAt: this.createdAt,
+      updatedAt: this.updatedAt,
+      heartbeatAt: this.lastT,
+      pid: null,
+      model: this.meta?.options.model ?? "",
+      tasks: {
+        total: tasks.length,
+        done: count("done"),
+        failed: count("failed"),
+        running: count("running") + count("verifying"),
+        pending: count("pending"),
+        blocked: count("blocked"),
+      },
+      agentsActive: this.activeAgents().length,
+      usage: this.totalUsage,
+      cost: this.cost,
+      finalSummary: this.finalSummary,
+    };
+  }
+}
+
+function clipTail(s: string, max: number): string {
+  return s.length <= max ? s : s.slice(s.length - max);
+}

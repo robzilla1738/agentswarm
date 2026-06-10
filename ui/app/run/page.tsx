@@ -1,0 +1,299 @@
+"use client";
+
+import Link from "next/link";
+import { useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useMemo, useState } from "react";
+import { ReportPanel } from "@/components/ReportPanel";
+import { CancelButton, NoteComposer } from "@/components/RunControls";
+import { SideRail } from "@/components/SideRail";
+import { SwarmBoard } from "@/components/SwarmBoard";
+import { TaskDetail } from "@/components/TaskDetail";
+import { TopBar } from "@/components/TopBar";
+import { BudgetBar, Spinner, StatusBadge, StatusDot } from "@/components/atoms";
+import { api } from "@/lib/api";
+import { fmtDur, fmtMoney, fmtTokens } from "@/lib/format";
+import { useNow, useRun } from "@/lib/hooks";
+import type { Task } from "@/lib/types";
+
+function RunView() {
+  const params = useSearchParams();
+  const id = params.get("id");
+  const { data, connected, engineLive } = useRun(id);
+  const now = useNow(1000);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [tab, setTab] = useState<"swarm" | "report">("swarm");
+  const [autoSwitched, setAutoSwitched] = useState(false);
+
+  const terminal = data ? ["done", "failed", "cancelled"].includes(data.status) : false;
+  useEffect(() => {
+    if (terminal && !autoSwitched && (data?.finalSummary || data?.finalReportPath)) {
+      setTab("report");
+      setAutoSwitched(true);
+    }
+  }, [terminal, autoSwitched, data?.finalSummary, data?.finalReportPath]);
+
+  const selectedTask = useMemo(
+    () => (data && selected ? data.tasks.find((t) => t.id === selected) ?? null : null),
+    [data, selected]
+  );
+
+  const artifactCount = useMemo(() => {
+    if (!data) return 0;
+    const all = new Set<string>();
+    for (const t of data.tasks) for (const a of t.artifacts) all.add(a);
+    if (data.finalReportPath) all.add("final-report.md");
+    return all.size;
+  }, [data]);
+
+  if (!id) {
+    return (
+      <div className="min-h-screen">
+        <TopBar />
+        <div className="max-w-3xl mx-auto p-10 text-center text-ink-dim">
+          No run id. <Link href="/" className="underline">Back to dashboard</Link>
+        </div>
+      </div>
+    );
+  }
+
+  if (!data || !data.meta) {
+    return (
+      <div className="min-h-screen">
+        <TopBar />
+        <div className="max-w-3xl mx-auto p-16 flex items-center justify-center gap-3 text-ink-faint">
+          <Spinner /> connecting to run…
+        </div>
+      </div>
+    );
+  }
+
+  const meta = data.meta;
+  const spent = data.usage.promptTokens + data.usage.completionTokens;
+  const cap = meta.options.maxTokens;
+  const live = !terminal;
+  const failed = data.status === "failed";
+  const authIssue = failed && /auth|api key|rejected|401/i.test(data.statusReason || "");
+  // The journal says "running" but the hub reports the engine process gone:
+  // the run was interrupted (crash, kill, reboot) and will not progress.
+  const interrupted = live && engineLive === false;
+  // Freeze the clock at the last journal event once nothing can progress.
+  const elapsed = fmtDur(((terminal || interrupted) && data.updatedAt ? data.updatedAt : now) - meta.createdAt);
+
+  const counts = {
+    done: data.tasks.filter((t) => t.status === "done").length,
+    failed: data.tasks.filter((t) => t.status === "failed").length,
+    blocked: data.tasks.filter((t) => t.status === "blocked").length,
+    total: data.tasks.length,
+  };
+  const cacheHitPct =
+    data.usage.promptTokens > 0 ? Math.round((data.usage.cacheHitTokens / data.usage.promptTokens) * 100) : 0;
+  const conductorLatest = data.conductorLog[data.conductorLog.length - 1]?.text;
+
+  const metaLine = [
+    meta.options.model,
+    meta.sandbox ? "sandbox" : "real directory",
+    `${meta.options.maxWorkers}× parallel`,
+    ...(meta.options.verification !== "off" ? [`verify ${meta.options.verification}`] : []),
+  ].join(" · ");
+
+  return (
+    <div className="min-h-screen">
+      <TopBar
+        right={
+          <span className="hidden md:flex items-center gap-2 text-2xs text-ink-faint">
+            <StatusDot status={connected ? (live ? "running" : data.status) : "failed"} size={7} pulse={connected && live} />
+            {connected ? (live ? "live" : "loaded") : "reconnecting…"}
+          </span>
+        }
+      />
+
+      <main className="max-w-[1400px] mx-auto px-4 sm:px-6 py-6">
+        {failed && (
+          <Banner glyph="✕" title="This run failed">
+            {data.statusReason || "The run ended without completing."}
+            {authIssue && (
+              <Link href="/settings" className="btn btn-sm mt-3" style={{ display: "inline-flex" }}>
+                Fix your API key in Settings
+              </Link>
+            )}
+          </Banner>
+        )}
+
+        {interrupted && (
+          <Banner glyph="◌" title="Engine process is not running">
+            This run was interrupted before it could finish — the journal shows its last known state.
+            Resuming keeps completed work and re-runs only the tasks that were in flight.
+            <div className="mt-3">
+              <ResumeButton id={id} />
+            </div>
+          </Banner>
+        )}
+
+        {/* Header */}
+        <div className="panel p-5 mb-6">
+          <div className="flex items-start justify-between gap-4 flex-wrap">
+            <div className="min-w-0 flex-1">
+              <h1 className="text-lg font-semibold leading-snug mb-2 text-ink">{meta.mission}</h1>
+              <div className="flex items-center gap-x-3 gap-y-1.5 flex-wrap">
+                <StatusBadge status={data.status} />
+                <span className="mono text-2xs text-ink-faint">{metaLine}</span>
+                <button
+                  className="mono text-2xs text-ink-faint hover:text-ink-dim transition-colors"
+                  title="Copy run id"
+                  onClick={() => navigator.clipboard?.writeText(id).catch(() => {})}
+                >
+                  {id} ⧉
+                </button>
+              </div>
+              {data.statusReason && terminal && (
+                <p className="text-xs mt-2 text-ink-faint">{data.statusReason}</p>
+              )}
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <CancelButton id={id} live={live && !interrupted} />
+              {(data.finalSummary || terminal) && tab !== "report" && (
+                <button onClick={() => setTab("report")} className="btn">View report</button>
+              )}
+            </div>
+          </div>
+
+          <div className="flex flex-wrap gap-x-10 gap-y-4 mt-6">
+            <Stat
+              label="Tasks"
+              value={`${counts.done}/${counts.total}`}
+              sub={counts.failed ? `${counts.failed} failed` : counts.blocked ? `${counts.blocked} blocked` : "done"}
+              alert={counts.failed > 0 || counts.blocked > 0}
+            />
+            <Stat label="Active" value={String(data.activeAgents.length)} sub="agents" />
+            <Stat label="Tokens" value={fmtTokens(spent)} sub={cacheHitPct > 0 ? `${cacheHitPct}% cached` : `of ${fmtTokens(cap)}`} />
+            <Stat label="Cost" value={fmtMoney(data.cost)} sub="estimated" />
+            <Stat label="Elapsed" value={elapsed} sub={live && !interrupted ? "running" : "total"} />
+          </div>
+
+          <div className="mt-5">
+            <BudgetBar spent={spent} cap={cap} />
+            <div className="flex justify-between mt-1.5 mono text-2xs text-ink-faint">
+              <span>budget · {fmtTokens(spent)} of {fmtTokens(cap)}</span>
+              <span>{cap > 0 ? Math.min(100, Math.round((spent / cap) * 100)) : 0}%</span>
+            </div>
+          </div>
+
+          {live && !interrupted && (
+            <div className="mt-4">
+              <NoteComposer id={id} />
+            </div>
+          )}
+        </div>
+
+        {/* Tab switch */}
+        <div className="flex items-center gap-6 mb-5 border-b border-border-soft">
+          <button className="tab" data-active={tab === "swarm"} onClick={() => setTab("swarm")}>
+            Swarm
+          </button>
+          <button className="tab" data-active={tab === "report"} onClick={() => setTab("report")}>
+            Report
+            {data.finalSummary ? <span className="text-ink">✓</span> : null}
+            {artifactCount > 0 && <span className="mono text-2xs text-ink-faint">{artifactCount}</span>}
+          </button>
+        </div>
+
+        {tab === "swarm" ? (
+          <div className="grid grid-cols-1 lg:grid-cols-[1fr_380px] gap-5 items-start">
+            <div className="min-w-0">
+              {data.finalSummary && (
+                <div className="panel p-4 mb-5" style={{ borderColor: "rgba(255,255,255,0.22)", background: "rgba(255,255,255,0.03)" }}>
+                  <div className="label mb-1.5 text-ink">✓ Mission summary</div>
+                  <p className="text-sm leading-relaxed text-ink-dim">{data.finalSummary}</p>
+                </div>
+              )}
+              <SwarmBoard
+                tasks={data.tasks}
+                agents={data.agents}
+                status={data.status}
+                conductorLatest={conductorLatest}
+                now={now}
+                onSelect={(t: Task) => setSelected(t.id)}
+              />
+            </div>
+            <SideRail
+              activity={data.activity}
+              conductorLog={data.conductorLog}
+              notes={data.notes}
+              operatorNotes={data.operatorNotes}
+              now={now}
+            />
+          </div>
+        ) : (
+          <ReportPanel id={id} hasFinal={!!data.finalSummary} live={live} />
+        )}
+      </main>
+
+      <TaskDetail runId={id} task={selectedTask} agents={data.agents} now={now} onClose={() => setSelected(null)} />
+    </div>
+  );
+}
+
+function ResumeButton({ id }: { id: string }) {
+  const [state, setState] = useState<"idle" | "resuming" | "error">("idle");
+  return (
+    <button
+      className="btn btn-sm"
+      disabled={state === "resuming"}
+      onClick={async () => {
+        setState("resuming");
+        try {
+          await api.resume(id);
+          // The SSE liveness channel flips the banner off once the engine is up.
+        } catch {
+          setState("error");
+        }
+      }}
+    >
+      {state === "resuming" ? <Spinner size={12} /> : null}
+      {state === "error" ? "Resume failed — retry" : "Resume run"}
+    </button>
+  );
+}
+
+function Banner({ glyph, title, children }: { glyph: string; title: string; children: React.ReactNode }) {
+  return (
+    <div
+      className="panel p-4 mb-5 flex items-start gap-3.5"
+      style={{
+        borderColor: "rgba(255,255,255,0.28)",
+        background: "rgba(255,255,255,0.03)",
+        animation: "var(--animate-rise)",
+      }}
+    >
+      <span className="glyph shrink-0 text-ink" style={{ width: 30, height: 30, fontSize: 13 }}>{glyph}</span>
+      <div className="flex-1 min-w-0">
+        <div className="font-semibold text-ink">{title}</div>
+        <div className="text-sm mt-0.5 leading-relaxed text-ink-dim">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function Stat({ label, value, sub, alert }: { label: string; value: string; sub?: string; alert?: boolean }) {
+  return (
+    <div>
+      <div className="label mb-1.5">{label}</div>
+      <div className="text-xl font-bold leading-none mono text-ink">{value}</div>
+      {sub && <div className={`mono text-2xs mt-1.5 ${alert ? "text-ink" : "text-ink-faint"}`}>{sub}</div>}
+    </div>
+  );
+}
+
+export default function RunPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="min-h-screen grid place-items-center text-ink-faint">
+          <Spinner />
+        </div>
+      }
+    >
+      <RunView />
+    </Suspense>
+  );
+}
