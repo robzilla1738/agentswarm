@@ -31,6 +31,15 @@ import { SANDBOX_KINDS, SandboxKind, dockerAvailable, resolveSandboxKind, testSa
 import { RunOptions } from "./types";
 import { errMsg, pathInside } from "./util";
 
+const PKG_VERSION: string = (() => {
+  try {
+    // dist/hub.js → ../package.json; npm always ships package.json.
+    return String(require("../package.json").version || "0.0.0");
+  } catch {
+    return "0.0.0";
+  }
+})();
+
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
@@ -87,7 +96,7 @@ async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL
   const p = url.pathname;
   const method = req.method || "GET";
 
-  if (p === "/api/health") return sendJson(res, 200, { ok: true, version: "0.1.0", apiKey: Boolean(cfg.apiKey) });
+  if (p === "/api/health") return sendJson(res, 200, { ok: true, version: PKG_VERSION, apiKey: Boolean(cfg.apiKey) });
 
   if (p === "/api/config" && method === "GET") return sendJson(res, 200, publicConfig(cfg));
   if (p === "/api/config" && method === "POST") {

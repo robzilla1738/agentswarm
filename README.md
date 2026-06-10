@@ -38,12 +38,20 @@ You give it a mission. A conductor model breaks the mission into tasks and hands
 Requires Node 20 or newer.
 
 ```bash
-cd agentswarm
+npm install -g agent-swarm
+```
+
+That gives you the `swarm` command with the web UI prebuilt, nothing else to do. The E2B/Modal/Vercel SDKs install as optional dependencies; add `--omit=optional` if you'll never use a cloud sandbox.
+
+Or from source:
+
+```bash
+git clone https://github.com/robzilla1738/agentswarm.git && cd agentswarm
 npm run setup        # installs deps + builds the engine and the web UI
 npm link             # optional: puts `swarm` on your PATH
 ```
 
-Without `npm link`, replace `swarm` below with `node bin/swarm.js`. (`npm install` alone also builds the engine; `npm run setup` additionally builds the web UI.)
+Without `npm link`, replace `swarm` below with `node bin/swarm.js`.
 
 ## First run
 

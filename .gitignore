@@ -7,3 +7,4 @@ out/
 .env
 .env.*
 ui/next-env.d.ts
+*.tgz

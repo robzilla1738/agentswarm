@@ -1,12 +1,15 @@
 {
-  "name": "agentswarm",
-  "version": "0.1.0",
-  "private": true,
+  "name": "agent-swarm",
+  "version": "0.2.0",
   "description": "Local agent swarm: a conductor model splits missions into parallel sub-agents with real tools, optional sandboxes, and a localhost web UI. Works with DeepSeek, OpenAI, Anthropic, Grok, MiniMax, OpenRouter, Ollama, and LM Studio.",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/robzilla1738/agentswarm.git"
+  },
+  "homepage": "https://github.com/robzilla1738/agentswarm#readme",
+  "bugs": {
+    "url": "https://github.com/robzilla1738/agentswarm/issues"
   },
   "keywords": [
     "agents",
@@ -25,9 +28,15 @@
     "swarm": "bin/swarm.js"
   },
   "main": "dist/cli.js",
+  "files": [
+    "dist",
+    "bin",
+    "ui/out"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "prepare": "npm run build",
+    "prepublishOnly": "npm run build:all && node test/e2e.js",
     "build:ui": "npm --prefix ui run build",
     "build:all": "npm run build && npm --prefix ui install --no-fund --no-audit && npm run build:ui",
     "setup": "npm install --no-fund --no-audit && npm run build:all",
@@ -40,9 +49,9 @@
     "node": ">=20.10"
   },
   "optionalDependencies": {
-    "@vercel/sandbox": "*",
-    "e2b": "*",
-    "modal": "*"
+    "@vercel/sandbox": "^2.2.0",
+    "e2b": "^2.28.0",
+    "modal": "^0.7.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
