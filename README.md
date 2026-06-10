@@ -38,7 +38,7 @@ You give it a mission. A conductor model breaks the mission into tasks and hands
 Requires Node 20 or newer.
 
 ```bash
-npm install -g agent-swarm
+npm install -g @robzilla1738/agentswarm
 ```
 
 That gives you the `swarm` command with the web UI prebuilt, nothing else to do. The E2B/Modal/Vercel SDKs install as optional dependencies; add `--omit=optional` if you'll never use a cloud sandbox.
