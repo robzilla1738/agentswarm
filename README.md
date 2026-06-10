@@ -10,6 +10,7 @@
 [![npm](https://img.shields.io/npm/v/@robzilla1738/agentswarm)](https://www.npmjs.com/package/@robzilla1738/agentswarm)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![node](https://img.shields.io/badge/node-%E2%89%A520.10-brightgreen)](package.json)
+[![support](https://img.shields.io/badge/support-buy%20me%20a%20coffee-yellow)](https://buymeacoffee.com/robcourson)
 
 A local agent-swarm orchestrator with a terminal dashboard and a localhost web UI. Works with DeepSeek, OpenAI, Anthropic, xAI, MiniMax, OpenRouter, Ollama, LM Studio, or any OpenAI-compatible endpoint.
 
