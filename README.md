@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/swarm-mark-light.png">
+    <img src=".github/assets/swarm-mark-dark.png" alt="agentswarm" width="120">
+  </picture>
+</p>
+
 # agentswarm
 
 [![npm](https://img.shields.io/npm/v/@robzilla1738/agentswarm)](https://www.npmjs.com/package/@robzilla1738/agentswarm)
