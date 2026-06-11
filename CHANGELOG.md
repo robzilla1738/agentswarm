@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.0
+
+Clean sync release: comprehensive integration of all v0.6.0 features (cited research, academic search, PDF extraction, search cooldowns, freshness ranking, conductor ledger re-seeding, cascade diagnostics, mechanical verification, verifier dependency context, strict evidence mode, context windows config, grep_files + atomic multi-edit, plan tab, blackboard search filters, budget sparkline, localhost CORS, symlink-safe writes, atomic memory, plus 15 review-hardening fixes). Fully tested: 116 unit tests, 21 e2e phases. Production ready.
+
 ## 0.6.0
 
 ### Cited research & academic search
