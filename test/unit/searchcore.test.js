@@ -139,3 +139,37 @@ test("parseBingHtml extracts results and decodes /ck/ redirects", () => {
   assert.equal(hits[0].date, "2025-01-02");
   assert.equal(hits[1].url, "https://plain.example.org/page");
 });
+
+// ---------- v0.6.0 additions: reformulate, freshness, academic detection ----------
+
+const { reformulate, freshnessBoost, looksAcademic, classifySource: classify2 } = require("../../dist/searchcore.js");
+
+test("reformulate strips quotes and operators down to keywords", () => {
+  assert.equal(reformulate('"Quoted Exotic Phrase" site:exotic.example'), "quoted exotic phrase");
+  assert.equal(reformulate("intitle:benchmark filetype:pdf vector databases"), "vector databases");
+  assert.equal(reformulate("plain query"), "", "no-op when nothing useful changes");
+});
+
+test("freshnessBoost decays with age", () => {
+  const now = Date.UTC(2026, 5, 15); // 2026-06-15
+  assert.equal(freshnessBoost("2026-01-10", now), 3);
+  assert.equal(freshnessBoost("2025-01-10", now), 2);
+  assert.equal(freshnessBoost("2023", now), 1);
+  assert.equal(freshnessBoost("2018-03-01", now), 0);
+  assert.equal(freshnessBoost(undefined, now), 0);
+  assert.equal(freshnessBoost("no date here", now), 0);
+});
+
+test("looksAcademic detects scholarly intent", () => {
+  assert.ok(looksAcademic("peer-reviewed studies on sleep deprivation"));
+  assert.ok(looksAcademic("arxiv transformer survey"));
+  assert.ok(!looksAcademic("best pizza near me"));
+});
+
+test("classifySource knows the scholarly hosts", () => {
+  assert.equal(classify2("arxiv.org"), "academic");
+  assert.equal(classify2("doi.org"), "academic");
+  assert.equal(classify2("semanticscholar.org"), "academic");
+  assert.equal(classify2("nature.com"), "academic");
+  assert.equal(classify2("pubmed.ncbi.nlm.nih.gov"), "government", ".gov wins — same rank weight");
+});

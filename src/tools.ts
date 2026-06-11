@@ -5,8 +5,9 @@ import { ToolSchema } from "./deepseek";
 import { SandboxRuntime } from "./sandbox";
 import { RunMeta } from "./types";
 import { crawlSite, resolveCrawlBackend, slugForUrl } from "./crawltools";
+import { mergeCandidates } from "./searchcore";
 import { ensureDir, errMsg, pathInside, truncateMiddle } from "./util";
-import { fetchUrl, webSearch } from "./webtools";
+import { arxivSearch, crossrefSearch, fetchUrl, webSearch } from "./webtools";
 
 export interface ToolCtx {
   cfg: SwarmConfig;
@@ -301,6 +302,40 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
           const quotes = (h.passages || []).map((p) => `   > ${p}`).join("\n");
           return quotes ? `${head}\n${quotes}` : head;
         })
+        .join("\n");
+    },
+  };
+
+  tools.academic_search = {
+    schema: {
+      name: "academic_search",
+      description:
+        "Search scholarly sources: arXiv preprints and Crossref journal/conference metadata (keyless APIs). Returns papers with title, link (arXiv/DOI), abstract snippet, and date. Use for scientific or technical questions where peer-reviewed and preprint sources beat the open web.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          count: { type: "number", description: "Max results, default 8, max 20" },
+        },
+        required: ["query"],
+      },
+    },
+    run: async (args, ctx) => {
+      const count = Math.min(Math.max(Number(args.count) || 8, 1), 20);
+      const q = String(args.query);
+      const settled = await Promise.allSettled([
+        arxivSearch(q, count, ctx.signal),
+        crossrefSearch(q, count, ctx.signal),
+      ]);
+      const candidates = settled.flatMap((s) => (s.status === "fulfilled" ? s.value : []));
+      if (!candidates.length) {
+        const err = settled.find((s): s is PromiseRejectedResult => s.status === "rejected");
+        if (err) throw err.reason;
+        return "no results";
+      }
+      const merged = mergeCandidates(candidates, count);
+      return merged
+        .map((h, i) => `${i + 1}. ${h.title}${h.date ? ` (${h.date})` : ""} [${h.engine}]\n   ${h.url}\n   ${h.snippet}`)
         .join("\n");
     },
   };

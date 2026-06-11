@@ -1,17 +1,20 @@
 import { SwarmConfig } from "./config";
 import { hasScrapeBackend, scrapeUrl } from "./crawltools";
+import { extractPdfText } from "./pdftext";
 import {
   Candidate,
   detectDate,
   expandQueries,
+  looksAcademic,
   mergeCandidates,
   passageBonus,
   queryTerms,
   rankBonus,
+  reformulate,
   scorePage,
   selectPassages,
 } from "./searchcore";
-import { decodeEntities, htmlToText, truncateMiddle } from "./util";
+import { decodeEntities, htmlToText, oneLine, truncateMiddle } from "./util";
 
 export interface SearchHit {
   title: string;
@@ -46,7 +49,8 @@ export async function webSearch(
   count: number,
   signal?: AbortSignal,
   deep = false,
-  warn?: (msg: string) => void
+  warn?: (msg: string) => void,
+  _retried = false
 ): Promise<SearchHit[]> {
   // Deep searches widen recall by issuing complementary phrasings; the fast
   // path stays a single query so an agent's tool loop isn't slowed.
@@ -64,18 +68,29 @@ export async function webSearch(
       }
     }
   }
+  // Scholarly questions also sweep the keyless academic APIs (deep mode only).
+  if (deep && looksAcademic(query)) {
+    engineCalls.push(arxivSearch(query, perEngine, signal), crossrefSearch(query, perEngine, signal));
+  }
 
   const settled = await Promise.allSettled(engineCalls);
   const candidates = settled.flatMap((s) => (s.status === "fulfilled" ? s.value : []));
   if (!candidates.length) {
     const firstErr = settled.find((s): s is PromiseRejectedResult => s.status === "rejected");
+    if (firstErr && settled.every((s) => s.status === "rejected")) throw firstErr.reason;
+    // Engines answered but nothing parsed/matched: one retry with a
+    // simplified phrasing before giving up.
+    if (!_retried) {
+      const alt = reformulate(query);
+      if (alt) {
+        warn?.(`no results for "${query}" — retrying as "${alt}"`);
+        return webSearch(cfg, alt, count, signal, deep, warn, true);
+      }
+    }
     if (firstErr) throw firstErr.reason;
     return [];
   }
   const failures = settled.filter((s) => s.status === "rejected").length;
-  if (failures && failures === settled.length) {
-    throw (settled.find((s): s is PromiseRejectedResult => s.status === "rejected"))!.reason;
-  }
   if (failures) {
     warn?.(`${failures}/${settled.length} search engine calls failed; results come from the rest`);
   }
@@ -140,14 +155,20 @@ async function fetchReadable(url: string, signal?: AbortSignal): Promise<string>
     }
   }
   const res = await fetch(url, {
-    headers: { "user-agent": UA, accept: "text/html,text/*;q=0.9,*/*;q=0.5" },
+    headers: { "user-agent": UA, accept: "text/html,application/pdf,text/*;q=0.9,*/*;q=0.5" },
     signal: mergeSignal(20_000, signal),
     redirect: "follow",
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const ctype = res.headers.get("content-type") || "";
+  if (/application\/pdf/i.test(ctype)) {
+    const buf = Buffer.from(await res.arrayBuffer());
+    const pdf = buf.length <= 20_000_000 ? extractPdfText(buf) : null;
+    if (!pdf) throw new Error("pdf with no extractable text");
+    return clip(pdf.text);
+  }
   if (!/text\/|html|xml|json/i.test(ctype)) throw new Error(`not textual: ${ctype}`);
-  const body = await res.text();
+  const body = decodeBody(Buffer.from(await res.arrayBuffer()), ctype);
   const text = /html/i.test(ctype) ? htmlToText(body) : body;
   return clip(text);
 }
@@ -164,6 +185,43 @@ function mergeSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
 }
 
 // ---------------------------------------------------------------- engines
+
+/**
+ * Per-engine rate-limit cooldowns: an engine that answers 429/403/503 sits
+ * out (60s, or the server's retry-after up to 120s) instead of getting
+ * hammered into a long block mid-research. A tiny retry-after (≤5s) is
+ * honored once in-call.
+ */
+const engineCooldown = new Map<string, number>();
+
+/** Test hook. */
+export function _resetEngineCooldowns(): void {
+  engineCooldown.clear();
+}
+
+async function engineFetch(
+  engine: string,
+  url: string,
+  init: { headers?: Record<string, string> },
+  signal?: AbortSignal
+): Promise<Response> {
+  const until = engineCooldown.get(engine) ?? 0;
+  if (until > Date.now()) {
+    throw new Error(`${engine} is cooling down after a rate limit (${Math.ceil((until - Date.now()) / 1000)}s left)`);
+  }
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, { ...init, signal: mergeSignal(20_000, signal) });
+    if (![429, 403, 503].includes(res.status)) return res;
+    const retryAfter = Number(res.headers.get("retry-after"));
+    if (attempt === 0 && Number.isFinite(retryAfter) && retryAfter > 0 && retryAfter <= 5) {
+      await new Promise((r) => setTimeout(r, retryAfter * 1000));
+      continue;
+    }
+    const ms = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter, 120) * 1000 : 60_000;
+    engineCooldown.set(engine, Date.now() + ms);
+    throw new Error(`${engine} rate-limited (HTTP ${res.status}); cooling down ${Math.round(ms / 1000)}s`);
+  }
+}
 
 async function tinyfishSearch(
   cfg: SwarmConfig,
@@ -211,10 +269,9 @@ async function ddgSearch(query: string, count: number, signal?: AbortSignal): Pr
   let reachedAny = false;
   for (const ep of DDG_ENDPOINTS) {
     try {
-      const res = await fetch(ep.url + encodeURIComponent(query), {
+      const res = await engineFetch("duckduckgo", ep.url + encodeURIComponent(query), {
         headers: { "user-agent": UA },
-        signal: mergeSignal(20_000, signal),
-      });
+      }, signal);
       if (!res.ok) throw new Error(`search failed: HTTP ${res.status}`);
       reachedAny = true;
       const hits = parseDdgHtml(await res.text(), count, ep.linkRe());
@@ -253,12 +310,51 @@ function parseDdgHtml(html: string, count: number, linkRe: RegExp): Candidate[] 
 
 /** Bing's HTML results page: each hit is an <li class="b_algo"> with an <h2><a> link. */
 async function bingSearch(query: string, count: number, signal?: AbortSignal): Promise<Candidate[]> {
-  const res = await fetch(`https://www.bing.com/search?q=${encodeURIComponent(query)}`, {
+  const res = await engineFetch("bing", `https://www.bing.com/search?q=${encodeURIComponent(query)}`, {
     headers: { "user-agent": UA, "accept-language": "en-US,en;q=0.9" },
-    signal: mergeSignal(20_000, signal),
-  });
+  }, signal);
   if (!res.ok) throw new Error(`bing search ${res.status}`);
   return parseBingHtml(await res.text(), count);
+}
+
+// ---------------------------------------------------------------- academic engines (keyless)
+
+/** arXiv's Atom API — preprints with abstracts, no key needed. */
+export async function arxivSearch(query: string, count: number, signal?: AbortSignal): Promise<Candidate[]> {
+  const url = `https://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(query)}&max_results=${Math.min(count, 15)}`;
+  const res = await engineFetch("arxiv", url, { headers: { "user-agent": UA } }, signal);
+  if (!res.ok) throw new Error(`arxiv search ${res.status}`);
+  const xml = await res.text();
+  const out: Candidate[] = [];
+  for (const entry of xml.split(/<entry>/).slice(1)) {
+    if (out.length >= count) break;
+    const title = strip((/<title>([\s\S]*?)<\/title>/.exec(entry) || [])[1] || "");
+    const id = ((/<id>([\s\S]*?)<\/id>/.exec(entry) || [])[1] || "").trim();
+    const summary = strip((/<summary>([\s\S]*?)<\/summary>/.exec(entry) || [])[1] || "");
+    const published = (/<published>(\d{4}-\d{2}-\d{2})/.exec(entry) || [])[1];
+    if (!id || !title || !/^https?:\/\//.test(id)) continue;
+    out.push({ title, url: id, snippet: summary.slice(0, 300), rank: out.length + 1, engine: "arxiv", date: published });
+  }
+  return out;
+}
+
+/** Crossref's works API — journal/conference metadata with DOIs, no key needed. */
+export async function crossrefSearch(query: string, count: number, signal?: AbortSignal): Promise<Candidate[]> {
+  const url = `https://api.crossref.org/works?query=${encodeURIComponent(query)}&rows=${Math.min(count, 15)}&select=title,DOI,abstract,issued,container-title`;
+  const res = await engineFetch("crossref", url, { headers: { "user-agent": UA } }, signal);
+  if (!res.ok) throw new Error(`crossref search ${res.status}`);
+  const data: any = await res.json();
+  const out: Candidate[] = [];
+  for (const it of data?.message?.items ?? []) {
+    if (out.length >= count) break;
+    const title = strip(String(Array.isArray(it.title) ? it.title[0] ?? "" : it.title ?? ""));
+    if (!title || !it.DOI) continue;
+    const date = Array.isArray(it.issued?.["date-parts"]?.[0]) ? it.issued["date-parts"][0].join("-") : undefined;
+    const venue = Array.isArray(it["container-title"]) ? it["container-title"][0] : "";
+    const snippet = (strip(String(it.abstract ?? "")) || venue || "").slice(0, 300);
+    out.push({ title, url: `https://doi.org/${it.DOI}`, snippet, rank: out.length + 1, engine: "crossref", date });
+  }
+  return out;
 }
 
 export function parseBingHtml(html: string, count: number): Candidate[] {
@@ -332,17 +428,51 @@ export async function fetchUrl(
     }
   }
   const res = await fetch(url, {
-    headers: { "user-agent": UA, accept: "text/html,application/json,text/*;q=0.9,*/*;q=0.5" },
+    headers: { "user-agent": UA, accept: "text/html,application/json,application/pdf,text/*;q=0.9,*/*;q=0.5" },
     signal: signal ?? AbortSignal.timeout(25000),
     redirect: "follow",
   });
   const ctype = res.headers.get("content-type") || "";
-  const body = await res.text();
   if (!res.ok) {
-    return `HTTP ${res.status} ${res.statusText}\n${truncateMiddle(body, 2000, "chars")}`;
+    // An error page is not content: returning it as a successful result lets
+    // "HTTP 403 ... subscribe to continue" become a "fact" in someone's report.
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `HTTP ${res.status} ${res.statusText} — page is not usable as a source (paywall/login/blocked?). ` +
+        `Try web_search for an alternative source.${body ? ` Server said: ${oneLine(htmlToText(body), 200)}` : ""}`
+    );
   }
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (/application\/pdf/i.test(ctype) || buf.subarray(0, 5).toString("latin1") === "%PDF-") {
+    if (buf.length > 20_000_000) throw new Error(`PDF is ${Math.round(buf.length / 1e6)}MB — too large to extract`);
+    const pdf = extractPdfText(buf);
+    if (!pdf) {
+      throw new Error("PDF contains no extractable text (likely scanned or encrypted) — find an HTML version of this source.");
+    }
+    return truncateMiddle(`[PDF, ${pdf.pages} page${pdf.pages > 1 ? "s" : ""}]\n${pdf.text}`, maxChars, "chars");
+  }
+  const body = decodeBody(buf, ctype);
   const text = !raw && /html/i.test(ctype) ? htmlToText(body) : body;
+  if (!raw && /html/i.test(ctype)) {
+    const trimmed = text.trim();
+    if (trimmed.length < 400 && /subscrib|sign.?in|log.?in|enable javascript|access denied|are you a (human|robot)|captcha/i.test(trimmed)) {
+      return `WARNING: this page returned only a paywall/anti-bot shell — the text below is probably not the real content. Try web_search for an alternative source.\n\n${trimmed}`;
+    }
+  }
   return truncateMiddle(text, maxChars, "chars");
+}
+
+/** Decode a response body honoring its content-type charset (UTF-8 fallback). */
+function decodeBody(buf: Buffer, ctype: string): string {
+  const charset = /charset=([\w-]+)/i.exec(ctype)?.[1]?.toLowerCase();
+  if (charset && charset !== "utf-8" && charset !== "utf8") {
+    try {
+      return new TextDecoder(charset).decode(buf);
+    } catch {
+      /* unknown label — fall through to utf-8 */
+    }
+  }
+  return buf.toString("utf8");
 }
 
 async function tinyfishFetch(

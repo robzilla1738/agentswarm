@@ -38,6 +38,26 @@ export function expandQueries(query: string, max = 3): string[] {
   return out.map((q) => q.trim()).filter((q) => q && !seen.has(q.toLowerCase()) && seen.add(q.toLowerCase())).slice(0, max);
 }
 
+/**
+ * Fallback phrasing when a query returns nothing: strip quotes and search
+ * operators down to the top keyword terms. Returns "" when no useful
+ * simplification exists.
+ */
+export function reformulate(query: string): string {
+  const cleaned = query
+    .replace(/["'""'']/g, " ")
+    .replace(/\b(site|intitle|inurl|filetype):\S+/gi, " ");
+  const alt = queryTerms(cleaned).slice(0, 6).join(" ");
+  return alt && alt !== query.toLowerCase().trim() ? alt : "";
+}
+
+/** Queries that smell academic trigger the scholarly engines in deep mode. */
+export function looksAcademic(query: string): boolean {
+  return /\b(paper|papers|study|studies|research|arxiv|doi|journal|peer.?review(ed)?|preprint|dataset|benchmark|survey|meta.?analysis|citations?|et al)\b/i.test(
+    query
+  );
+}
+
 const TRACKING_KEYS = new Set(["fbclid", "gclid", "mc_cid", "mc_eid"]);
 
 /** Stable canonical form for dedup: strip tracking params, www, trailing slash; sort the query. */
@@ -59,13 +79,41 @@ export function canonicalizeUrl(url: string): string {
   return `${u.protocol.toLowerCase()}//${host}${path}${query}`;
 }
 
+const ACADEMIC_HOSTS = [
+  "arxiv.org",
+  "doi.org",
+  "semanticscholar.org",
+  "ncbi.nlm.nih.gov",
+  "nature.com",
+  "sciencedirect.com",
+  "springer.com",
+  "link.springer.com",
+  "scholar.google.com",
+  "acm.org",
+  "ieee.org",
+];
+
 export function classifySource(domain: string): SourceType {
   const d = domain.toLowerCase();
   if (d.endsWith(".gov") || d.endsWith(".mil")) return "government";
   if (d.endsWith(".edu")) return "academic";
+  if (ACADEMIC_HOSTS.some((h) => d === h || d.endsWith("." + h))) return "academic";
   if (["twitter.com", "x.com", "reddit.com", "facebook.com"].some((s) => d.includes(s))) return "social";
   if (d.includes("news") || d.includes("reuters.com") || d.includes("apnews.com") || d.includes("bbc.")) return "news";
   return "secondary";
+}
+
+/** Recency boost from an ISO date or bare year: +3 <1y, +2 <2y, +1 <5y, 0 older/undated. */
+export function freshnessBoost(date: string | undefined, now = Date.now()): number {
+  if (!date) return 0;
+  const m = /^(\d{4})(?:-(\d{1,2})(?:-(\d{1,2}))?)?/.exec(date.trim());
+  if (!m) return 0;
+  const t = Date.UTC(Number(m[1]), m[2] ? Number(m[2]) - 1 : 6, m[3] ? Number(m[3]) : 15);
+  const years = (now - t) / 31_557_600_000;
+  if (years < 1) return 3;
+  if (years < 2) return 2;
+  if (years < 5) return 1;
+  return 0;
 }
 
 /** ISO date if present, else a bare year. */
@@ -134,7 +182,7 @@ export function scorePage(page: PageSignal, terms: string[]): number {
   if (domain.includes("docs") || url.includes("docs") || title.includes("documentation")) score += 5;
   if (domain === "github.com" || domain === "gitlab.com") score += 4;
   if (["pypi.org", "npmjs.com", "rubygems.org"].includes(domain)) score -= 2;
-  if (page.date) score += 1;
+  score += freshnessBoost(page.date);
   const lowered = page.text.toLowerCase();
   for (const t of terms) if (lowered.includes(t)) score += 1;
   score += Math.min(page.text.length / 4000, 1);
@@ -162,6 +210,8 @@ export function resultQualityScore(c: Candidate): number {
   if (title.includes("official") || snippet.includes("official")) score += 4;
   if (title.includes("documentation") || snippet.includes("documentation") || url.includes("docs")) score += 4;
   if (url.includes("github.com") || url.includes("gitlab.com")) score += 3;
+  if (c.engine === "arxiv" || c.engine === "crossref") score += 3;
+  score += Math.min(2, freshnessBoost(c.date));
   if (LOW_VALUE_SNIPPET.some((t) => snippet.includes(t))) score -= 10;
   return score;
 }
