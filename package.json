@@ -47,7 +47,7 @@
     "serve": "node bin/swarm.js serve",
     "demo": "node bin/swarm.js demo",
     "test": "npm run test:unit && node test/e2e.js",
-    "test:unit": "node --test \"test/unit/**/*.test.js\""
+    "test:unit": "node --test test/unit/*.test.js"
   },
   "engines": {
     "node": ">=20.10"
