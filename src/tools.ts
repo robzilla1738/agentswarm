@@ -4,6 +4,7 @@ import { SwarmConfig } from "./config";
 import { ToolSchema } from "./deepseek";
 import { SandboxRuntime } from "./sandbox";
 import { RunMeta } from "./types";
+import { crawlSite, resolveCrawlBackend, slugForUrl } from "./crawltools";
 import { ensureDir, errMsg, pathInside, truncateMiddle } from "./util";
 import { fetchUrl, webSearch } from "./webtools";
 
@@ -89,7 +90,7 @@ async function writeFileVia(ctx: ToolCtx, abs: string, content: string): Promise
 
 // ---------- tool definitions ----------
 
-export function workerToolset(): Record<string, ToolDef> {
+export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
   const tools: Record<string, ToolDef> = {};
 
   tools.shell = {
@@ -276,20 +277,20 @@ export function workerToolset(): Record<string, ToolDef> {
     schema: {
       name: "web_search",
       description:
-        "Search the web. Returns ranked results with title, URL and snippet. " +
-        "Set deep=true to also fetch top pages and return quotable passages (slower; use for claims that need grounding).",
+        "Search the web. Fans out across multiple engines (DuckDuckGo, Bing, +TinyFish if configured), merges and quality-ranks results, and dedupes by canonical URL. Returns ranked results with title, URL and snippet. " +
+        "Set deep=true to widen the query into complementary phrasings, fetch the top pages, and return quotable passages with publication dates — use for thorough research and any claim that needs grounding. Raise count (up to 25) to pull more sources per call.",
       parameters: {
         type: "object",
         properties: {
           query: { type: "string" },
-          count: { type: "number", description: "Max results, default 6, max 10" },
-          deep: { type: "boolean", description: "Fetch page content for quotable passages" },
+          count: { type: "number", description: "Max results, default 8, max 25" },
+          deep: { type: "boolean", description: "Multi-phrasing sweep + fetch pages for quotable passages" },
         },
         required: ["query"],
       },
     },
     run: async (args, ctx) => {
-      const count = Math.min(Math.max(Number(args.count) || 6, 1), 10);
+      const count = Math.min(Math.max(Number(args.count) || 8, 1), 25);
       const hits = await webSearch(ctx.cfg, String(args.query), count, ctx.signal, Boolean(args.deep), (msg) =>
         ctx.log?.("warn", msg)
       );
@@ -419,7 +420,7 @@ export function workerToolset(): Record<string, ToolDef> {
     schema: {
       name: "save_artifact",
       description:
-        "Save a deliverable into the run's artifacts folder (shown prominently to the operator). Provide content, or from_path to copy an existing file.",
+        "Save a deliverable into the run's artifacts folder (shown prominently to the operator). Provide content, or from_path to copy an existing file. Any file type works — save deliverables in the format that fits them (.csv/.json for data, .html for documents, runnable code files), not just markdown.",
       parameters: {
         type: "object",
         properties: {
@@ -451,6 +452,64 @@ export function workerToolset(): Record<string, ToolDef> {
     },
   };
 
+  // Only offered when a crawl backend (Firecrawl / context.dev / deepcrawl)
+  // is configured — there is no free fallback for whole-site crawls.
+  if (cfg && resolveCrawlBackend(cfg)) {
+    tools.crawl_site = {
+      schema: {
+        name: "crawl_site",
+        description:
+          "Crawl a website (JS-rendered, clean markdown) and save every discovered page as a markdown file under crawl/<host>/ in the working directory. Returns an index of the saved files — read individual pages afterwards with read_file. Use for ingesting documentation sites or multi-page content; use fetch_url for single pages.",
+        parameters: {
+          type: "object",
+          properties: {
+            url: { type: "string", description: "Starting URL to crawl" },
+            max_pages: { type: "number", description: "Page limit (default 15, max 50)" },
+            include_paths: {
+              type: "array",
+              items: { type: "string" },
+              description: "Limit the crawl to URL path prefixes/globs, e.g. /docs/*",
+            },
+          },
+          required: ["url"],
+        },
+      },
+      run: async (args, ctx) => {
+        const url = String(args.url ?? "");
+        if (!/^https?:\/\//.test(url)) throw new Error("only http(s) URLs are supported");
+        const maxPages = Math.min(Math.max(Number(args.max_pages) || 15, 1), 50);
+        const includePaths = Array.isArray(args.include_paths)
+          ? args.include_paths.map(String).filter(Boolean)
+          : undefined;
+        const out = await crawlSite(ctx.cfg, { url, maxPages, includePaths, signal: ctx.signal });
+        if (!out.pages.length) {
+          return `crawled ${url} via ${out.backend}: no pages with content${out.warnings.length ? `\nwarnings: ${out.warnings.join("; ")}` : ""}`;
+        }
+        const used = new Set<string>();
+        const lines: string[] = [];
+        for (const page of out.pages) {
+          const { host, slug } = slugForUrl(page.url || url);
+          let rel = `crawl/${host}/${slug}.md`;
+          for (let n = 2; used.has(rel); n++) rel = `crawl/${host}/${slug}-${n}.md`;
+          used.add(rel);
+          const abs = resolveWrite(rel, ctx);
+          const header = `# ${page.title || page.url || "untitled"}\n\nSource: ${page.url || url}\n\n`;
+          await writeFileVia(ctx, abs, header + page.markdown);
+          if (lines.length < 50) {
+            lines.push(`  ${rel} — "${page.title || "untitled"}" (${page.markdown.length.toLocaleString()} chars)`);
+          }
+        }
+        const hidden = out.pages.length - lines.length;
+        return [
+          `crawled ${url} via ${out.backend}: ${out.pages.length} page${out.pages.length > 1 ? "s" : ""} saved`,
+          ...lines,
+          ...(hidden > 0 ? [`  …and ${hidden} more (list crawl/ to see all)`] : []),
+          ...(out.warnings.length ? [`warnings: ${out.warnings.join("; ")}`] : []),
+        ].join("\n");
+      },
+    };
+  }
+
   return tools;
 }
 
@@ -470,6 +529,7 @@ export function synthToolset(): Record<string, ToolDef> {
   return {
     read_file: all.read_file,
     list_dir: all.list_dir,
+    save_artifact: all.save_artifact,
   };
 }
 

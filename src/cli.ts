@@ -484,8 +484,10 @@ function cmdReport(id: string, flags: Args["flags"]): void {
     process.exit(1);
   }
   if (flags.open) {
-    openBrowser("file://" + file);
-    console.log(file);
+    const html = path.join(runDir(id), "artifacts", "final-report.html");
+    const target = fs.existsSync(html) ? html : file;
+    openBrowser("file://" + target);
+    console.log(target);
     return;
   }
   process.stdout.write(fs.readFileSync(file, "utf8") + "\n");
@@ -622,7 +624,7 @@ function printFinalLine(id: string): void {
   console.log("");
   if (fs.existsSync(reportFile)) {
     console.log(ansi.green("✓ final report: ") + reportFile);
-    console.log(ansi.gray("  view: ") + `swarm report ${id}`);
+    console.log(ansi.gray("  view: ") + `swarm report ${id}` + ansi.gray("  ·  open in browser: ") + `swarm report ${id} --open`);
   } else {
     console.log(ansi.gray(`run ${id} ended without a final report (see: swarm watch ${id})`));
   }
@@ -670,7 +672,6 @@ ${b("RUN OPTIONS")}
 ${b("FIRST RUN")}
   swarm config set apiKey <key>             # key for the active provider (default: DeepSeek)
   swarm config set provider <id>            # deepseek | openai | anthropic | xai | minimax | openrouter | ollama | lmstudio | custom
-  pip install searchkit                     # optional: local, citable web search for agents
   swarm serve --open                        # open the web UI
 `);
 }

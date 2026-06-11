@@ -119,6 +119,11 @@ async function phaseHappy() {
   if (!fs.existsSync(reportFile) || !/Mission Report/.test(fs.readFileSync(reportFile, "utf8"))) fail("final report missing/incomplete");
   ok("synthesizer wrote final-report.md");
 
+  const htmlFile = path.join(runDir, "artifacts", "final-report.html");
+  const htmlBody = fs.existsSync(htmlFile) ? fs.readFileSync(htmlFile, "utf8") : "";
+  if (!/^<!doctype html>/.test(htmlBody) || !/Mission Report/.test(htmlBody)) fail("final-report.html missing/incomplete");
+  ok("engine rendered final-report.html alongside the markdown");
+
   if (byType("run.status").pop().status !== "done") fail("run did not end as done");
   ok("run finished with status=done");
 

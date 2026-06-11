@@ -27,7 +27,7 @@ interface Knobs {
 
 /** Quick = cheap sanity pass. Deep = long-horizon research with strict QA. */
 const QUICK: Knobs = { workers: 4, tasks: 16, steps: 20, budgetM: 4, verification: "off" };
-const DEEP: Knobs = { workers: 12, tasks: 160, steps: 60, budgetM: 60, verification: "strict" };
+const DEEP: Knobs = { workers: 20, tasks: 300, steps: 80, budgetM: 120, verification: "strict" };
 
 export function MissionComposer({ config }: { config: PublicConfig | null }) {
   const router = useRouter();
@@ -172,7 +172,8 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
         />
       )}
 
-      {advanced && (
+      <div className="collapse-v" data-open={advanced}>
+        <div inert={!advanced}>
         <div className="mt-4 pt-4 space-y-4 border-t border-border-soft">
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="text-2xs text-ink-faint mr-1">Size</span>
@@ -182,7 +183,7 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
             <PresetChip active={preset === "standard"} onClick={() => applyPreset(standard)} title="Your saved defaults from Settings">
               Standard
             </PresetChip>
-            <PresetChip active={preset === "deep"} onClick={() => applyPreset(DEEP)} title="12 agents · 160 tasks · big budget · strict verification — long-horizon research">
+            <PresetChip active={preset === "deep"} onClick={() => applyPreset(DEEP)} title="20 agents · 300 tasks · 120M budget · strict verification — hundreds of sources, long-horizon research">
               Deep research
             </PresetChip>
             {preset === "custom" && <span className="chip" style={{ color: "var(--color-ink)" }}>custom</span>}
@@ -255,7 +256,8 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
             </p>
           )}
         </div>
-      )}
+        </div>
+      </div>
 
       {error && (
         <div className="mt-3 text-sm text-ink px-3 py-2 rounded-lg" style={{ background: "rgb(var(--hi) / 0.06)", border: "1px solid rgb(var(--hi) / 0.2)" }}>

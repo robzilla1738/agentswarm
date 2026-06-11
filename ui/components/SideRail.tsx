@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { fmtAgo, fmtClock } from "@/lib/format";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { type ActivityGroup, groupActivity } from "@/lib/feed";
+import { fmtAgo, fmtClock, fmtClockShort } from "@/lib/format";
 import { PixelAvatar, personaName } from "@/lib/persona";
 import type { ActivityItem, BlackboardNote, ConductorSay, OperatorNote } from "@/lib/types";
-import { EmptyState, Md, ToolIcon } from "./atoms";
+import { Clamp, EmptyState, Md, ToolIcon } from "./atoms";
 
 type Tab = "activity" | "conductor" | "blackboard";
 
@@ -51,6 +52,7 @@ export function SideRail({
 function ActivityFeed({ activity, now }: { activity: ActivityItem[]; now: number }) {
   const ref = useRef<HTMLDivElement>(null);
   const [stick, setStick] = useState(true);
+  const rows = useMemo(() => groupActivity(activity), [activity]);
 
   useEffect(() => {
     if (stick && ref.current) ref.current.scrollTop = ref.current.scrollHeight;
@@ -70,7 +72,7 @@ function ActivityFeed({ activity, now }: { activity: ActivityItem[]; now: number
         }}
         className="h-full overflow-y-auto px-3 py-2 space-y-0.5"
       >
-        {activity.map((item) => (
+        {rows.map((item) => (
           <ActivityRow key={item.id} item={item} />
         ))}
       </div>
@@ -99,7 +101,7 @@ function ActivityFeed({ activity, now }: { activity: ActivityItem[]; now: number
  * stay mono; everything prose-like is sans and clamped — the rail should scan
  * like a feed, not a log dump.
  */
-function ActivityRow({ item }: { item: ActivityItem }) {
+function ActivityRow({ item }: { item: ActivityGroup }) {
   const isResult = item.kind === "result";
   let head: React.ReactNode = null;
   let text = item.text ?? "";
@@ -109,12 +111,13 @@ function ActivityRow({ item }: { item: ActivityItem }) {
     head = (
       <span className="mono font-medium text-ink mr-1.5 whitespace-nowrap">
         <ToolIcon name={item.name} /> {item.name}
+        {(item.count ?? 1) > 1 && <span className="text-ink-faint"> ×{item.count}</span>}
       </span>
     );
     tone = "text-ink-faint";
   } else if (isResult) {
-    head = <span className={`mr-1.5 ${item.ok ? "text-ink-faint" : "text-ink"}`}>{item.ok ? "↳" : "↳ ✗"}</span>;
-    tone = item.ok ? "text-ink-faint" : "text-ink";
+    head = <span className={`mr-1.5 ${item.ok ? "text-ink-faint" : "text-ink-dim"}`}>{item.ok ? "↳" : "↳ ✗"}</span>;
+    tone = item.ok ? "text-ink-faint" : "text-ink-dim";
   } else if (item.kind === "note") {
     head = <span className="text-ink-dim mr-1.5">✦</span>;
   } else if (item.kind === "spawn") {
@@ -129,28 +132,26 @@ function ActivityRow({ item }: { item: ActivityItem }) {
 
   return (
     <div
-      className="flex items-start gap-2 py-1.5 text-xs leading-snug"
+      className="flex items-center gap-2 py-1 text-xs leading-snug"
       style={{ animation: "var(--animate-rise)" }}
-      title={`${new Date(item.t).toLocaleString()}${item.taskId ? ` · ${item.taskId} ${personaName(item.taskId)}` : ""}`}
+      title={`${new Date(item.t).toLocaleString()}${item.taskId ? ` · ${item.taskId} ${personaName(item.taskId)}` : " · conductor"}${item.name ? `\n${item.name}` : ""}${text ? `\n${text}` : ""}`}
     >
-      <span className="flex items-center gap-1.5 shrink-0 w-[56px]" style={{ marginTop: 1 }}>
+      <span className="flex items-center gap-1.5 shrink-0 w-[52px]">
         {item.taskId ? (
           <>
             <PixelAvatar seed={item.taskId} size={18} />
             <span className="mono text-2xs text-ink-faint">{item.taskId}</span>
           </>
         ) : (
-          <span className="mono text-2xs text-ink-faint">◉</span>
+          <span className="mono text-2xs text-ink-faint inline-flex items-center justify-center" style={{ width: 18 }}>◉</span>
         )}
       </span>
-      <span className={`min-w-0 flex-1 ${isResult ? "pl-2 border-l border-border-soft" : ""}`}>
-        <span className="line-clamp-2" style={{ overflowWrap: "anywhere" }}>
-          {head}
-          <span className={tone}>{text}</span>
-        </span>
+      <span className={`min-w-0 flex-1 truncate ${isResult ? "pl-2 border-l border-border-soft" : ""}`}>
+        {head}
+        <span className={tone}>{text}</span>
       </span>
-      <span className="mono text-2xs shrink-0 text-ink-faint" style={{ marginTop: 1 }}>
-        {fmtClock(item.t)}
+      <span className="mono text-2xs shrink-0 w-[36px] text-right text-ink-faint">
+        {fmtClockShort(item.t)}
       </span>
     </div>
   );
@@ -231,7 +232,9 @@ function Blackboard({ notes, now }: { notes: BlackboardNote[]; now: number }) {
             {n.taskId && <span className="mono shrink-0">{n.taskId}</span>}
             <span className="ml-auto shrink-0">{fmtAgo(n.t, now)}</span>
           </div>
-          <Md compact dim>{n.text}</Md>
+          <Clamp lines={5}>
+            <Md compact dim>{n.text}</Md>
+          </Clamp>
         </div>
       ))}
     </div>

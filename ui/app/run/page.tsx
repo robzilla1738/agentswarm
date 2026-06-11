@@ -9,7 +9,7 @@ import { SideRail } from "@/components/SideRail";
 import { SwarmBoard } from "@/components/SwarmBoard";
 import { TaskDetail } from "@/components/TaskDetail";
 import { TopBar } from "@/components/TopBar";
-import { BudgetBar, Md, Spinner, StatusBadge, StatusDot } from "@/components/atoms";
+import { BudgetBar, Spinner, StatusBadge, StatusDot } from "@/components/atoms";
 import { api } from "@/lib/api";
 import { fmtDur, fmtMoney, fmtTokens } from "@/lib/format";
 import { useNow, useRun } from "@/lib/hooks";
@@ -109,7 +109,6 @@ function RunView() {
   };
   const cacheHitPct =
     data.usage.promptTokens > 0 ? Math.round((data.usage.cacheHitTokens / data.usage.promptTokens) * 100) : 0;
-  const conductorLatest = data.conductorLog[data.conductorLog.length - 1]?.text;
 
   const metaLine = [
     meta.options.model,
@@ -180,25 +179,29 @@ function RunView() {
             </div>
           </div>
 
-          <div className="flex flex-wrap gap-x-8 gap-y-3 mt-4">
-            <Stat
-              label="Tasks"
-              value={`${counts.done}/${counts.total}`}
-              sub={counts.failed ? `${counts.failed} failed` : counts.blocked ? `${counts.blocked} blocked` : "done"}
-              alert={counts.failed > 0 || counts.blocked > 0}
-            />
-            <Stat label="Active" value={String(data.activeAgents.length)} sub="agents" />
-            <Stat label="Tokens" value={fmtTokens(spent)} sub={cacheHitPct > 0 ? `${cacheHitPct}% cached` : `of ${fmtTokens(cap)}`} />
-            <Stat label="Cost" value={fmtMoney(data.cost)} sub="estimated" />
-            <Stat label="Elapsed" value={elapsed} sub={live && !interrupted ? "running" : "total"} />
+          <div className="mono text-2xs text-ink-faint mt-3 flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span className="text-ink-dim">{counts.done}/{counts.total} tasks</span>
+            {counts.failed > 0 && <span className="text-ink font-bold">{counts.failed} failed</span>}
+            {counts.blocked > 0 && <span className="text-ink font-bold">{counts.blocked} blocked</span>}
+            <span>·</span>
+            <span>{data.activeAgents.length} active</span>
+            <span>·</span>
+            <span>{fmtTokens(spent)} tok{cacheHitPct > 0 ? ` · ${cacheHitPct}% cached` : ""}</span>
+            <span>·</span>
+            <span title="total artifacts saved by the swarm">↧ {artifactCount} sources</span>
+            <span>·</span>
+            <span>{fmtMoney(data.cost)}</span>
+            <span>·</span>
+            <span>{elapsed}</span>
           </div>
 
-          <div className="mt-3.5">
-            <BudgetBar spent={spent} cap={cap} />
-            <div className="flex justify-between mt-1.5 mono text-2xs text-ink-faint">
-              <span>budget · {fmtTokens(spent)} of {fmtTokens(cap)}</span>
-              <span>{cap > 0 ? Math.min(100, Math.round((spent / cap) * 100)) : 0}%</span>
+          <div className="mt-3 flex items-center gap-3">
+            <div className="flex-1 min-w-0">
+              <BudgetBar spent={spent} cap={cap} height={3} />
             </div>
+            <span className="mono text-2xs text-ink-faint shrink-0">
+              {cap > 0 ? Math.min(100, Math.round((spent / cap) * 100)) : 0}% of {fmtTokens(cap)}
+            </span>
           </div>
 
           {live && !interrupted && (
@@ -222,19 +225,15 @@ function RunView() {
 
         {tab === "swarm" ? (
           <div className="min-w-0">
-            {data.finalSummary && (
-              <div className="panel p-4 mb-5" style={{ borderColor: "rgb(var(--hi) / 0.22)", background: "rgb(var(--hi) / 0.03)" }}>
-                <div className="label mb-1.5 text-ink">✓ Mission summary</div>
-                <Md compact>{data.finalSummary}</Md>
-              </div>
-            )}
             <SwarmBoard
               tasks={data.tasks}
               agents={data.agents}
               status={data.status}
-              conductorLatest={conductorLatest}
+              conductorLog={data.conductorLog}
+              finalSummary={data.finalSummary}
               now={now}
               onSelect={(t: Task) => setSelected(t.id)}
+              onOpenReport={() => setTab("report")}
             />
           </div>
         ) : (
@@ -293,16 +292,6 @@ function Banner({ glyph, title, children }: { glyph: string; title: string; chil
         <div className="font-semibold text-ink">{title}</div>
         <div className="text-sm mt-0.5 leading-relaxed text-ink-dim">{children}</div>
       </div>
-    </div>
-  );
-}
-
-function Stat({ label, value, sub, alert }: { label: string; value: string; sub?: string; alert?: boolean }) {
-  return (
-    <div>
-      <div className="label mb-1">{label}</div>
-      <div className="text-lg font-bold leading-none mono text-ink">{value}</div>
-      {sub && <div className={`mono text-2xs mt-1.5 ${alert ? "text-ink" : "text-ink-faint"}`}>{sub}</div>}
     </div>
   );
 }

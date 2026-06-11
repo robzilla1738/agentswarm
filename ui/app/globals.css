@@ -1,5 +1,14 @@
 @import "tailwindcss";
 
+/* Display face for the wordmark and big page headings only. */
+@font-face {
+  font-family: "Planet Kosmos";
+  src: url("/fonts/PlanetKosmos.ttf") format("truetype");
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap;
+}
+
 /*
  * Monochrome design system. One hue: none — state is carried by brightness
  * and glyph, never color. Three ink levels cover every text role.
@@ -204,6 +213,61 @@ body {
   }
   .tile-hover:hover {
     border-color: rgb(var(--hi) / 0.3);
+  }
+  /* Process spine: one continuous vertical line; nodes occlude it with bg fill. */
+  .spine {
+    position: relative;
+  }
+  .spine::before {
+    content: "";
+    position: absolute;
+    left: 10px;
+    top: 10px;
+    bottom: 10px;
+    width: 1px;
+    background: var(--color-border);
+  }
+  .spine-item {
+    position: relative;
+    padding-left: 34px;
+  }
+  .spine-node {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 21px;
+    height: 21px;
+    display: grid;
+    place-items: center;
+    background: var(--color-bg);
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--color-ink-dim);
+  }
+  @media (max-width: 640px) {
+    .spine::before { left: 7px; }
+    .spine-item { padding-left: 24px; }
+    .spine-node { width: 15px; height: 15px; font-size: 10px; }
+  }
+  /* Smooth vertical expand/collapse — content stays mounted, height animates. */
+  .collapse-v {
+    display: grid;
+    grid-template-rows: 0fr;
+    transition: grid-template-rows 0.28s ease;
+  }
+  .collapse-v[data-open="true"] {
+    grid-template-rows: 1fr;
+  }
+  .collapse-v > * {
+    min-height: 0;
+    overflow: hidden;
+  }
+  /* Brand display face — wordmark and big page headings only. */
+  .font-display {
+    font-family: "Planet Kosmos", var(--font-sans);
+    font-weight: normal;
+    letter-spacing: 0.04em;
   }
   /* The uppercase micro-heading used across panels and sections. */
   .label {
@@ -426,6 +490,12 @@ body {
 .prose-compact li { margin: 0.2em 0; }
 .prose-compact ul, .prose-compact ol { margin: 0.4em 0; padding-left: 1.3em; }
 .prose-compact pre { padding: 10px 12px; margin: 0.6em 0; }
+
+/* Collapsed Clamp content fades out at the bottom; mask works on any background. */
+.clamp-fade {
+  mask-image: linear-gradient(to bottom, black 55%, transparent);
+  -webkit-mask-image: linear-gradient(to bottom, black 55%, transparent);
+}
 
 /* Dim prose: secondary surfaces where even body text steps back one ink level. */
 .prose-dim { font-size: var(--text-xs); }

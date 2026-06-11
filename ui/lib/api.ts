@@ -58,7 +58,15 @@ export interface PublicConfig {
   tinyfishKeySet: boolean;
   tinyfishKeyMasked: string;
   searchBackend: string;
-  searchkitCmd: string;
+  crawlBackend: string;
+  crawlResolved: string | null;
+  firecrawlKeySet: boolean;
+  firecrawlKeyMasked: string;
+  contextdevKeySet: boolean;
+  contextdevKeyMasked: string;
+  deepcrawlKeySet: boolean;
+  deepcrawlKeyMasked: string;
+  deepcrawlBaseUrl: string;
   sandboxRuntime: string;
   sandboxResolved: string;
   sandboxImage: string;

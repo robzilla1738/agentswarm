@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.0
+
+### Task-fit deliverables (not just markdown)
+- Every run now writes `artifacts/final-report.html` next to `final-report.md`: a styled, self-contained document (inline CSS, light/dark aware, real tables and code blocks, no scripts) rendered by a built-in dependency-free markdown renderer — failure and fallback reports included. `swarm report <id> --open` opens the HTML.
+- Deliverables ship in the format the mission actually needs: the conductor now specs output formats per task (runnable code, `.csv`/`.json` data, self-contained `.html` documents), workers and the writer role are steered the same way, and the synthesizer gained `save_artifact` so it can capture structured findings (rankings, comparisons, datasets) as data files before submitting.
+
+### Native search & crawl stack
+- Multi-engine web search built in: DuckDuckGo (two endpoints) + Bing + TinyFish (when keyed) queried in parallel, quality-ranked, and deduped by canonical URL — one engine failing or bot-challenged never blanks results. Deep mode widens the query into complementary phrasings, fetches the top pages, and returns quotable passages with publication dates. Ranking/passage algorithms live in `src/searchcore.ts`; the external `searchkit` CLI dependency is gone.
+- Crawl/scrape backends: Firecrawl, context.dev, and custom deepcrawl endpoints (`crawlBackend`, auto-resolved from configured keys). Workers get a `crawl_site` tool that ingests whole documentation sites into local markdown, and `fetch_url` upgrades to a real-browser scrape when a backend is configured. New keys are settable via config/UI/env and masked from agent shell environments.
+- `maxToolResultChars` default raised 12k → 20k.
+
+### UI
+- Run page redesign: continuous process-spine activity feed, compact one-line rows for settled tasks, tool errors summarized to calm one-liners, and workspace-relative paths throughout.
+- Settings page covers the new search/crawl backends with masked key status from the hub's public config.
+- Planet Kosmos display font for the wordmark and page headings.
+
 ## 0.4.0
 
 ### UI polish

@@ -29,6 +29,8 @@ export default function SettingsPage() {
   const [provUrls, setProvUrls] = useState<Record<string, string>>({});
   // Sandbox secrets, blank = keep current.
   const [sbxSecrets, setSbxSecrets] = useState<Record<string, string>>({});
+  // Crawl integration keys, blank = keep current.
+  const [crawlSecrets, setCrawlSecrets] = useState<Record<string, string>>({});
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ status: string; message?: string } | null>(null);
   const [sbxTesting, setSbxTesting] = useState(false);
@@ -61,6 +63,8 @@ export default function SettingsPage() {
         reasoningEffort: config.reasoningEffort,
         safeMode: config.safeMode,
         searchBackend: config.searchBackend,
+        crawlBackend: config.crawlBackend,
+        deepcrawlBaseUrl: config.deepcrawlBaseUrl,
         sandboxRuntime: config.sandboxRuntime,
         sandboxImage: config.sandboxImage,
         e2bTemplate: config.e2bTemplate,
@@ -98,6 +102,9 @@ export default function SettingsPage() {
       for (const k of ["e2bApiKey", "modalTokenId", "modalTokenSecret", "vercelToken"]) {
         if (sbxSecrets[k]?.trim()) patch[k] = sbxSecrets[k].trim();
       }
+      for (const k of ["firecrawlApiKey", "contextdevApiKey", "deepcrawlApiKey"]) {
+        if (crawlSecrets[k]?.trim()) patch[k] = crawlSecrets[k].trim();
+      }
       // Per-provider credentials — only fields the operator actually touched.
       const providers: Record<string, { apiKey?: string; baseUrl?: string }> = {};
       for (const p of config?.providers ?? []) {
@@ -110,6 +117,7 @@ export default function SettingsPage() {
       await api.setConfig(patch);
       setProvKeys({});
       setSbxSecrets({});
+      setCrawlSecrets({});
       setTinyfishApiKey("");
       await reload();
       api.models().then((r) => setModels(r.models)).catch(() => {});
@@ -144,7 +152,7 @@ export default function SettingsPage() {
       <TopBar />
       <main className="max-w-2xl mx-auto px-5 sm:px-8 py-8 pb-24">
         <div className="flex items-baseline gap-3 mb-6">
-          <h1 className="text-xl font-bold">Settings</h1>
+          <h1 className="text-xl font-display">Settings</h1>
           <Link href="/" className="text-xs text-ink-faint hover:text-ink-dim transition-colors">← back to missions</Link>
         </div>
 
@@ -243,15 +251,15 @@ export default function SettingsPage() {
           </p>
         </Card>
 
-        <Card title="Web search" sub="What agents use for web_search. Auto prefers SearchKit (local, citable passages) when installed, then TinyFish, then DuckDuckGo.">
-          <Field label="Search backend">
+        <Card title="Web search" sub="Built-in multi-engine search: DuckDuckGo and Bing are scraped in parallel, results are quality-ranked and deduped, and deep mode fetches top pages for quotable passages. A TinyFish key adds a third engine to the mix.">
+          <Field label="Search engines">
             <select className="input" value={form.searchBackend ?? "auto"} onChange={(e) => setForm({ ...form, searchBackend: e.target.value })}>
-              <option value="auto">Auto — best available</option>
-              <option value="tinyfish">TinyFish (skip SearchKit)</option>
-              <option value="ddg">DuckDuckGo only</option>
+              <option value="auto">Auto — all engines, merged</option>
+              <option value="tinyfish">TinyFish only</option>
+              <option value="ddg">Free engines only (DuckDuckGo + Bing)</option>
             </select>
           </Field>
-          <Field label="TinyFish API key" hint={config.tinyfishKeySet ? `current: ${config.tinyfishKeyMasked}` : "optional — fast hosted search & fetch"}>
+          <Field label="TinyFish API key" hint={config.tinyfishKeySet ? `current: ${config.tinyfishKeyMasked}` : "optional — extra hosted engine & fetch"}>
             <input
               className="input mono"
               type="password"
@@ -261,10 +269,79 @@ export default function SettingsPage() {
               autoComplete="off"
             />
             <p className="text-2xs mt-1.5 text-ink-faint">
-              SearchKit: <span className="mono">pip install searchkit</span> — agents get ranked, citable results with quotable passages.
               TinyFish: <a href="https://docs.tinyfish.ai" target="_blank" rel="noreferrer" className="text-ink underline underline-offset-2">tinyfish.ai</a>
             </p>
           </Field>
+        </Card>
+
+        <Card
+          title="Crawl integrations"
+          sub="Gives agents a crawl_site tool that ingests whole sites as markdown files, and upgrades fetch_url with JS rendering and clean markdown. Auto uses the first configured service (Firecrawl → context.dev → deepcrawl)."
+        >
+          <Field
+            label="Crawl backend"
+            hint={
+              (form.crawlBackend ?? "auto") === "auto"
+                ? `currently resolves to: ${config.crawlResolved ?? "none configured"}`
+                : undefined
+            }
+          >
+            <select
+              className="input"
+              value={form.crawlBackend ?? "auto"}
+              onChange={(e) => setForm({ ...form, crawlBackend: e.target.value })}
+            >
+              <option value="auto">Auto — first configured</option>
+              <option value="firecrawl">Firecrawl{config.firecrawlKeySet ? " · key saved" : ""}</option>
+              <option value="contextdev">context.dev{config.contextdevKeySet ? " · key saved" : ""}</option>
+              <option value="deepcrawl">deepcrawl (custom){config.deepcrawlKeySet ? " · key saved" : ""}</option>
+              <option value="off">Off — disable crawl_site</option>
+            </select>
+          </Field>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Field
+              label="Firecrawl API key"
+              hint={config.firecrawlKeySet ? `current: ${config.firecrawlKeyMasked}` : "firecrawl.dev"}
+            >
+              <input
+                className="input mono" type="password" autoComplete="off"
+                placeholder={config.firecrawlKeySet ? "•••••• (leave blank to keep)" : "fc-..."}
+                value={crawlSecrets.firecrawlApiKey ?? ""}
+                onChange={(e) => setCrawlSecrets({ ...crawlSecrets, firecrawlApiKey: e.target.value })}
+              />
+            </Field>
+            <Field
+              label="context.dev API key"
+              hint={config.contextdevKeySet ? `current: ${config.contextdevKeyMasked}` : "context.dev"}
+            >
+              <input
+                className="input mono" type="password" autoComplete="off"
+                placeholder={config.contextdevKeySet ? "•••••• (leave blank to keep)" : "api key"}
+                value={crawlSecrets.contextdevApiKey ?? ""}
+                onChange={(e) => setCrawlSecrets({ ...crawlSecrets, contextdevApiKey: e.target.value })}
+              />
+            </Field>
+            <Field
+              label="deepcrawl API key"
+              hint={config.deepcrawlKeySet ? `current: ${config.deepcrawlKeyMasked}` : "custom crawler"}
+            >
+              <input
+                className="input mono" type="password" autoComplete="off"
+                placeholder={config.deepcrawlKeySet ? "•••••• (leave blank to keep)" : "api key"}
+                value={crawlSecrets.deepcrawlApiKey ?? ""}
+                onChange={(e) => setCrawlSecrets({ ...crawlSecrets, deepcrawlApiKey: e.target.value })}
+              />
+            </Field>
+            <Field label="deepcrawl base URL" hint="custom crawler endpoint (POST /crawl)">
+              <input
+                className="input mono"
+                placeholder="https://crawler.example.com"
+                value={form.deepcrawlBaseUrl ?? ""}
+                onChange={(e) => setForm({ ...form, deepcrawlBaseUrl: e.target.value })}
+              />
+            </Field>
+          </div>
         </Card>
 
         <Card

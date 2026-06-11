@@ -5,7 +5,7 @@ import { api } from "@/lib/api";
 import { fmtDur, statusColor } from "@/lib/format";
 import { PixelAvatar, personaName } from "@/lib/persona";
 import type { AgentView, Task } from "@/lib/types";
-import { Md, StatusBadge } from "./atoms";
+import { Clamp, Md, StatusBadge } from "./atoms";
 
 export function TaskDetail({
   runId,
@@ -77,23 +77,31 @@ export function TaskDetail({
         </div>
 
         <div className="px-6 py-5">
+          <FailureCallout task={task} />
+
           <Section title="Objective">
-            <Md compact>{task.objective}</Md>
+            <Clamp lines={3}>
+              <Md compact>{task.objective}</Md>
+            </Clamp>
           </Section>
 
           {task.context && (
             <Section title="Context from the conductor">
-              <Md compact dim>{task.context}</Md>
+              <Clamp lines={3}>
+                <Md compact dim>{task.context}</Md>
+              </Clamp>
             </Section>
           )}
 
           {task.report && (
-            <Section title="Report">
+            <Section title={reportTitle(task)}>
               <div
                 className="rounded-xl px-4 py-3.5 border border-border-soft"
                 style={{ background: "var(--input-bg)" }}
               >
-                <Md compact>{task.report}</Md>
+                <Clamp lines={10}>
+                  <Md compact dim={task.status === "failed" || task.status === "blocked"}>{task.report}</Md>
+                </Clamp>
               </div>
             </Section>
           )}
@@ -145,24 +153,15 @@ export function TaskDetail({
             </Section>
           )}
 
-          {task.feedback && (
-            <Section title="Verifier feedback">
+          {task.feedback && task.status !== "failed" && task.status !== "blocked" && (
+            <Section title="Verifier feedback (previous attempt)">
               <div
                 className="rounded-xl p-3.5"
                 style={{ background: "rgb(var(--hi) / 0.03)", border: "1px solid rgb(var(--hi) / 0.16)" }}
               >
-                <Md compact dim>{task.feedback}</Md>
-              </div>
-            </Section>
-          )}
-
-          {task.error && task.status !== "done" && (
-            <Section title="Error">
-              <div
-                className="text-xs leading-relaxed whitespace-pre-wrap rounded-xl p-3.5 text-ink"
-                style={{ background: "rgb(var(--hi) / 0.05)", border: "1px solid rgb(var(--hi) / 0.22)" }}
-              >
-                {task.error}
+                <Clamp lines={5}>
+                  <Md compact dim>{task.feedback}</Md>
+                </Clamp>
               </div>
             </Section>
           )}
@@ -198,6 +197,50 @@ export function TaskDetail({
         </div>
       </div>
     </div>
+  );
+}
+
+function reportTitle(task: Task): string {
+  if (task.status === "failed" || task.status === "blocked") {
+    return `Last report (unverified · attempt ${task.attempt})`;
+  }
+  if (task.status === "verifying") return "Report (being verified)";
+  return "Report";
+}
+
+/**
+ * Failed/blocked tasks lead with the reason. The engine often stores the same
+ * text in both `error` and `feedback` (the retry path falls back from one to
+ * the other), so overlapping copies collapse to one.
+ */
+function FailureCallout({ task }: { task: Task }) {
+  if (task.status !== "failed" && task.status !== "blocked") return null;
+  const error = task.error?.trim() ?? "";
+  const feedback = task.feedback?.trim() ?? "";
+  const same =
+    !!error && !!feedback && (error === feedback || error.startsWith(feedback.slice(0, 80)) || feedback.startsWith(error.slice(0, 80)));
+  const main = same ? feedback : error || feedback;
+  if (!main) return null;
+
+  return (
+    <Section title={task.status === "blocked" ? "Why it's blocked" : "Why it failed"}>
+      <div
+        className="rounded-xl p-3.5"
+        style={{ background: "rgb(var(--hi) / 0.05)", border: "1px solid rgb(var(--hi) / 0.22)" }}
+      >
+        <Clamp lines={6}>
+          <Md compact>{main}</Md>
+        </Clamp>
+        {!same && error && feedback && (
+          <div className="mt-2.5 pt-2.5 border-t border-border-soft">
+            <div className="label mb-1">Verifier feedback</div>
+            <Clamp lines={6}>
+              <Md compact dim>{feedback}</Md>
+            </Clamp>
+          </div>
+        )}
+      </div>
+    </Section>
   );
 }
 

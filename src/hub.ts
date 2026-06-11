@@ -13,6 +13,7 @@ import {
   saveConfig,
 } from "./config";
 import { appendControl } from "./control";
+import { resolveCrawlBackend } from "./crawltools";
 import { listModels, validateAuth } from "./deepseek";
 import { PROVIDERS, PROVIDER_IDS, isProviderId } from "./providers";
 import { eventsFile, readEvents, readNewEvents, TailState } from "./journal";
@@ -365,7 +366,7 @@ function streamEvents(res: http.ServerResponse, id: string, quiet = false): void
 
 // ---------------------------------------------------------------- helpers
 
-function publicConfig(cfg: SwarmConfig) {
+export function publicConfig(cfg: SwarmConfig) {
   const active = PROVIDERS[cfg.provider];
   // Active provider's suggestions first, then anything else with pricing.
   const knownModels = [
@@ -398,7 +399,15 @@ function publicConfig(cfg: SwarmConfig) {
     tinyfishKeySet: Boolean(cfg.tinyfishApiKey),
     tinyfishKeyMasked: maskKey(cfg.tinyfishApiKey),
     searchBackend: cfg.searchBackend,
-    searchkitCmd: cfg.searchkitCmd,
+    crawlBackend: cfg.crawlBackend,
+    crawlResolved: resolveCrawlBackend(cfg),
+    firecrawlKeySet: Boolean(cfg.firecrawlApiKey),
+    firecrawlKeyMasked: maskKey(cfg.firecrawlApiKey),
+    contextdevKeySet: Boolean(cfg.contextdevApiKey),
+    contextdevKeyMasked: maskKey(cfg.contextdevApiKey),
+    deepcrawlKeySet: Boolean(cfg.deepcrawlApiKey),
+    deepcrawlKeyMasked: maskKey(cfg.deepcrawlApiKey),
+    deepcrawlBaseUrl: cfg.deepcrawlBaseUrl,
     sandboxRuntime: cfg.sandboxRuntime,
     sandboxResolved: resolveSandboxKind(cfg),
     sandboxImage: cfg.sandboxImage,

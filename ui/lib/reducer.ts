@@ -10,6 +10,7 @@ import type {
   Usage,
 } from "./types";
 import type { SwarmEvent } from "./types";
+import { shortPath, summarizeToolError } from "./feed";
 
 export interface ClientState {
   meta: RunMeta | null;
@@ -84,7 +85,7 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
     } else if (ev.type === "tool.call") {
       pushActivity(s, {
         id: `t${ev.seq}`, t: ev.t, agentId: ev.agentId as string, taskId: ev.teamId,
-        kind: "tool", name: ev.name as string, text: summarizeArgs(ev.name as string, ev.args),
+        kind: "tool", name: ev.name as string, text: summarizeArgs(ev.name as string, ev.args, s.meta?.cwd),
       });
     } else if (ev.type === "note.added") {
       // Shared blackboard: team notes are swarm-wide facts.
@@ -217,14 +218,15 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
       }
       pushActivity(s, {
         id: `t${ev.seq}`, t: ev.t, agentId: ev.agentId as string, taskId: ev.taskId as string,
-        kind: "tool", name: ev.name as string, text: summarizeArgs(ev.name as string, ev.args),
+        kind: "tool", name: ev.name as string, text: summarizeArgs(ev.name as string, ev.args, s.meta?.cwd),
       });
       break;
     }
     case "tool.result":
       pushActivity(s, {
         id: `x${ev.seq}`, t: ev.t, agentId: ev.agentId as string, taskId: ev.taskId as string,
-        kind: "result", name: ev.name as string, ok: ev.ok as boolean, text: String(ev.summary ?? ""),
+        kind: "result", name: ev.name as string, ok: ev.ok as boolean,
+        text: ev.ok ? String(ev.summary ?? "") : summarizeToolError(String(ev.summary ?? ""), s.meta?.cwd),
       });
       break;
     case "task.checkpoint": {
@@ -306,7 +308,7 @@ function pushActivity(s: ClientState, item: ActivityItem): void {
   if (s.activity.length > MAX_ACTIVITY) s.activity.splice(0, s.activity.length - MAX_ACTIVITY);
 }
 
-function summarizeArgs(name: string, args: unknown): string {
+function summarizeArgs(name: string, args: unknown, cwd?: string): string {
   if (!args || typeof args !== "object") return "";
   const a = args as Record<string, unknown>;
   switch (name) {
@@ -316,13 +318,13 @@ function summarizeArgs(name: string, args: unknown): string {
     case "write_file":
     case "replace_in_file":
     case "save_artifact":
-      return String(a.path ?? a.name ?? "");
+      return shortPath(String(a.path ?? a.name ?? ""), cwd);
     case "web_search":
       return String(a.query ?? "");
     case "fetch_url":
       return String(a.url ?? "");
     case "list_dir":
-      return String(a.path ?? ".");
+      return shortPath(String(a.path ?? "."), cwd);
     case "note":
       return String(a.text ?? "");
     case "spawn_tasks": {

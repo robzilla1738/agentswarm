@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { statusColor } from "@/lib/format";
@@ -15,6 +15,48 @@ export function Md({ children, compact, dim }: { children: string; compact?: boo
   return (
     <div className={`prose-report${compact ? " prose-compact" : ""}${dim ? " prose-dim" : ""}`}>
       <ReactMarkdown remarkPlugins={[remarkGfm]}>{children}</ReactMarkdown>
+    </div>
+  );
+}
+
+/**
+ * Collapses long content to roughly `lines` lines with a fade-out mask and a
+ * "Show more" toggle. Max-height based (not line-clamp) because `Md` renders
+ * block elements. The toggle only appears when the content actually overflows.
+ */
+export function Clamp({ children, lines = 3 }: { children: React.ReactNode; lines?: number }) {
+  const [open, setOpen] = useState(false);
+  const [canExpand, setCanExpand] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const maxHeight = `${Math.round(lines * 1.55 * 10) / 10}em`;
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const check = () => setCanExpand(el.scrollHeight > el.clientHeight + 2);
+    check();
+    const ro = new ResizeObserver(check);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [children, open]);
+
+  return (
+    <div>
+      <div
+        ref={ref}
+        className={!open && canExpand ? "clamp-fade" : undefined}
+        style={open ? undefined : { maxHeight, overflow: "hidden" }}
+      >
+        {children}
+      </div>
+      {(canExpand || open) && (
+        <button
+          onClick={() => setOpen((v) => !v)}
+          className="text-2xs mt-1 text-ink-faint hover:text-ink transition-colors"
+        >
+          {open ? "Show less ▴" : "Show more ▾"}
+        </button>
+      )}
     </div>
   );
 }
@@ -38,7 +80,7 @@ export function Logo({ small }: { small?: boolean }) {
   return (
     <Link href="/" className="flex items-center gap-2.5">
       <LogoMark size={small ? 24 : 28} />
-      <span className="font-bold tracking-tight" style={{ fontSize: small ? 14 : 15 }}>
+      <span className="font-display" style={{ fontSize: small ? 14 : 15 }}>
         agentswarm
       </span>
     </Link>

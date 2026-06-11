@@ -38,6 +38,7 @@ import {
   WORKER_KICKOFF,
 } from "./prompts";
 import { appendMemory, memoryBlock } from "./memory";
+import { renderFinalHtml } from "./report";
 import { SandboxRuntime, createSandbox } from "./sandbox";
 import { RunState } from "./state";
 import { RunMeta, RunStatus, Task, TaskSpec, Usage, usageCost } from "./types";
@@ -204,7 +205,7 @@ export class Executor {
     // Decisions anchor mission-wide coherence and are never trimmed out of the
     // digest; everything else shows only its recent tail.
     const decisions = this.notes.filter((n) => n.kind === "decision").map(fmt);
-    const rest = this.notes.filter((n) => n.kind !== "decision").slice(-40).map(fmt);
+    const rest = this.notes.filter((n) => n.kind !== "decision").slice(-80).map(fmt);
     let tail = rest.join("\n");
     const budget = Math.max(400, max - decisions.join("\n").length);
     if (tail.length > budget) tail = tail.slice(tail.length - budget);
@@ -991,10 +992,10 @@ export class Executor {
         this.notes.push({ taskId: task?.id, key, kind, text });
         // Only the recent tail ever feeds digests; without a cap a multi-day
         // run accumulates every note in memory. Decisions are kept regardless.
-        if (this.notes.length > 2000) {
+        if (this.notes.length > 4000) {
           const decisions = this.notes.filter((n) => n.kind === "decision");
           const rest = this.notes.filter((n) => n.kind !== "decision");
-          rest.splice(0, rest.length - Math.max(0, 2000 - decisions.length));
+          rest.splice(0, rest.length - Math.max(0, 4000 - decisions.length));
           this.notes = [...decisions, ...rest];
         }
         this.journal.append("note.added", { taskId: task?.id, agentId, key, kind, text: clip(text, 1200) });
@@ -1130,7 +1131,7 @@ export class Executor {
       reasoningEffort: this.meta.options.reasoningEffort,
       system,
       kickoff: WORKER_KICKOFF,
-      tools: workerToolset(),
+      tools: workerToolset(this.cfg),
       terminal: [REPORT_TOOL],
       maxSteps: this.meta.options.maxStepsPerTask,
       signal: this.ac.signal,
@@ -1473,8 +1474,28 @@ export class Executor {
     const reportPath = path.join(this.runDirPath, "artifacts", "final-report.md");
     ensureDir(path.dirname(reportPath));
     fs.writeFileSync(reportPath, reportMarkdown, "utf8");
+    // Always ship a readable, shareable HTML rendering alongside the raw
+    // markdown; a rendering bug must never block run finalization.
+    let htmlPath: string | undefined;
+    try {
+      htmlPath = path.join(this.runDirPath, "artifacts", "final-report.html");
+      fs.writeFileSync(
+        htmlPath,
+        renderFinalHtml({
+          markdown: reportMarkdown,
+          mission: this.meta.mission,
+          runId: this.meta.id,
+          status,
+          finishedAt: Date.now(),
+        }),
+        "utf8"
+      );
+    } catch (e) {
+      htmlPath = undefined;
+      this.journal.append("log", { level: "warn", msg: `final-report.html render failed: ${errMsg(e)}` });
+    }
     this.setStatus(status, reason);
-    this.journal.append("run.final", { summary, reportPath, reason, status });
+    this.journal.append("run.final", { summary, reportPath, htmlPath, reason, status });
     await this.journal.flush();
   }
 
@@ -1522,16 +1543,16 @@ export class Executor {
         system: synthSystem({
           meta: this.meta,
           finishNotes: [this.finishNotes, extraNote].filter(Boolean).join("\n\n"),
-          reports: truncateMiddle(reports, 120_000, "chars"),
-          blackboard: this.blackboardDigest(4000),
+          reports: truncateMiddle(reports, 300_000, "chars"),
+          blackboard: this.blackboardDigest(6000),
           artifactList,
           reason: this.finishReason || "completed",
         }),
         kickoff: SYNTH_KICKOFF,
         tools: synthToolset(),
         terminal: [SUBMIT_FINAL_TOOL],
-        maxSteps: 12,
-        maxTokensOut: 16384,
+        maxSteps: 24,
+        maxTokensOut: 32000,
         signal: new AbortController().signal, // synthesis should finish even if run was cancelled
         ctx: this.makeToolCtx(agentId, null),
         hooks: this.agentHooks(agentId, ""),

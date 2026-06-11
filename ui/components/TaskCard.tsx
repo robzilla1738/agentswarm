@@ -5,7 +5,7 @@ import { PixelAvatar, personaName } from "@/lib/persona";
 import type { AgentView, Task } from "@/lib/types";
 import { Spinner, ToolIcon } from "./atoms";
 
-function statusGlyph(status: string) {
+export function statusGlyph(status: string) {
   switch (status) {
     case "done": return "✓";
     case "failed": return "✗";
@@ -16,7 +16,7 @@ function statusGlyph(status: string) {
 }
 
 /** Markdown syntax reads as noise in a two-line preview. */
-function plainPreview(s: string): string {
+export function plainPreview(s: string): string {
   return s.replace(/[#*`_>]+/g, "").replace(/\s+/g, " ").trim().slice(0, 140);
 }
 

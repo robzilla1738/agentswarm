@@ -44,6 +44,12 @@ export function fmtClock(t: number): string {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
+/** Fixed-width 24h clock for dense feeds — uniform column, no AM/PM. */
+export function fmtClockShort(t: number): string {
+  const d = new Date(t);
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
 /* Monochrome: state is carried by brightness + glyph, not hue. */
 export const STATUS_COLOR: Record<string, string> = {
   pending: "var(--color-ink-faint)",

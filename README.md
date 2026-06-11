@@ -29,7 +29,7 @@ You give it a mission. A conductor model breaks the mission into tasks and hands
         │  T4 dep  │◀─────│ verify  │   adversarial verification
         └────┬─────┘      └─────────┘
         ┌────▼─────┐
-        │Synthesize│  → final-report.md + artifacts
+        │Synthesize│  → final report (.md + .html) + artifacts
         └──────────┘
 ```
 
@@ -113,7 +113,7 @@ Verified tasks pass two gates: a free mechanical check (claimed artifacts must e
 
 The scheduler starts a task as soon as its dependencies are done, up to the parallelism cap. Tasks whose dependencies failed are blocked and surfaced to the conductor for re-planning.
 
-When the conductor finishes (or the budget forces it), a synthesizer composes `final-report.md` from every task report.
+When the conductor finishes (or the budget forces it), a synthesizer composes the final deliverable from every task report. Deliverables ship in the format the mission calls for — code, `.csv`/`.json` data, styled documents — alongside `final-report.md` and a self-contained `final-report.html` rendering (open it with `swarm report <id> --open`).
 
 The journal is the source of truth. Every run is an append-only `events.jsonl`; the terminal dashboard, the web UI, and `swarm ls` all reduce the same file. That's why runs survive crashes and can be resumed or replayed. Runs live under `~/.agentswarm/runs/<id>/`.
 

@@ -28,7 +28,7 @@ DOCTRINE
 2. Make every task self-contained: crisp objective, explicit success criteria ("Done when …"), and every fact/path/URL the worker needs inlined in context. Workers know nothing you don't tell them.
 3. Invent the right specialist role per task (researcher, coder, analyst, data-wrangler, reviewer, writer, …). One concern per task, roughly 5–25 tool steps of work. Bigger → split it. Trivial → batch it.
 4. Software missions: scaffold first (one task), then parallel tasks on DISJOINT files/modules — never two writers on the same file — then an integration + test task that deps on all of them with verify:true.
-5. Research missions: parallel scouts with distinct angles and sources, then a consolidation/analysis task that deps on the scouts.
+5. Research missions: go WIDE. Spawn many parallel scouts (10+ for a broad topic), each owning a distinct sub-question, angle, source type, time period, or entity — so collectively they pull hundreds of sources, not dozens. Tell each scout to use deep web_search (high count) and to record findings with exact URLs/quotes on the blackboard and in artifact files. Then spawn analysis/consolidation tasks that dep on the scouts, and a final synthesis. When one scout's area is itself broad, spawn it with team:true so it fans out further.
 6. Set verify:true on tasks whose failure would poison the mission (builds, integrations, data pipelines, final deliverables). A verification agent will adversarially check them and can fail them back for retry.
 7. React to evidence. Failed/blocked task → diagnose from its report and spawn a corrected or alternative approach (never re-run a failed approach verbatim). Surprising findings → adapt the plan.
 8. Watch the budget shown in every update. As it tightens, cut scope to what the mission truly needs — always deliver value before the cap, never run out mid-flight.
@@ -38,6 +38,7 @@ DOCTRINE
 12. Big subsystems: spawn with team:true to run the task as a sub-swarm — its own lead decomposes it into parallel sub-tasks and reports one consolidated result. Use for coherent multi-task chunks ("build the backend", "research all 12 competitors"), not for single jobs.
 13. Beyond ~20 tasks, maintain a living plan with update_plan (mission-plan.md): approach, what's done, what's next, open risks. Rewrite it at phase boundaries — it is pinned into your updates and survives restarts.
 14. Long missions: structure the work into phases with set_phase (e.g. discovery → build → integrate → polish). The current phase and its exit criteria are pinned into every update, so the plan survives even when old history is trimmed.
+15. DELIVERABLES SHIP IN THE FORMAT THE MISSION ACTUALLY NEEDS — a markdown report is the fallback, not the default. Software → running code with build/run instructions; data work → .csv/.json/.sqlite plus a summary; comparisons and datasets → tables in CSV as well as prose; polished documents → styled self-contained .html (the operator reads HTML, not raw markdown); scripts/configs → the runnable files themselves. Spell the expected format and exact filename(s) out in the deliverable task's objective and have it save them with save_artifact.
 
 RULES
 - Respond ONLY by calling your tools (spawn_tasks / set_phase / wait / finish). Plain-text replies are ignored. set_phase alone is not a decision — pair it with spawn_tasks, wait, or finish.
@@ -139,13 +140,14 @@ export function depReportBlock(t: Task): string {
 
 const ROLE_HINTS: Record<string, string> = {
   researcher:
-    "Research craft: triangulate across independent sources; prefer primary docs over blog spam; capture exact figures, dates, URLs. Search several distinct phrasings before concluding something is unfindable.",
+    "Research craft: be exhaustive. Run deep web_search (deep=true, high count) across several distinct phrasings — pull DOZENS of sources for your sub-question, not three. Triangulate across independent sources; prefer primary docs and official sources over blog spam; capture exact figures, dates, and URLs, and keep the quotable passages the search returns. Record key findings as blackboard notes (with the source URL) and save a structured markdown file of your sources+findings as an artifact so the synthesizer can build on it. " +
+    "If a crawl_site tool is available, use it to ingest whole documentation sites or multi-page sources into local markdown files, then read the saved files — far cheaper and broader than fetching pages one by one.",
   coder:
     "Engineering craft: read existing code before changing it; match its conventions; build/run/test after every meaningful change and include the command + result in your report. Leave the tree compiling.",
   analyst:
     "Analysis craft: quantify wherever possible; state assumptions explicitly; separate observation from interpretation; sanity-check numbers twice.",
   writer:
-    "Writing craft: structure before prose; concrete over abstract; cut filler. Match the audience and purpose given in the objective.",
+    "Writing craft: structure before prose; concrete over abstract; cut filler. Match the audience and purpose given in the objective. Deliver in the format the objective calls for — for polished documents prefer a styled, self-contained .html file (inline CSS, readable typography, real tables) over raw markdown; ship data tables as .csv alongside the prose.",
   reviewer:
     "Review craft: be adversarial; try to break it; check edge cases and the unhappy path; verify claims against the actual files, not the description.",
   "data-wrangler":
@@ -195,7 +197,7 @@ OPERATING PROTOCOL
 - Be token-lean: targeted reads (line ranges, grep via shell) over wholesale dumps; don't re-read unchanged files.
 - Post durable discoveries other agents will need to the blackboard with note(...) — facts only, used sparingly.
 - Editing files other tasks might also touch? First search_notes for claims, then post note(kind:"claim", key:"<path>") before editing. Claims are advisory — coordinate, don't fight.
-- Save deliverable files with save_artifact so the operator sees them.
+- Save deliverable files with save_artifact so the operator sees them. Pick the format that genuinely fits the deliverable — structured data as .csv/.json, polished documents as self-contained .html, code as runnable files — not everything is a markdown report.
 - On long tasks, call checkpoint(...) after each major chunk so an interrupted run resumes warm instead of from scratch.
 - Genuinely impossible / missing prerequisite → report(status:"blocked", …) early instead of thrashing.
 - You have at most ${opts.maxSteps} tool steps. Budget them.
@@ -271,8 +273,9 @@ Working directory: ${opts.meta.cwd}
 
 PROTOCOL
 - You may read files (read_file / list_dir) to confirm specifics before writing — verify key claims you repeat.
+- The mission's PRIMARY deliverable should exist in the format that serves it best, not only as prose. If the task reports produced data, comparisons, or rankings that the artifacts don't already capture in a structured form, save them now with save_artifact (e.g. data/results.csv, data/findings.json) before submitting. Don't duplicate artifacts that already exist — point to them.
 - Then call submit_final with:
-  • report_markdown — the deliverable document. Structure: # title; **Outcome** first (did the mission succeed, headline results); then What was built/found with evidence and exact paths; How to use/run it (if applicable); Open issues & recommended next steps. Write for the operator: complete, concrete, zero filler.
+  • report_markdown — the deliverable document. Structure: # title; **Outcome** first (did the mission succeed, headline results); then What was built/found with evidence and exact paths; How to use/run it (if applicable); Open issues & recommended next steps. Write for the operator: complete, concrete, zero filler. Use real markdown tables for tabular findings. (A styled HTML rendering is generated automatically — do not hand-write one.)
   • summary — ≤8 sentences for the console.
 - The report stands alone: a reader who saw nothing else must understand what happened and where everything is.`;
 }

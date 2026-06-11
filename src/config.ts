@@ -34,10 +34,15 @@ export interface SwarmConfig {
   reasoningEffort: ReasoningEffort;
   safeMode: boolean;
   tinyfishApiKey: string;
-  /** Web search backend: auto = SearchKit if installed → TinyFish → DuckDuckGo. */
+  /** Web search engines: auto = DDG + Bing + TinyFish (if keyed) merged; ddg = free engines only. */
   searchBackend: "auto" | "tinyfish" | "ddg";
-  /** SearchKit CLI command (from github script-search; `pip install searchkit`). */
-  searchkitCmd: string;
+  firecrawlApiKey: string;
+  contextdevApiKey: string;
+  deepcrawlApiKey: string;
+  /** Custom crawler endpoint (POST {base}/crawl). Required for the deepcrawl backend. */
+  deepcrawlBaseUrl: string;
+  /** Crawl/scrape backend for crawl_site + fetch_url upgrades: auto = first configured (Firecrawl → context.dev → deepcrawl). */
+  crawlBackend: "auto" | "firecrawl" | "contextdev" | "deepcrawl" | "off";
   /**
    * Where isolated runs execute. Default "host": the run's private workspace
    * directory on this machine — works out of the box, no Docker or cloud
@@ -104,7 +109,11 @@ export const DEFAULTS: SwarmConfig = {
   safeMode: true,
   tinyfishApiKey: "",
   searchBackend: "auto",
-  searchkitCmd: "searchkit",
+  firecrawlApiKey: "",
+  contextdevApiKey: "",
+  deepcrawlApiKey: "",
+  deepcrawlBaseUrl: "",
+  crawlBackend: "auto",
   sandboxRuntime: "host",
   sandboxImage: "node:22-bookworm",
   e2bApiKey: "",
@@ -118,7 +127,7 @@ export const DEFAULTS: SwarmConfig = {
   requestTimeoutMs: 900_000,
   idleTimeoutMs: 180_000,
   contextTokenLimit: 120_000,
-  maxToolResultChars: 12_000,
+  maxToolResultChars: 20_000,
   hubPort: 7777,
   uiPort: 7780,
   pricing: DEFAULT_PRICING,
@@ -135,6 +144,9 @@ export const SECRET_ENV_KEYS: string[] = [
       .map((p) => p.keyEnv)
       .filter((k): k is string => Boolean(k)),
     "TINYFISH_API_KEY",
+    "FIRECRAWL_API_KEY",
+    "CONTEXT_DEV_API_KEY",
+    "DEEPCRAWL_API_KEY",
     "E2B_API_KEY",
     "MODAL_TOKEN_ID",
     "MODAL_TOKEN_SECRET",
@@ -193,6 +205,10 @@ export function loadConfig(): SwarmConfig {
   // Env overrides: provider-specific key env, plus legacy DEEPSEEK_API_KEY.
   if (info.keyEnv && process.env[info.keyEnv]) cfg.apiKey = process.env[info.keyEnv]!;
   if (process.env.TINYFISH_API_KEY) cfg.tinyfishApiKey = process.env.TINYFISH_API_KEY;
+  if (process.env.FIRECRAWL_API_KEY) cfg.firecrawlApiKey = process.env.FIRECRAWL_API_KEY;
+  if (process.env.CONTEXT_DEV_API_KEY) cfg.contextdevApiKey = process.env.CONTEXT_DEV_API_KEY;
+  if (process.env.DEEPCRAWL_API_KEY) cfg.deepcrawlApiKey = process.env.DEEPCRAWL_API_KEY;
+  if (process.env.DEEPCRAWL_BASE_URL) cfg.deepcrawlBaseUrl = process.env.DEEPCRAWL_BASE_URL;
   if (process.env.E2B_API_KEY) cfg.e2bApiKey = process.env.E2B_API_KEY;
   if (process.env.MODAL_TOKEN_ID) cfg.modalTokenId = process.env.MODAL_TOKEN_ID;
   if (process.env.MODAL_TOKEN_SECRET) cfg.modalTokenSecret = process.env.MODAL_TOKEN_SECRET;
@@ -261,7 +277,11 @@ export const SETTABLE_KEYS: (keyof SwarmConfig)[] = [
   "safeMode",
   "tinyfishApiKey",
   "searchBackend",
-  "searchkitCmd",
+  "firecrawlApiKey",
+  "contextdevApiKey",
+  "deepcrawlApiKey",
+  "deepcrawlBaseUrl",
+  "crawlBackend",
   "sandboxRuntime",
   "sandboxImage",
   "e2bApiKey",
@@ -294,6 +314,7 @@ const ENUMS: Partial<Record<keyof SwarmConfig, string[]>> = {
   verification: ["off", "normal", "strict"],
   reasoningEffort: ["low", "medium", "high", "max"],
   searchBackend: ["auto", "tinyfish", "ddg"],
+  crawlBackend: ["auto", "firecrawl", "contextdev", "deepcrawl", "off"],
   sandboxRuntime: ["auto", "host", "docker", "e2b", "modal", "vercel"],
   provider: Object.keys(PROVIDERS),
 };
