@@ -93,7 +93,7 @@ swarm run "Research the best open-source vector DBs in 2026 and write a recommen
 | `swarm report <id> [--open]` | Print or open a run's final report. |
 | `swarm note <id> "<text>"` | Steer a live run. The conductor reads it. |
 | `swarm cancel <id>` | Stop a run. It still synthesizes a report from completed work. |
-| `swarm config [list\|get\|set\|unset …]` | Manage `~/.agentswarm/config.json`. Secrets are masked in `list`/`get`; `unset` removes a key. |
+| `swarm config [list\|get\|set\|unset …]` | Manage `~/.agentswarm/config.json`. Secrets are masked in `list`/`get`; `unset` resets a key to its default. |
 | `swarm models` | List models from the active provider. |
 | `swarm demo` | Run a self-contained demo mission in an isolated workspace. |
 

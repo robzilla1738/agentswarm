@@ -34,6 +34,17 @@
 ### Tests
 - Four new e2e phases (cascade root causes, failure diagnostics, strict-evidence verification, citations) and five new unit suites (validate, pdftext, webtools, tools, memory) — 105 unit tests total.
 
+### Review hardening
+A full-program audit (three correctness sweeps plus reuse/efficiency/altitude passes, every finding independently verified) closed out the release:
+- Big settle batches no longer flood the conductor: a `slice(-0)` bug disabled the 12-report digest cap exactly when 12+ failed/blocked reports landed at once.
+- Hierarchical-team fixes: file claims are namespaced by team (root `T3` and a team's `T3` no longer release each other's claims), a failed team no longer records a contradictory "done" report, team-posted blackboard notes survive resume, and team usage events no longer overwrite the run's cost readout and sparkline with the child swarm's own total.
+- The web UI's activity feed and blackboard no longer freeze after the first render (stale memoization over in-place-mutated arrays).
+- `kill`/SIGTERM can no longer lose just-settled tasks: the journal's sync flush now covers the chunk an in-flight async write holds, and readers dedupe by seq.
+- `swarm config unset` resets any settable key to its default instead of writing `""` — clearing `model` used to brick every subsequent run — and `swarm config get providers` no longer prints raw per-provider API keys.
+- `searchBackend: "tinyfish"` falls back to the free engines during a TinyFish outage again, an engine that answers "no results" while another engine errors reads as no results (not a search failure), and `grep_files` reports invalid regexes/paths as loud errors instead of "no matches".
+- A malformed cross-run memory file degrades to "forgotten" instead of crashing every run in that workspace at startup.
+- Settings → "Test search" now probes exactly the engine set runs will use (shared registry with `webSearch`) instead of a hardcoded list.
+
 ## 0.5.0
 
 ### Task-fit deliverables (not just markdown)
