@@ -30,7 +30,7 @@ const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36 agentswarm/0.1";
 
 /** How many of the merged pool get fetched for passage extraction in deep mode. */
-const DEEP_FETCH = 12;
+const DEEP_FETCH = 25;
 /** Quotable passages kept per fetched page. */
 const DEEP_PASSAGES = 3;
 
@@ -55,7 +55,7 @@ export async function webSearch(
   // Deep searches widen recall by issuing complementary phrasings; the fast
   // path stays a single query so an agent's tool loop isn't slowed.
   const queries = deep ? expandQueries(query) : [query];
-  const perEngine = Math.min(count, 15);
+  const perEngine = Math.min(count, 25);
 
   const engines = searchEngines(cfg);
   const engineCalls: Promise<Candidate[]>[] = [];

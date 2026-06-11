@@ -25,12 +25,12 @@ test("queryTerms drops short tokens and dedupes", () => {
 });
 
 test("expandQueries widens recall without noise, deduped and capped", () => {
-  // question query → original + keyword core + guide angle
+  // question query → original + keyword core + guide angle + quoted phrase + recency variants
   const q = expandQueries("How do I configure FastAPI lifespan events?");
   assert.equal(q[0], "How do I configure FastAPI lifespan events?");
   assert.ok(q.includes("how configure fastapi lifespan events"), "keyword core variant");
   assert.ok(q.some((s) => s.endsWith("guide")), "docs/guide angle for questions");
-  assert.ok(q.length <= 3, "capped");
+  assert.ok(q.length <= 6, "capped at 6 by default");
   // plain keyword query where the core equals the input → no duplicate variants
   const k = expandQueries("redis vector search");
   assert.deepEqual(k, ["redis vector search"]);

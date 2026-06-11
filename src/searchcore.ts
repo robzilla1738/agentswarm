@@ -20,19 +20,28 @@ export function queryTerms(query: string): string[] {
 }
 
 /**
- * Generate a few complementary query phrasings to widen source coverage in
- * one search: the original, a stopword-stripped keyword core (different
- * recall on most engines), and a docs/guide angle for question-shaped
- * queries. Deterministic and low-noise — capped at `max`.
+ * Generate multiple complementary query phrasings to widen source coverage:
+ * the original, a stopword-stripped keyword core (different recall on most engines),
+ * a docs/guide angle for question-shaped queries, a quoted phrase variant for
+ * precision, and recency-boosted variants. Deterministic and low-noise — capped at `max`.
  */
-export function expandQueries(query: string, max = 3): string[] {
+export function expandQueries(query: string, max = 6): string[] {
   const base = query.trim();
   const out = [base];
   const terms = queryTerms(query);
   const core = terms.join(" ");
+  const isQuestion = /^(how|what|why|when|which|where|who|is|are|can|does|do)\b/i.test(base);
+
   if (core && core.length > 4 && core !== base.toLowerCase()) out.push(core);
-  if (/^(how|what|why|when|which|where|who|is|are|can|does|do)\b/i.test(base) && terms.length) {
+  if (isQuestion && terms.length) {
     out.push(`${core} guide`);
+    // For questions, also add precision/recency variants to catch docs and recent releases
+    if (core && terms.length >= 2) {
+      out.push(`"${core}"`);
+    }
+    if (!/\b(19|20)\d{2}\b|year|date|when|time/.test(base.toLowerCase())) {
+      out.push(`${core} 2024 OR 2025`);
+    }
   }
   const seen = new Set<string>();
   return out.map((q) => q.trim()).filter((q) => q && !seen.has(q.toLowerCase()) && seen.add(q.toLowerCase())).slice(0, max);

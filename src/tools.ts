@@ -403,19 +403,19 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
       name: "web_search",
       description:
         "Search the web. Fans out across multiple engines (DuckDuckGo, Bing, +TinyFish if configured), merges and quality-ranks results, and dedupes by canonical URL. Returns ranked results with title, URL and snippet. " +
-        "Set deep=true to widen the query into complementary phrasings, fetch the top pages, and return quotable passages with publication dates — use for thorough research and any claim that needs grounding. Raise count (up to 25) to pull more sources per call.",
+        "Set deep=true to widen the query into complementary phrasings, fetch the top pages, and return quotable passages with publication dates — use for thorough research and any claim that needs grounding. Raise count (up to 50) to pull more sources per call.",
       parameters: {
         type: "object",
         properties: {
           query: { type: "string" },
-          count: { type: "number", description: "Max results, default 8, max 25" },
+          count: { type: "number", description: "Max results, default 15, max 50" },
           deep: { type: "boolean", description: "Multi-phrasing sweep + fetch pages for quotable passages" },
         },
         required: ["query"],
       },
     },
     run: async (args, ctx) => {
-      const count = Math.min(Math.max(Number(args.count) || 8, 1), 25);
+      const count = Math.min(Math.max(Number(args.count) || 15, 1), 50);
       const hits = await webSearch(ctx.cfg, String(args.query), count, ctx.signal, Boolean(args.deep), (msg) =>
         ctx.log?.("warn", msg)
       );
@@ -439,13 +439,13 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
         type: "object",
         properties: {
           query: { type: "string" },
-          count: { type: "number", description: "Max results, default 8, max 20" },
+          count: { type: "number", description: "Max results, default 15, max 40" },
         },
         required: ["query"],
       },
     },
     run: async (args, ctx) => {
-      const count = Math.min(Math.max(Number(args.count) || 8, 1), 20);
+      const count = Math.min(Math.max(Number(args.count) || 15, 1), 40);
       const q = String(args.query);
       const settled = await Promise.allSettled([
         arxivSearch(q, count, ctx.signal),

@@ -147,9 +147,14 @@ export function depReportBlock(t: Task): string {
 
 const ROLE_HINTS: Record<string, string> = {
   researcher:
-    "Research craft: be exhaustive. Run deep web_search (deep=true, high count) across several distinct phrasings — pull DOZENS of sources for your sub-question, not three. Triangulate across independent sources; prefer primary docs and official sources over blog spam; capture exact figures, dates, and URLs, and keep the quotable passages the search returns. Record key findings as blackboard notes (with url=<source>) and save a structured markdown file of your sources+findings as an artifact so the synthesizer can build on it. " +
-    "A finding without a source is an opinion: list EVERY source your findings rest on in report(...)'s `sources` field (url + what it supports) — only sources reported there can be cited in the final deliverable. When independent sources disagree on a material fact, post note(kind:'conflict') naming both sources and the discrepancy — never silently pick one. For scientific or technical questions, also run academic_search (arXiv + Crossref) — peer-reviewed beats blog posts. " +
-    "If a crawl_site tool is available, use it to ingest whole documentation sites or multi-page sources into local markdown files, then read the saved files — far cheaper and broader than fetching pages one by one.",
+    "Research craft: be exhaustive and broad. Minimum 8 sources per task — if you have fewer, keep searching.\n" +
+    "• Call web_search at least 3–4 times with DIFFERENT angles and phrasings (not variations of the same thing). Every call: count: 25, deep: true. One query/call is never enough.\n" +
+    "• For any scientific, technical, or academic sub-question also run academic_search (count: 20) — peer-reviewed and preprints beat blog posts.\n" +
+    "• Prefer primary docs, official sources, and recent research over blog spam. Capture exact figures, dates, URLs, and keep the quotable passages the search returns.\n" +
+    "• List EVERY source your findings rest on in report(...)'s `sources` field (url + what it supports). A finding without a source in that field doesn't exist for the synthesizer.\n" +
+    "• When independent sources disagree on a material fact, post note(kind:'conflict') naming both sources and the discrepancy — never silently pick one.\n" +
+    "• Record findings as blackboard notes (with url=<source>) and save a structured markdown file of sources+findings as an artifact for the synthesizer.\n" +
+    "• If a crawl_site tool is available, use it to ingest whole documentation sites or multi-page sources into local markdown — far cheaper and broader than fetching pages one by one.",
   coder:
     "Engineering craft: read existing code before changing it; match its conventions; build/run/test after every meaningful change and include the command + result in your report. Leave the tree compiling.",
   analyst:
