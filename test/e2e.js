@@ -480,6 +480,10 @@ async function phaseHubSmoke() {
   ok(`mock model server on :${port}`);
   writeConfig(home, port);
   const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+  // Ensure test runs with no crawl backend keys
+  delete env.FIRECRAWL_API_KEY;
+  delete env.CONTEXT_DEV_API_KEY;
+  delete env.DEEPCRAWL_API_KEY;
 
   const hub = spawn(process.execPath, [SWARM, "serve", "--port", "0"], { env, stdio: ["ignore", "pipe", "inherit"] });
   let hubOut = "";

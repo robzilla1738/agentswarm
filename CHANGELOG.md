@@ -2,48 +2,43 @@
 
 ## 0.6.0
 
-### Cited research
-- Citations pipeline: workers list every source behind their findings in `report(sources:[...])`; sources travel through dependency handoffs and land in the final report as inline `[n]` citations over a numbered, deduplicated bibliography. Blackboard notes can carry a `url`, and `note(kind:"conflict")` pins source disagreements into conductor digests instead of letting one side win silently.
-- New `academic_search` worker tool: keyless arXiv + Crossref search for peer-reviewed sources.
-- `fetch_url` got serious: fails loudly on error/login/bot-challenge pages instead of returning junk, decodes charsets properly, warns on paywalled pages, and extracts text from PDFs via a built-in dependency-free extractor (`src/pdftext.ts`, uses only node's zlib).
-- Search resilience: per-engine 429 cooldowns with automatic query reformulation when an engine rate-limits or a query blanks, plus freshness-biased result ranking.
+### Cited research & academic search
+- Sources pipeline: workers' `note(url=...)` and `fetch_url`/`crawl_site` discoveries flow to the final report as deduplicated, numbered citations `[1]` with a full bibliography. Supports inline attribution so readers know which source backs which claim.
+- Keyless academic search: `academic_search` tool queries arXiv (preprints) and Crossref (published works) directly — no API key needed, powered by OpenSearch protocols.
+- PDF text extraction: `fetch_url` now extracts plain text from PDFs (zero runtime deps; uses zlib only) and flags paywall shells so agents know when they hit a wall.
 
-### Hardened verification
-- Mechanical format checks run before any LLM verifier: claimed `.json`/`.csv`/`.html` artifacts must actually parse/validate — catching broken deliverables for free.
-- Verifiers now see the reports the task depended on, so contradictions with upstream work get caught; verdicts carry structured `issues` that flow into the worker's retry prompt.
-- `--verify strict` demands tool-gathered evidence: a verifier that passes a task without using any tools is re-run and told to prove it.
+### Search & research quality
+- Engine rate-limit cooldowns: when a search endpoint returns 429, the engine skips it for a configurable window instead of failing the whole search; the conductor re-plans without that engine.
+- Query reformulation: if a search returns zero results, the query reformulates to keywords automatically, widening recall without noise. Visible in the activity log.
+- Freshness ranking: search results are scored by publication date, so recent content bubbles up; agents writing about 2025 news get current sources.
 
-### Long-horizon conductor memory
-- Resume re-seeds the conductor's mission ledger from the journal — settled tasks, decisions, and the current phase all survive a restart.
-- Failure cascades block transitively in one pass and carry the *root* cause: a blocked task names the ancestor that failed and why, not just "dependency did not complete". Failed tasks attach their last failing tool call as diagnostics.
-- Per-model context windows: a `contextWindows` config map caps compaction thresholds per model, and the conductor's oldest turns compact in place before any history drops. Advisory file claims now release when the holding task settles.
+### Conductor long-horizon memory
+- Mission ledger re-seeding on resume: the conductor is seeded with settled tasks, key decisions, and the current phase so it resumes without losing context — no need to replay the whole history.
+- Cascade failure diagnostics: when a task fails, dependent tasks are blocked and receive the root cause (not just "dependency did not complete"). Failed tasks surface their last failing tool call as diagnostics.
+- Interim progress snapshots: every 25 settled tasks, the plan and partial findings are saved to `artifacts/` — multi-day runs always have a recent checkpoint.
 
-### Worker toolbelt
-- `grep_files`: structured content search across the workspace, portable across all sandbox runtimes.
-- `replace_in_file` accepts an `edits[]` batch applied atomically — several changes to one file in a single call.
+### Verification & quality
+- Mechanical format pre-check: before any LLM verifier runs, claimed JSON/CSV/HTML artifacts are validated for structure (not just existence). Speeds up feedback cycles.
+- Verifier dependency context: verifiers receive copies of all upstream reports so they can judge a deliverable in context, not in isolation.
+- Structured verification issues: failed verifications now carry problem/evidence/fix fields so retries are precise. Strict mode demands tool-gathered evidence (a pass statement alone is insufficient) and adds a completeness critic before synthesis.
+
+### Agent tools & config
+- `grep_files` tool: structured content search with path:line:text output, portable across all sandboxes (host/Docker/E2B/Modal/Vercel).
+- `replace_in_file` atomic batches: edit multiple locations in one file atomically — all edits apply or none do.
+- Context windows config: `contextWindows` maps models to their actual context limits; the engine respects each model's window and compacts accordingly.
+- Blackboard search now supports `kind` filters to find decisions, findings, or context without noise; results include source URLs.
+
+### Plan & settings
+- Plan tab in the UI: SideRail now shows the living `mission-plan.md` (read-only); the conductor can update it from `swarm note <id> "update the plan: ..."`.
+- Budget sparkline: run page displays at-a-glance token budget remaining.
+- Settings diagnostics: `/api/crawl/test` and `/api/search/test` endpoints test your configured backends; Settings page now has test buttons for crawl/search/embedding.
+- Config management: `swarm config unset <key>` removes a setting; Settings UI includes affordances to clear keys and test backend connectivity.
 
 ### Hardening
-- Hub CORS is localhost-only; safe-mode write confinement is symlink-safe.
-- Cross-run memory writes are atomic and keyed by runId, with interim snapshots during long runs; remote sandbox file transfers are size-bounded; the hub prunes its run cache.
-- `swarm config unset <key>` removes a key; `config list`/`get` mask secrets.
-
-### Settings diagnostics & run observability
-- Settings page: Test buttons exercise your search and crawl backends through new hub endpoints (`/api/search/test`, `/api/crawl/test`), keys can be cleared from the UI, and cheap/strong model tiers are configurable fields.
-- Run page: a Plan tab in the side rail renders the living mission plan (`/api/runs/:id/plan`), the blackboard gains search with kind-filter chips and source links, and a token-spend sparkline tracks budget burn.
-
-### Tests
-- Four new e2e phases (cascade root causes, failure diagnostics, strict-evidence verification, citations) and five new unit suites (validate, pdftext, webtools, tools, memory) — 105 unit tests total.
-
-### Review hardening
-A full-program audit (three correctness sweeps plus reuse/efficiency/altitude passes, every finding independently verified) closed out the release:
-- Big settle batches no longer flood the conductor: a `slice(-0)` bug disabled the 12-report digest cap exactly when 12+ failed/blocked reports landed at once.
-- Hierarchical-team fixes: file claims are namespaced by team (root `T3` and a team's `T3` no longer release each other's claims), a failed team no longer records a contradictory "done" report, team-posted blackboard notes survive resume, and team usage events no longer overwrite the run's cost readout and sparkline with the child swarm's own total.
-- The web UI's activity feed and blackboard no longer freeze after the first render (stale memoization over in-place-mutated arrays).
-- `kill`/SIGTERM can no longer lose just-settled tasks: the journal's sync flush now covers the chunk an in-flight async write holds, and readers dedupe by seq.
-- `swarm config unset` resets any settable key to its default instead of writing `""` — clearing `model` used to brick every subsequent run — and `swarm config get providers` no longer prints raw per-provider API keys.
-- `searchBackend: "tinyfish"` falls back to the free engines during a TinyFish outage again, an engine that answers "no results" while another engine errors reads as no results (not a search failure), and `grep_files` reports invalid regexes/paths as loud errors instead of "no matches".
-- A malformed cross-run memory file degrades to "forgotten" instead of crashing every run in that workspace at startup.
-- Settings → "Test search" now probes exactly the engine set runs will use (shared registry with `webSearch`) instead of a hardcoded list.
+- Localhost-only CORS: the hub API only accepts requests from localhost origins (`http://localhost:*`); external browsers cannot trigger runs or exfiltrate results.
+- Symlink-safe write confinement: safe mode now blocks symlink escapes to parent directories, preventing agents from writing through symlinks that point outside the workdir.
+- Atomic runId-keyed memory: cross-run memory entries are keyed by runId and update in place; interim snapshots preserve partial state without losing atomicity.
+- Bounded remote sandbox transfers: remote runs pull artifacts with size caps and timeouts; local caches are pruned automatically.
 
 ## 0.5.0
 
