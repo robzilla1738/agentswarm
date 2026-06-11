@@ -368,10 +368,21 @@ async function phaseVerifyRetry() {
   }
   ok("verifier failed attempt 1 and passed attempt 2");
 
+  const failedVerdict = byType("verify.result").find((e) => e.taskId === "T1" && !e.pass);
+  if (!Array.isArray(failedVerdict.issues) || !/ISSUE-MARKER/.test(String(failedVerdict.issues[0]?.problem))) {
+    fail("failed verdict should journal its structured issues");
+  }
+  ok("failed verdict journaled structured issues (problem/evidence/fix)");
+
   if (!byType("task.status").some((e) => e.taskId === "T1" && e.status === "running" && e.attempt === 2)) {
     fail("T1 should have re-run as attempt 2 after the failed verdict");
   }
   ok("task re-ran with attempt=2 carrying the verifier's feedback");
+
+  if (!byType("task.report").some((e) => e.taskId === "T1" && /saw-structured-feedback/.test(String(e.report)))) {
+    fail("the retry worker should have received the verifier's structured issues in its prompt");
+  }
+  ok("retry worker received the structured issues verbatim");
 
   if (!byType("task.status").some((e) => e.taskId === "T1" && e.status === "done")) fail("T1 should end done");
   if (byType("run.status").pop().status !== "done") fail("run should end done");
@@ -826,6 +837,40 @@ async function phaseDiagnostics() {
   fs.rmSync(home, { recursive: true, force: true });
 }
 
+async function phaseStrictVerify() {
+  console.log("\n▶ Phase 20: strict mode demands tool-gathered evidence from verifiers");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "strict-verify" });
+  ok(`mock model server on :${port} (strict-verify script)`);
+  writeConfig(home, port, { verification: "strict" });
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const res = runMission(env, "Test: strictly verified brief");
+  proc.kill();
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); fail(`swarm run exited ${res.status}`); }
+  const { evs } = soleRunEvents(home);
+  const byType = (t) => evs.filter((e) => e.type === t);
+
+  if (!byType("log").some((e) => /without evidence — re-running/.test(String(e.msg)))) {
+    fail("engine should have rejected the tool-free pass and re-run the verifier");
+  }
+  ok("tool-free pass verdict triggered an evidence-required re-run");
+
+  const verifierSpawns = byType("agent.spawned").filter((e) => e.role === "verifier" && e.taskId === "T1");
+  if (verifierSpawns.length !== 2) fail(`expected 2 verifier passes, got ${verifierSpawns.length}`);
+  ok("a second verifier agent ran");
+
+  const verdict = byType("verify.result").find((e) => e.taskId === "T1");
+  if (!verdict || !verdict.pass || !/EVIDENCE-OK/.test(String(verdict.feedback))) {
+    fail(`the accepted verdict should be the evidence-backed one, got: ${verdict && verdict.feedback}`);
+  }
+  ok("the evidence-backed verdict is the one that counted");
+
+  if (byType("run.status").pop().status !== "done") fail("strict-verify run did not end done");
+  ok("run finished with status=done");
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
 async function main() {
   await phaseHappy();
   await phaseAuthFail();
@@ -846,6 +891,7 @@ async function main() {
   await phaseLongHorizon();
   await phaseDepChain();
   await phaseDiagnostics();
+  await phaseStrictVerify();
   console.log(
     "\n✅ E2E passed — pipeline, auth failure, resume (with ledger re-seed), budget cap, verify-retry, steering + cancel, compaction, hub API, checkpoint resume, conductor breaker, blind verification, SIGTERM safety, 429 limiter, model tiers, hierarchical teams, the living plan, cascade root causes, and failure diagnostics all work."
   );

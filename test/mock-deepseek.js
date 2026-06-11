@@ -163,6 +163,17 @@ const server = http.createServer((req, res) => {
         }
         return sse(res, [...toolChunks("wait", { reason: "watching" })]);
       }
+      if (SCENARIO === "strict-verify") {
+        if (update.includes("No tasks exist yet")) {
+          return sse(res, [...toolChunks("spawn_tasks", {
+            tasks: [{ title: "Verified brief", objective: "STRICTTASK: write a brief. Done when reported.", role: "writer", verify: true }],
+          })]);
+        }
+        if (/T1 \[done/.test(update)) {
+          return sse(res, [...toolChunks("finish", { notes: "Verified task complete." })]);
+        }
+        return sse(res, [...toolChunks("wait", { reason: "waiting" })]);
+      }
       if (update.includes("No tasks exist yet")) {
         if (SCENARIO === "verify-retry") {
           return sse(res, [
@@ -277,10 +288,29 @@ const server = http.createServer((req, res) => {
         const leaked = JSON.stringify(messages).includes("SECRET-NOTE-XYZ");
         return sse(res, [...toolChunks("verdict", { pass: true, feedback: leaked ? "LEAK" : "clean" })]);
       }
+      if (SCENARIO === "strict-verify") {
+        if (/cited no tool-gathered evidence/.test(lastUser(messages))) {
+          // Second verifier pass: actually gather evidence, then pass.
+          if (!hasToolResult(messages)) {
+            return sse(res, [...toolChunks("shell", { command: "echo verify-evidence" })]);
+          }
+          return sse(res, [...toolChunks("verdict", { pass: true, feedback: "EVIDENCE-OK: verified with a real command." })]);
+        }
+        // First pass: rubber-stamp with zero tool calls.
+        return sse(res, [...toolChunks("verdict", { pass: true, feedback: "NO-EVIDENCE: looks fine." })]);
+      }
       if (SCENARIO === "verify-retry" && verdictCalls === 1) {
         return sse(res, [
           thinkChunk("The report is missing required evidence."),
-          ...toolChunks("verdict", { pass: false, feedback: "Missing a Sources section — add it and report again." }),
+          ...toolChunks("verdict", {
+            pass: false,
+            feedback: "Missing a Sources section — add it and report again.",
+            issues: [{
+              problem: "ISSUE-MARKER: the report has no Sources section",
+              evidence: "report text contains no 'Sources' heading",
+              fix: "add a Sources section listing the URLs used",
+            }],
+          }),
         ]);
       }
       return sse(res, [
@@ -292,6 +322,13 @@ const server = http.createServer((req, res) => {
     // Worker: run one real shell tool, then report on the next turn.
     if (names.has("report")) {
       const system = String((messages[0] && messages[0].content) || "");
+      if (SCENARIO === "verify-retry" && /ISSUE-MARKER/.test(system)) {
+        // The retry prompt carried the verifier's structured issue verbatim.
+        return sse(res, [...toolChunks("report", {
+          status: "done",
+          report: "saw-structured-feedback: added the Sources section exactly as the issue's fix instructed.",
+        })]);
+      }
       if (SCENARIO === "dep-chain" && /ROOTFAIL/.test(system)) {
         return sse(res, [...toolChunks("report", {
           status: "blocked",
@@ -369,6 +406,16 @@ const server = http.createServer((req, res) => {
       ]);
     }
 
+    // Tool-less helper calls: completeness critic / faithfulness check (strict mode).
+    if (!tools.length) {
+      const lu = lastUser(messages);
+      if (/completeness critic/.test(lu)) {
+        return sse(res, [textChunk("COMPLETE"), { usage: { prompt_tokens: 10, completion_tokens: 2 } }]);
+      }
+      if (/faithfulness/.test(lu)) {
+        return sse(res, [textChunk("OK"), { usage: { prompt_tokens: 10, completion_tokens: 2 } }]);
+      }
+    }
     // Fallback (compaction summary requests, etc.)
     return sse(res, [textChunk("ok"), { usage: { prompt_tokens: 10, completion_tokens: 2 } }]);
   });

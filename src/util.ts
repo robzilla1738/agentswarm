@@ -104,6 +104,79 @@ export function pathInside(parent: string, child: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
+// ---------- artifact validation ----------
+
+/**
+ * Cheap structural checks for common deliverable formats — catches a worker
+ * shipping malformed JSON/CSV/stub HTML before an LLM verifier spends tokens
+ * on it. Returns a problem description, or null when the file looks sound
+ * (or is a format we don't check).
+ */
+export function validateArtifactFormat(absPath: string): string | null {
+  const ext = path.extname(absPath).toLowerCase();
+  if (![".json", ".csv", ".html", ".htm"].includes(ext)) return null;
+  let raw: string;
+  try {
+    raw = fs.readFileSync(absPath, "utf8");
+  } catch {
+    return null; // existence/size is the caller's check
+  }
+  if (ext === ".json") {
+    try {
+      JSON.parse(raw);
+      return null;
+    } catch (e) {
+      return `not valid JSON (${errMsg(e)})`;
+    }
+  }
+  if (ext === ".csv") {
+    const counts = csvFieldCounts(raw, 50);
+    if (!counts.length) return "CSV has no records";
+    const expect = counts[0];
+    const bad = counts.findIndex((c) => c !== expect);
+    if (bad > 0) return `inconsistent CSV: record 1 has ${expect} field(s), record ${bad + 1} has ${counts[bad]}`;
+    return null;
+  }
+  // .html / .htm — catch empty shells and plain text passed off as HTML.
+  if (raw.length < 200 || !/<[a-z!][^>]*>/i.test(raw) || !/<\/[a-z][a-z0-9]*>/i.test(raw)) {
+    return "HTML looks like a stub (too short or no real markup)";
+  }
+  return null;
+}
+
+/** Field count per CSV record (quote-aware, handles newlines inside quotes). */
+function csvFieldCounts(raw: string, maxRecords: number): number[] {
+  const counts: number[] = [];
+  let fields = 1;
+  let chars = 0; // non-separator chars seen in the current record
+  let inQ = false;
+  for (let i = 0; i < raw.length && counts.length < maxRecords; i++) {
+    const ch = raw[i];
+    if (inQ) {
+      if (ch === '"') {
+        if (raw[i + 1] === '"') i++;
+        else inQ = false;
+      }
+      chars++;
+    } else if (ch === '"') {
+      inQ = true;
+      chars++;
+    } else if (ch === ",") {
+      fields++;
+      chars++;
+    } else if (ch === "\n" || ch === "\r") {
+      if (ch === "\r" && raw[i + 1] === "\n") i++;
+      if (chars > 0) counts.push(fields); // skip blank lines
+      fields = 1;
+      chars = 0;
+    } else {
+      chars++;
+    }
+  }
+  if (chars > 0 && counts.length < maxRecords) counts.push(fields);
+  return counts;
+}
+
 // ---------- html ----------
 
 const ENTITIES: Record<string, string> = {

@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { estimateMessages, runAgent } from "./agent";
+import { AgentOutcome, estimateMessages, runAgent } from "./agent";
 import { SwarmConfig, runDir } from "./config";
 import { ControlReader } from "./control";
 import { ChatMsg, ChatResult, chat, gateFor, isFatalAuthError, validateAuth } from "./deepseek";
@@ -42,7 +42,7 @@ import { renderFinalHtml } from "./report";
 import { SandboxRuntime, createSandbox } from "./sandbox";
 import { RunState } from "./state";
 import { RunMeta, RunStatus, Task, TaskSpec, Usage, usageCost } from "./types";
-import { clip, ensureDir, errMsg, oneLine, rid, sleep, truncateMiddle } from "./util";
+import { clip, ensureDir, errMsg, oneLine, rid, sleep, truncateMiddle, validateArtifactFormat } from "./util";
 
 
 export interface ExecutorOptions {
@@ -1266,6 +1266,7 @@ export class Executor {
       return "Report is too thin to verify. Re-do the task and report concretely: what was done, what was verified, exact paths.";
     }
     const missing: string[] = [];
+    const malformed: string[] = [];
     // Remote sandboxes own their filesystem — only check host-visible paths.
     if (this.sandbox.localFs) {
       const okAt = (p: string) => {
@@ -1278,16 +1279,28 @@ export class Executor {
       for (const rel of task.artifacts) {
         const inArtifacts = path.join(this.runDirPath, "artifacts", rel);
         const inWorkdir = path.resolve(this.meta.cwd, rel);
-        if (!okAt(inArtifacts) && !okAt(inWorkdir)) missing.push(rel);
+        if (!okAt(inArtifacts) && !okAt(inWorkdir)) {
+          missing.push(rel);
+          continue;
+        }
+        // Structural format check (json parses, csv is rectangular, html is
+        // not a stub) — free, and catches what the LLM verifier wastes a whole
+        // agent run discovering.
+        const problem = validateArtifactFormat(okAt(inArtifacts) ? inArtifacts : inWorkdir);
+        if (problem) malformed.push(`${rel}: ${problem}`);
       }
     }
     if (missing.length) {
       return `Claimed artifact(s) do not exist or are empty: ${missing.join(", ")}. Actually create them (use save_artifact), then report again.`;
     }
+    if (malformed.length) {
+      return `Claimed artifact(s) are malformed — fix them and report again: ${malformed.join("; ")}`;
+    }
     return null;
   }
 
-  private async runVerifier(task: Task): Promise<boolean> {
+  /** One verifier agent pass; returns the outcome plus how many evidence-gathering tool calls it made. */
+  private async verifierAgent(task: Task, kickoff: string): Promise<{ outcome: AgentOutcome; evidenceCalls: number }> {
     const agentId = rid("v");
     // Verification gets the strong tier when configured — a weak verifier
     // rubber-stamps exactly the tasks that most need scrutiny.
@@ -1300,14 +1313,16 @@ export class Executor {
       model,
       purpose: `verify ${task.id}`,
     });
+    let evidenceCalls = 0;
+    const baseHooks = this.agentHooks(agentId, task.id);
     const outcome = await runAgent({
       cfg: this.cfg,
       agentId,
       model,
       thinking: this.meta.options.thinking,
       reasoningEffort: this.meta.options.reasoningEffort,
-      system: verifierSystem(this.meta, task),
-      kickoff: VERIFIER_KICKOFF,
+      system: verifierSystem(this.meta, task, this.depReportsFor(task)),
+      kickoff,
       tools: verifierToolset(),
       terminal: [VERDICT_TOOL],
       maxSteps: Math.min(14, this.meta.options.maxStepsPerTask),
@@ -1315,21 +1330,81 @@ export class Executor {
       // Blind verification: the verifier judges deliverables against the
       // objective with its own tools — it must not inherit the swarm's shared
       // beliefs (blackboard) or the worker's narrative beyond the claims.
+      // (Dep reports are settled upstream outputs, not the worker's story.)
       ctx: { ...this.makeToolCtx(agentId, task), readBlackboard: () => "", searchNotes: undefined },
-      hooks: this.agentHooks(agentId, task.id),
+      hooks: {
+        ...baseHooks,
+        onToolCall: (callId: string, name: string, args: unknown) => {
+          if (name !== "verdict") evidenceCalls++;
+          baseHooks.onToolCall(callId, name, args);
+        },
+      },
       stop: this.agentStop,
     });
     this.flushDeltas(agentId);
     this.journal.append("agent.done", { agentId, taskId: task.id, steps: outcome.steps });
+    return { outcome, evidenceCalls };
+  }
+
+  private async runVerifier(task: Task): Promise<boolean> {
+    const strict = this.cfg.verification === "strict";
+    let { outcome, evidenceCalls } = await this.verifierAgent(task, VERIFIER_KICKOFF);
     if (this.ac.signal.aborted) return true;
 
-    const v = (outcome.terminal?.args ?? {}) as { pass?: boolean; feedback?: string };
-    const strict = this.cfg.verification === "strict";
+    // Strict mode: a pass verdict backed by zero tool calls is an opinion,
+    // not a verification. One re-run demanding evidence; if that also passes
+    // tool-free, accept but say so in the journal.
+    if (strict && outcome.terminal && Boolean((outcome.terminal.args as { pass?: boolean }).pass) && evidenceCalls === 0) {
+      this.journal.append("log", {
+        level: "info",
+        msg: `verifier passed ${task.id} without evidence — re-running with a tools-required kickoff`,
+      });
+      const second = await this.verifierAgent(
+        task,
+        "A previous verdict on this task cited no tool-gathered evidence. Verify concretely NOW — read the claimed files, run the commands — then call verdict(...)."
+      );
+      if (this.ac.signal.aborted) return true;
+      if (second.outcome.terminal) {
+        if (second.evidenceCalls === 0) {
+          this.journal.append("log", { level: "warn", msg: `verifier passed ${task.id} without gathering evidence` });
+        }
+        outcome = second.outcome;
+      }
+    }
+
+    const v = (outcome.terminal?.args ?? {}) as { pass?: boolean; feedback?: string; issues?: unknown };
     // No verdict returned: in strict mode fail closed, otherwise accept.
     const pass = outcome.terminal ? Boolean(v.pass) : !strict;
-    const feedback = String(v.feedback ?? (outcome.terminal ? "" : "verifier produced no verdict"));
+    let feedback = String(v.feedback ?? (outcome.terminal ? "" : "verifier produced no verdict"));
+    // Structured issues become the retry's worklist — numbered, with evidence.
+    const issues = Array.isArray(v.issues)
+      ? (v.issues as Record<string, unknown>[])
+          .filter((i) => i && typeof i === "object" && i.problem)
+          .slice(0, 5)
+          .map((i) => ({
+            problem: oneLine(String(i.problem), 300),
+            evidence: i.evidence ? oneLine(String(i.evidence), 300) : undefined,
+            fix: i.fix ? oneLine(String(i.fix), 300) : undefined,
+          }))
+      : [];
+    if (!pass && issues.length) {
+      feedback = [
+        feedback,
+        ...issues.map(
+          (i, n) =>
+            `${n + 1}. ${i.problem}${i.evidence ? `\n   evidence: ${i.evidence}` : ""}${i.fix ? `\n   fix: ${i.fix}` : ""}`
+        ),
+      ]
+        .filter(Boolean)
+        .join("\n");
+    }
     task.feedback = feedback;
-    this.journal.append("verify.result", { taskId: task.id, pass, feedback });
+    this.journal.append("verify.result", {
+      taskId: task.id,
+      pass,
+      feedback,
+      ...(issues.length ? { issues } : {}),
+    });
     return pass;
   }
 

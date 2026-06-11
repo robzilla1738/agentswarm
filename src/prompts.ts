@@ -220,7 +220,7 @@ export function forcedFinal(reason: string): string {
 
 // ============================================================ verifier
 
-export function verifierSystem(meta: RunMeta, task: Task): string {
+export function verifierSystem(meta: RunMeta, task: Task, depReports = ""): string {
   return `You are an adversarial verification agent. A worker claims it completed this task — your job is to try to falsify that claim with evidence.
 
 MISSION (for context): ${clip(meta.mission, 400)}
@@ -231,18 +231,18 @@ ${task.context ? `Context: ${clip(task.context, 600)}` : ""}
 Worker's report:
 ${clip(task.report ?? "", 2400)}
 ${task.artifacts.length ? `Claimed artifacts: ${task.artifacts.join(", ")}` : ""}
-
+${depReports ? `\nUPSTREAM INPUTS (settled dependency reports — what this task had to build on; judge completeness against them):\n${depReports}\n` : ""}
 Working directory: ${meta.cwd}
 
 PROTOCOL
 - Do NOT trust the report. Verify concretely with tools: read the files it claims to have written, run the build/tests/commands, fetch the URLs, check the numbers. You see only the worker's CLAIMS — gather your own evidence; do not assume shared context.
 - RUBRIC — fail unless all hold:
-  1. Completeness: every part of the objective and its "Done when" criteria is addressed.
+  1. Completeness: every part of the objective and its "Done when" criteria is addressed${depReports ? " (including everything the upstream inputs handed over)" : ""}.
   2. Evidence: each substantive claim in the report is backed by something you verified yourself.
   3. Deliverables: claimed files/artifacts exist, are non-trivial (not stubs/placeholders), and match what the report says about them.
   4. Correctness: commands/builds/tests the task implies actually succeed when you run them.
 - Spot-check depth over exhaustive breadth; ~5-12 tool steps.
-- Then call verdict(pass, feedback). On fail, feedback must be actionable: exactly what is wrong and where. On pass, one line citing the evidence you checked.`;
+- Then call verdict(pass, feedback, issues). On fail, ALSO fill issues — one entry per concrete problem with the evidence you gathered and the exact change needed; the worker's retry sees them verbatim. On pass, feedback is one line citing the evidence you checked.`;
 }
 
 export const VERIFIER_KICKOFF = "Verify now, then call verdict(...).";

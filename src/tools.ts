@@ -583,6 +583,19 @@ export const VERDICT_TOOL: ToolSchema = {
         type: "string",
         description: "If fail: exactly what is wrong and where. If pass: one-line confirmation of the evidence.",
       },
+      issues: {
+        type: "array",
+        description: "On fail: one entry per concrete problem. The worker's retry sees these verbatim — make each actionable.",
+        items: {
+          type: "object",
+          properties: {
+            problem: { type: "string", description: "What is wrong" },
+            evidence: { type: "string", description: "What you observed that proves it (command output, file content, URL)" },
+            fix: { type: "string", description: "The exact change that would resolve it" },
+          },
+          required: ["problem"],
+        },
+      },
     },
     required: ["pass", "feedback"],
   },
