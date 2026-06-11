@@ -61,6 +61,11 @@ function resolveRead(p: string, ctx: ToolCtx): string {
   return path.resolve(ctx.workdir, p);
 }
 
+/** Single-quote a string for sh. */
+function shq(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
 function resolveWrite(p: string, ctx: ToolCtx): string {
   const abs = path.resolve(ctx.workdir, p);
   const ok =
@@ -182,7 +187,7 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
     schema: {
       name: "replace_in_file",
       description:
-        "Exact string replacement in a file. `find` must match exactly (including whitespace). Fails if not found, or if ambiguous when all=false.",
+        "Exact string replacement in a file. `find` must match exactly (including whitespace). Fails if not found, or if ambiguous when all=false. For several edits to the same file, pass `edits` — they apply in order, all-or-nothing, in one call.",
       parameters: {
         type: "object",
         properties: {
@@ -190,24 +195,97 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
           find: { type: "string" },
           replace: { type: "string" },
           all: { type: "boolean", description: "Replace every occurrence (default false)" },
+          edits: {
+            type: "array",
+            description: "Batch mode: multiple find/replace pairs applied in order, atomically (replaces top-level find/replace)",
+            items: {
+              type: "object",
+              properties: {
+                find: { type: "string" },
+                replace: { type: "string" },
+                all: { type: "boolean" },
+              },
+              required: ["find", "replace"],
+            },
+          },
         },
-        required: ["path", "find", "replace"],
+        required: ["path"],
       },
     },
     run: async (args, ctx) => {
       const abs = resolveWrite(String(args.path), ctx);
       const raw = await readFileVia(ctx, abs);
-      const find = String(args.find);
-      const replace = String(args.replace);
-      const count = raw.split(find).length - 1;
-      if (count === 0) throw new Error("find string not found in file");
-      if (count > 1 && !args.all) {
-        throw new Error(`find string matches ${count} times; provide more context or set all=true`);
+      const edits =
+        Array.isArray(args.edits) && args.edits.length
+          ? (args.edits as Record<string, unknown>[]).map((e) => ({
+              find: String(e.find ?? ""),
+              replace: String(e.replace ?? ""),
+              all: Boolean(e.all),
+            }))
+          : args.find !== undefined && args.replace !== undefined
+            ? [{ find: String(args.find), replace: String(args.replace), all: Boolean(args.all) }]
+            : null;
+      if (!edits) throw new Error("provide find+replace, or an edits array");
+      // Validate-then-apply against the progressively edited content:
+      // any failing edit aborts the whole batch with nothing written.
+      let next = raw;
+      let total = 0;
+      const at = (i: number) => (edits.length > 1 ? `edit ${i + 1}: ` : "");
+      for (let i = 0; i < edits.length; i++) {
+        const { find, replace, all } = edits[i];
+        if (!find) throw new Error(`${at(i)}find must not be empty`);
+        const count = next.split(find).length - 1;
+        if (count === 0) {
+          throw new Error(`${at(i)}find string not found in file${edits.length > 1 ? " — no edits were applied" : ""}`);
+        }
+        if (count > 1 && !all) {
+          throw new Error(
+            `${at(i)}find string matches ${count} times; provide more context or set all=true${edits.length > 1 ? " — no edits were applied" : ""}`
+          );
+        }
+        next = all ? next.split(find).join(replace) : next.replace(find, replace);
+        total += all ? count : 1;
       }
-      const next = args.all ? raw.split(find).join(replace) : raw.replace(find, replace);
       await writeFileVia(ctx, abs, next);
       const warn = ctx.checkClaim?.(String(args.path));
-      return `replaced ${args.all ? count : 1} occurrence(s) in ${abs}${warn ? `\n${warn}` : ""}`;
+      return `replaced ${total} occurrence(s) via ${edits.length} edit(s) in ${abs}${warn ? `\n${warn}` : ""}`;
+    },
+  };
+
+  tools.grep_files = {
+    schema: {
+      name: "grep_files",
+      description:
+        "Search file contents with a regex (grep -E syntax). Returns matching lines as path:line:text. Use this to locate code or text instead of shell grep pipelines — one round-trip, works identically in remote sandboxes, skips node_modules/.git/build output.",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string", description: "Extended regex (grep -E)" },
+          path: { type: "string", description: "Directory or file to search (default: working directory)" },
+          glob: { type: "string", description: "Filename filter, e.g. *.ts" },
+          ignore_case: { type: "boolean" },
+          max_results: { type: "number", description: "Default 50, max 200" },
+        },
+        required: ["pattern"],
+      },
+    },
+    run: async (args, ctx) => {
+      const pattern = String(args.pattern ?? "");
+      if (!pattern.trim()) throw new Error("pattern is required");
+      const root = args.path ? resolveRead(String(args.path), ctx) : ctx.workdir;
+      const max = Math.min(Math.max(Number(args.max_results) || 50, 1), 200);
+      const flags = `-rnE${args.ignore_case ? "i" : ""}`;
+      const include = args.glob ? ` --include=${shq(String(args.glob))}` : "";
+      const excludes = ["node_modules", ".git", "dist", ".next", "out", "build", "target", "__pycache__", ".venv"]
+        .map((d) => ` --exclude-dir=${d}`)
+        .join("");
+      const cmd = `grep ${flags}${include}${excludes} -e ${shq(pattern)} ${shq(root)} | head -n ${max + 1}`;
+      const r = await ctx.sandbox.exec(cmd, { cwd: ctx.workdir, timeoutSec: 60, signal: ctx.signal });
+      const lines = r.out.split("\n").filter(Boolean);
+      if (!lines.length) return "no matches";
+      const shown = lines.slice(0, max);
+      const more = lines.length > max ? `\n…more matches truncated (raise max_results or narrow the pattern)` : "";
+      return shown.join("\n") + more;
     },
   };
 
