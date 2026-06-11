@@ -87,6 +87,8 @@ export interface Task {
   artifacts: string[];
   feedback?: string;
   error?: string;
+  /** Last failing tool call of the current attempt — diagnostic context for retries and the conductor. */
+  lastToolError?: string;
   /** Latest progress summary journaled by a worker (compaction or checkpoint tool). */
   lastCheckpoint?: string;
   /** Structured handoff fields from the worker's report. */

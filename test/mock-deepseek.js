@@ -132,6 +132,37 @@ const server = http.createServer((req, res) => {
         return;
       }
       const update = lastUser(messages);
+      // Prove (or disprove) that the engine seeded a mission ledger into the
+      // conductor's history — phaseResume asserts it, phaseHappy asserts not.
+      const ledgerMark = messages.some((m) => m.role === "user" && String(m.content || "").includes("MISSION LEDGER"))
+        ? [textChunk("LEDGER-SEEN ")]
+        : [];
+      if (SCENARIO === "dep-chain") {
+        if (update.includes("No tasks exist yet")) {
+          return sse(res, [...toolChunks("spawn_tasks", {
+            tasks: [
+              { title: "Root task", objective: "ROOTFAIL: needs a missing prerequisite. Done when reported.", role: "researcher" },
+              { title: "Mid task", objective: "Use T1 output. Done when reported.", role: "analyst", deps: ["T1"] },
+              { title: "Leaf task", objective: "Use T2 output. Done when reported.", role: "writer", deps: ["T2"] },
+            ],
+          })]);
+        }
+        if (/T3 \[blocked/.test(update) || /All tasks have settled/.test(update)) {
+          return sse(res, [...toolChunks("finish", { notes: "Chain blocked; finishing." })]);
+        }
+        return sse(res, [...toolChunks("wait", { reason: "watching the chain" })]);
+      }
+      if (SCENARIO === "diag") {
+        if (update.includes("No tasks exist yet")) {
+          return sse(res, [...toolChunks("spawn_tasks", {
+            tasks: [{ title: "Doomed task", objective: "DIAGTASK: read the missing file. Done when reported.", role: "researcher" }],
+          })]);
+        }
+        if (/T1 \[failed/.test(update) || /All tasks have settled/.test(update)) {
+          return sse(res, [...toolChunks("finish", { notes: "Task failed; finishing." })]);
+        }
+        return sse(res, [...toolChunks("wait", { reason: "watching" })]);
+      }
       if (update.includes("No tasks exist yet")) {
         if (SCENARIO === "verify-retry") {
           return sse(res, [
@@ -215,11 +246,13 @@ const server = http.createServer((req, res) => {
       // otherwise wait so the swarm runs the full wave-2 synthesis task.
       if (SCENARIO === "default" && /T3 \[done/.test(update)) {
         return sse(res, [
+          ...ledgerMark,
           thinkChunk("All reports are in and look complete."),
           ...toolChunks("finish", { notes: "Combine the two scouts' findings; highlight the synthesis." }),
         ]);
       }
       return sse(res, [
+        ...ledgerMark,
         thinkChunk("Work is still in flight."),
         ...toolChunks("wait", { reason: "waiting on running tasks" }),
       ]);
@@ -259,6 +292,23 @@ const server = http.createServer((req, res) => {
     // Worker: run one real shell tool, then report on the next turn.
     if (names.has("report")) {
       const system = String((messages[0] && messages[0].content) || "");
+      if (SCENARIO === "dep-chain" && /ROOTFAIL/.test(system)) {
+        return sse(res, [...toolChunks("report", {
+          status: "blocked",
+          report: "BLOCKED-ROOT: the prerequisite dataset does not exist anywhere.",
+        })]);
+      }
+      if (SCENARIO === "diag" && /DIAGTASK/.test(system)) {
+        const last = lastUser(messages);
+        // Refuse the wrap-up calls so the worker "ends without reporting" and
+        // the engine must surface the last failing tool in its diagnostics.
+        if (/step limit|Call the report tool now/i.test(last)) {
+          return sse(res, [textChunk("cannot comply"), { usage: { prompt_tokens: 10, completion_tokens: 2 } }]);
+        }
+        // read_file on a missing path THROWS (unlike a non-zero shell exit),
+        // which is what marks a tool.result ok:false and feeds diagnostics.
+        return sse(res, [...toolChunks("read_file", { path: "/nonexistent-swarm-e2e-diag.txt" })]);
+      }
       if (SCENARIO === "note-cancel" && !hasToolResult(messages)) {
         // Long-running shells give the operator time to steer and cancel.
         const secs = /SLOWTASK/.test(system) ? 15 : 2;

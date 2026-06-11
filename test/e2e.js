@@ -127,6 +127,11 @@ async function phaseHappy() {
   if (byType("run.status").pop().status !== "done") fail("run did not end as done");
   ok("run finished with status=done");
 
+  if (byType("conductor.say").some((e) => /LEDGER-SEEN/.test(String(e.text)))) {
+    fail("a fresh (non-resumed, non-trimmed) run must not inject a mission ledger");
+  }
+  ok("no mission ledger injected on a fresh run");
+
   proc.kill();
   fs.rmSync(home, { recursive: true, force: true });
 }
@@ -246,6 +251,11 @@ async function phaseResume() {
   const reportFile = path.join(runDir, "artifacts", "final-report.md");
   if (!fs.existsSync(reportFile) || !/Mission Report/.test(fs.readFileSync(reportFile, "utf8"))) fail("final report missing after resume");
   ok("resumed run finished with status=done and a final report");
+
+  if (!byType("conductor.say").some((e) => /LEDGER-SEEN/.test(String(e.text)) && e.seq > resumeSeq)) {
+    fail("the resumed conductor should have been seeded with a MISSION LEDGER (mock echoes LEDGER-SEEN)");
+  }
+  ok("resumed conductor was re-seeded with the mission ledger");
 
   proc.kill();
   fs.rmSync(home, { recursive: true, force: true });
@@ -752,6 +762,70 @@ async function phaseLongHorizon() {
   fs.rmSync(home, { recursive: true, force: true });
 }
 
+async function phaseDepChain() {
+  console.log("\n▶ Phase 18: failure cascades block transitively with root causes");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "dep-chain" });
+  ok(`mock model server on :${port} (dep-chain script)`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const res = runMission(env, "Test: a chain doomed at the root");
+  proc.kill();
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); fail(`swarm run exited ${res.status}`); }
+  const { evs } = soleRunEvents(home);
+  const blocked = {};
+  for (const e of evs) {
+    if (e.type === "task.status" && e.status === "blocked" && blocked[e.taskId] == null) blocked[e.taskId] = e;
+  }
+  if (!blocked.T1 || !blocked.T2 || !blocked.T3) fail(`expected T1,T2,T3 all blocked, got ${Object.keys(blocked).join(",")}`);
+  ok("the whole chain (T1→T2→T3) ended blocked");
+
+  if (!/dependency T1 did not complete \(BLOCKED-ROOT/.test(String(blocked.T2.reason))) {
+    fail(`T2's reason should carry T1's failure verbatim, got: ${blocked.T2.reason}`);
+  }
+  if (!/root cause T1: BLOCKED-ROOT/.test(String(blocked.T3.reason))) {
+    fail(`T3's reason should name the ROOT cause (T1), got: ${blocked.T3.reason}`);
+  }
+  ok("blocked tasks carry the root failure, not just 'dependency did not complete'");
+
+  // Fixpoint: T2 and T3 must block in the same scheduler pass — no conductor
+  // turn (conductor.action) may land between them.
+  const between = evs.filter(
+    (e) => e.type === "conductor.action" && e.seq > blocked.T2.seq && e.seq < blocked.T3.seq
+  );
+  if (between.length) fail("cascade blocking took multiple conductor turns (not a single fixpoint pass)");
+  ok("the cascade blocked in one pass (no conductor turn in between)");
+
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+async function phaseDiagnostics() {
+  console.log("\n▶ Phase 19: failed tasks surface their last failing tool call");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "diag" });
+  ok(`mock model server on :${port} (diag script)`);
+  writeConfig(home, port, { maxStepsPerTask: 3 });
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const res = runMission(env, "Test: doomed by a missing file");
+  proc.kill();
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); fail(`swarm run exited ${res.status}`); }
+  const { evs } = soleRunEvents(home);
+  const failedEv = evs.find((e) => e.type === "task.status" && e.taskId === "T1" && e.status === "failed");
+  if (!failedEv) fail("T1 should have failed");
+  if (!/last tool failure: read_file/.test(String(failedEv.reason))) {
+    fail(`T1's failure should name the failing tool call, got: ${failedEv.reason}`);
+  }
+  ok("task failure carries the last failing tool call as diagnostics");
+  if (!/worker ended without reporting/.test(String(failedEv.reason))) {
+    fail(`expected the no-report cause in the reason, got: ${failedEv.reason}`);
+  }
+  ok("no-report cause and tool diagnostics are both in the journal");
+
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
 async function main() {
   await phaseHappy();
   await phaseAuthFail();
@@ -770,8 +844,10 @@ async function main() {
   await phaseModelTiers();
   await phaseTeam();
   await phaseLongHorizon();
+  await phaseDepChain();
+  await phaseDiagnostics();
   console.log(
-    "\n✅ E2E passed — pipeline, auth failure, resume, budget cap, verify-retry, steering + cancel, compaction, hub API, checkpoint resume, conductor breaker, blind verification, SIGTERM safety, 429 limiter, model tiers, hierarchical teams, and the living plan all work."
+    "\n✅ E2E passed — pipeline, auth failure, resume (with ledger re-seed), budget cap, verify-retry, steering + cancel, compaction, hub API, checkpoint resume, conductor breaker, blind verification, SIGTERM safety, 429 limiter, model tiers, hierarchical teams, the living plan, cascade root causes, and failure diagnostics all work."
   );
 }
 

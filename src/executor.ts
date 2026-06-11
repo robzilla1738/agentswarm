@@ -151,7 +151,14 @@ export class Executor {
       const n = Number(/^T(\d+)$/.exec(copy.id)?.[1] ?? 0);
       this.taskCounter = Math.max(this.taskCounter, n);
     }
-    this.notes = state.notes.map((n) => ({ taskId: n.taskId, key: n.key, kind: n.kind, text: n.text }));
+    // Drop claims held by settled tasks — they were released on task end and
+    // must not resurrect across a restart.
+    const settled = new Set(
+      state.taskList().filter((t) => ["done", "failed", "blocked"].includes(t.status) && !reset.has(t.id)).map((t) => t.id)
+    );
+    this.notes = state.notes
+      .map((n) => ({ taskId: n.taskId, key: n.key, kind: n.kind, text: n.text }))
+      .filter((n) => !(n.kind === "claim" && n.taskId && settled.has(n.taskId)));
     const lastPhase = state.phases[state.phases.length - 1];
     if (lastPhase) this.phase = { name: lastPhase.name, goal: lastPhase.goal, exitCriteria: lastPhase.exitCriteria };
     this.spentTokens = state.totalUsage.promptTokens + state.totalUsage.completionTokens;
@@ -288,6 +295,8 @@ export class Executor {
         content: this.resumed
           ? conductorUpdate({
               blackboard: this.blackboardDigest(),
+              phase: this.phaseLine(),
+              plan: this.planPin(),
               nextId: this.nextId(),
               taskTable: taskTable(this.taskList()),
               budgetLine: budgetLine({ total: this.spentTokens, cost: this.cost }, this.meta.options.maxTokens),
@@ -300,6 +309,15 @@ export class Executor {
           : conductorInitialUpdate(this.meta, this.nextId()),
       },
     ];
+    if (this.resumed) {
+      // The conductor's reasoning history died with the old process. Re-seed
+      // the durable facts into the same slot trimConductorHistory() maintains,
+      // so a resumed conductor knows what settled and what was decided.
+      this.conductorMessages.splice(1, 0, {
+        role: "user",
+        content: this.missionLedger("This run was resumed — prior orchestration history is gone."),
+      });
+    }
 
     try {
       await this.conductorTurn();
@@ -835,8 +853,8 @@ export class Executor {
    * trimmed history so the conductor never loses the plot on long missions —
    * rebuilt fresh each trim from current state, so it also survives resume.
    */
-  private missionLedger(): string {
-    const lines: string[] = ["[Earlier orchestration history was trimmed. MISSION LEDGER — durable state so far:]"];
+  private missionLedger(intro = "Earlier orchestration history was trimmed."): string {
+    const lines: string[] = [`[${intro} MISSION LEDGER — durable state so far:]`];
     if (this.phase) lines.push(this.phaseLine()!);
     const settled = this.taskList().filter((t) => ["done", "failed", "blocked"].includes(t.status));
     if (settled.length) {
@@ -911,19 +929,46 @@ export class Executor {
     return this.taskList().some((t) => ["pending", "running", "verifying"].includes(t.status));
   }
 
+  /** Walk a failed/blocked dep chain down to the task that actually failed. */
+  private rootFailure(id: string): Task | undefined {
+    let cur = this.tasks.get(id);
+    const seen = new Set<string>();
+    while (cur && !seen.has(cur.id)) {
+      seen.add(cur.id);
+      const next = cur.deps
+        .map((d) => this.tasks.get(d))
+        .find((t): t is Task => !!t && (t.status === "failed" || t.status === "blocked"));
+      if (!next) return cur;
+      cur = next;
+    }
+    return cur;
+  }
+
   private blockStuckTasks(): void {
-    for (const t of this.taskList()) {
-      if (t.status !== "pending") continue;
-      const bad = t.deps.find((d) => {
-        const s = this.tasks.get(d)?.status;
-        return s === "failed" || s === "blocked";
-      });
-      if (bad) {
+    // Fixpoint: a failed dep chain T1→T2→T5 must block the whole chain in one
+    // pass, not one level per conductor turn.
+    for (let changed = true; changed; ) {
+      changed = false;
+      for (const t of this.taskList()) {
+        if (t.status !== "pending") continue;
+        const bad = t.deps.find((d) => {
+          const s = this.tasks.get(d)?.status;
+          return s === "failed" || s === "blocked";
+        });
+        if (!bad) continue;
+        // Carry the root cause so the conductor re-plans around the actual
+        // failure, not a chain of "dependency did not complete".
+        const root = this.rootFailure(bad);
+        const cause = root ? oneLine(root.feedback ?? root.error ?? "unknown failure", 160) : "";
         t.status = "blocked";
-        t.error = `dependency ${bad} did not complete`;
+        t.error =
+          root && root.id !== bad
+            ? `dependency ${bad} did not complete (root cause ${root.id}: ${cause})`
+            : `dependency ${bad} did not complete${cause ? ` (${cause})` : ""}`;
         t.endedAt = Date.now();
         this.journal.append("task.status", { taskId: t.id, status: "blocked", attempt: t.attempt, reason: t.error });
         this.settledSinceUpdate.push(t.id);
+        changed = true;
       }
     }
   }
@@ -1067,7 +1112,12 @@ export class Executor {
           if (task.attempt < this.cfg.verifyMaxAttempts) {
             task.attempt++;
             task.status = "running";
-            this.journal.append("task.status", { taskId: task.id, status: "running", attempt: task.attempt });
+            this.journal.append("task.status", {
+              taskId: task.id,
+              status: "running",
+              attempt: task.attempt,
+              reason: task.feedback || task.error,
+            });
             continue;
           }
           this.finalizeTask(task, "failed", task.feedback || task.error || "verification failed after retries");
@@ -1081,12 +1131,12 @@ export class Executor {
         }
         if (task.attempt < this.cfg.verifyMaxAttempts && !this.finishing && !this.budgetExceeded()) {
           task.attempt++;
-          task.error = errMsg(e);
+          task.error = `${errMsg(e)}${task.lastToolError ? ` (last tool failure: ${task.lastToolError})` : ""}`;
           task.status = "running";
           this.journal.append("task.status", { taskId: task.id, status: "running", attempt: task.attempt, reason: task.error });
           continue;
         }
-        this.finalizeTask(task, "failed", `worker error: ${errMsg(e)}`);
+        this.finalizeTask(task, "failed", `worker error: ${errMsg(e)}${task.lastToolError ? ` (last tool failure: ${task.lastToolError})` : ""}`);
         return;
       }
     }
@@ -1103,6 +1153,7 @@ export class Executor {
     const agentId = rid("w");
     const model = this.resolveModel(task.modelTier);
     task.agentIds.push(agentId);
+    task.lastToolError = undefined; // diagnostics are per-attempt
     const dirListing = this.topListing();
     const system = workerSystem({
       agentId,
@@ -1137,7 +1188,7 @@ export class Executor {
       signal: this.ac.signal,
       ctx: this.makeToolCtx(agentId, task),
       hooks: {
-        ...this.agentHooks(agentId, task.id),
+        ...this.agentHooks(agentId, task.id, task),
         onCheckpoint: (summary: string) => this.recordCheckpoint(task, agentId, summary),
       },
       stop: this.agentStop,
@@ -1148,7 +1199,11 @@ export class Executor {
     if (this.ac.signal.aborted) return "done";
 
     if (!outcome.terminal) {
-      task.error = "worker ended without reporting";
+      const lastWords = oneLine(outcome.finalText ?? "", 200);
+      task.error =
+        "worker ended without reporting" +
+        (task.lastToolError ? ` — last tool failure: ${task.lastToolError}` : "") +
+        (lastWords ? `; last words: ${lastWords}` : "");
       return "retry";
     }
     const a = outcome.terminal.args as {
@@ -1282,6 +1337,13 @@ export class Executor {
     task.status = status;
     task.endedAt = Date.now();
     if (reason && status !== "done") task.error = reason;
+    // A settled task holds no file claims — release them so the digest and
+    // search_notes don't accumulate dead claims on long runs. In-place splice:
+    // teams share this array by reference.
+    for (let i = this.notes.length - 1; i >= 0; i--) {
+      const n = this.notes[i];
+      if (n.kind === "claim" && n.taskId === task.id) this.notes.splice(i, 1);
+    }
     this.journal.append("task.status", { taskId: task.id, status, attempt: task.attempt, reason });
     this.settledSinceUpdate.push(task.id);
     this.maybeSnapshot();
@@ -1412,7 +1474,7 @@ export class Executor {
     }
   }
 
-  private agentHooks(agentId: string, taskId: string) {
+  private agentHooks(agentId: string, taskId: string, trackErrorsOn?: Task) {
     return {
       onDelta: (channel: "text" | "think", text: string) => {
         this.queueDelta(agentId, taskId, channel, text);
@@ -1422,6 +1484,7 @@ export class Executor {
         this.journal.append("tool.call", { agentId, taskId, callId, name, args });
       },
       onToolResult: (callId: string, name: string, ok: boolean, summary: string) => {
+        if (!ok && trackErrorsOn) trackErrorsOn.lastToolError = `${name}: ${oneLine(summary, 200)}`;
         this.journal.append("tool.result", { agentId, taskId, callId, name, ok, summary });
       },
       onUsage: this.onUsage,

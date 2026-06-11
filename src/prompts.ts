@@ -85,7 +85,7 @@ export function taskTable(tasks: Task[]): string {
   const line = (t: Task) => {
     const deps = t.deps.length ? ` deps:[${t.deps.join(",")}]` : "";
     const extra =
-      t.status === "failed" && t.error ? ` — ${clip(t.error, 80)}` : "";
+      (t.status === "failed" || t.status === "blocked") && t.error ? ` — ${clip(t.error, 120)}` : "";
     return `${t.id} [${t.status}${t.attempt > 1 ? ` a${t.attempt}` : ""}] (${t.role})${deps} ${clip(t.title, 70)}${extra}`;
   };
   const settled = tasks.filter((t) => ["done", "failed", "blocked"].includes(t.status));
