@@ -13,7 +13,8 @@ import {
   saveConfig,
 } from "./config";
 import { appendControl } from "./control";
-import { resolveCrawlBackend } from "./crawltools";
+import { crawlSite, hasScrapeBackend, resolveCrawlBackend, scrapeUrl } from "./crawltools";
+import { bingSearch, ddgSearch, tinyfishSearch } from "./webtools";
 import { listModels, validateAuth } from "./deepseek";
 import { PROVIDERS, PROVIDER_IDS, isProviderId } from "./providers";
 import { eventsFile, readEvents, readNewEvents, TailState } from "./journal";
@@ -157,6 +158,50 @@ async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL
     return sendJson(res, 200, { kind, ...r });
   }
 
+  // Settings diagnostics: prove the search engines / crawl backend actually
+  // work with the saved keys before a mission depends on them.
+  if (p === "/api/search/test" && method === "POST") {
+    const q = "open source vector database";
+    const probe = async (engine: string, fn: () => Promise<unknown[]>) => {
+      try {
+        const hits = await fn();
+        return { engine, ok: hits.length > 0, detail: `${hits.length} result(s)` };
+      } catch (e) {
+        return { engine, ok: false, detail: errMsg(e) };
+      }
+    };
+    const checks = [probe("duckduckgo", () => ddgSearch(q, 3)), probe("bing", () => bingSearch(q, 3))];
+    if (cfg.tinyfishApiKey) checks.push(probe("tinyfish", () => tinyfishSearch(cfg, q, 3)));
+    const engines = await Promise.all(checks);
+    return sendJson(res, 200, { ok: engines.some((e) => e.ok), engines });
+  }
+
+  if (p === "/api/crawl/test" && method === "POST") {
+    const backend = resolveCrawlBackend(cfg);
+    if (!backend) {
+      return sendJson(res, 200, { ok: false, backend: null, detail: "no crawl backend configured — add a key first" });
+    }
+    try {
+      if (hasScrapeBackend(cfg)) {
+        const text = await scrapeUrl(cfg, "https://example.com/");
+        return sendJson(res, 200, {
+          ok: Boolean(text && text.length > 50),
+          backend,
+          detail: text ? `scraped ${text.length} chars` : "empty scrape result",
+        });
+      }
+      // deepcrawl has no single-page scrape — smoke a 1-page crawl instead.
+      const out = await crawlSite(cfg, { url: "https://example.com/", maxPages: 1 });
+      return sendJson(res, 200, {
+        ok: out.pages.length > 0,
+        backend,
+        detail: out.pages.length ? `crawled ${out.pages.length} page(s)` : out.warnings.join("; ") || "no pages",
+      });
+    } catch (e) {
+      return sendJson(res, 200, { ok: false, backend, detail: errMsg(e) });
+    }
+  }
+
   if (p === "/api/models" && method === "GET") {
     try {
       const models = await listModels(cfg);
@@ -294,6 +339,14 @@ async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL
     if (sub === "/report" && method === "GET") {
       const file = path.join(runDir(id), "artifacts", "final-report.md");
       if (!fs.existsSync(file)) return sendJson(res, 404, { error: "no report yet" });
+      res.writeHead(200, { "content-type": "text/markdown; charset=utf-8" });
+      res.end(fs.readFileSync(file));
+      return;
+    }
+
+    if (sub === "/plan" && method === "GET") {
+      const file = path.join(runDir(id), "artifacts", "mission-plan.md");
+      if (!fs.existsSync(file)) return sendJson(res, 404, { error: "no plan yet" });
       res.writeHead(200, { "content-type": "text/markdown; charset=utf-8" });
       res.end(fs.readFileSync(file));
       return;
@@ -489,6 +542,8 @@ function snapshot(state: ReturnType<typeof loadRunState>, id: string) {
     operatorNotes: state.operatorNotes,
     usageByModel: Object.fromEntries(state.usageByModel),
     cost: state.cost,
+    budgetSeries: state.budgetSeries,
+    planExcerpt: state.planExcerpt,
     finalSummary: state.finalSummary,
     finalReportPath: state.finalReportPath,
     live: isRunLive(id),

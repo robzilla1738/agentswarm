@@ -90,6 +90,9 @@ export interface PublicConfig {
   reasoningEffort: string;
   safeMode: boolean;
   contextTokenLimit: number;
+  contextWindows: Record<string, number>;
+  cheapModel: string;
+  strongModel: string;
   knownModels: string[];
   pricing: Record<string, { inMiss: number; inHit: number; out: number }>;
 }
@@ -102,6 +105,9 @@ export const api = {
   validate: () => jget<{ status: "ok" | "invalid" | "unknown"; message?: string }>("/api/validate"),
   sandboxTest: (runtime?: string) =>
     jpost<{ kind: string; ok: boolean; detail: string }>("/api/sandbox/test", runtime ? { runtime } : {}),
+  searchTest: () =>
+    jpost<{ ok: boolean; engines: { engine: string; ok: boolean; detail: string }[] }>("/api/search/test", {}),
+  crawlTest: () => jpost<{ ok: boolean; backend: string | null; detail: string }>("/api/crawl/test", {}),
   listDirs: (path?: string) =>
     jget<{ path: string; parent: string | null; home: string; dirs: { name: string; path: string }[] }>(
       `/api/fs/dirs${path ? `?path=${encodeURIComponent(path)}` : ""}`
@@ -125,6 +131,11 @@ export const api = {
     }
   },
   artifacts: (id: string) => jget<{ artifacts: { name: string; size: number }[] }>(`/api/runs/${id}/artifacts`),
+  fetchPlan: async (id: string): Promise<string | null> => {
+    const res = await fetch(hubBase() + `/api/runs/${id}/plan`, { cache: "no-store" });
+    if (!res.ok) return null;
+    return res.text();
+  },
   artifactUrl: (id: string, name: string) => hubBase() + `/api/runs/${id}/artifacts/${encodeURIComponent(name)}`,
   reportUrl: (id: string) => hubBase() + `/api/runs/${id}/report`,
   streamUrl: (id: string) => hubBase() + `/api/runs/${id}/stream`,

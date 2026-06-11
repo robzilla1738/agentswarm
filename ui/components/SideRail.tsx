@@ -1,25 +1,30 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { api } from "@/lib/api";
 import { type ActivityGroup, groupActivity } from "@/lib/feed";
 import { fmtAgo, fmtClock, fmtClockShort } from "@/lib/format";
 import { PixelAvatar, personaName } from "@/lib/persona";
 import type { ActivityItem, BlackboardNote, ConductorSay, OperatorNote } from "@/lib/types";
 import { Clamp, EmptyState, Md, ToolIcon } from "./atoms";
 
-type Tab = "activity" | "conductor" | "blackboard";
+type Tab = "activity" | "conductor" | "blackboard" | "plan";
 
 export function SideRail({
+  runId,
   activity,
   conductorLog,
   notes,
   operatorNotes,
+  planUpdatedAt,
   now,
 }: {
+  runId: string;
   activity: ActivityItem[];
   conductorLog: ConductorSay[];
   notes: BlackboardNote[];
   operatorNotes: OperatorNote[];
+  planUpdatedAt: number;
   now: number;
 }) {
   const [tab, setTab] = useState<Tab>("activity");
@@ -27,6 +32,7 @@ export function SideRail({
     { id: "activity", label: "Activity" },
     { id: "conductor", label: "Conductor", count: conductorLog.length + operatorNotes.length },
     { id: "blackboard", label: "Blackboard", count: notes.length },
+    { id: "plan", label: "Plan" },
   ];
 
   return (
@@ -44,7 +50,48 @@ export function SideRail({
         {tab === "activity" && <ActivityFeed activity={activity} now={now} />}
         {tab === "conductor" && <ConductorFeed log={conductorLog} operatorNotes={operatorNotes} now={now} />}
         {tab === "blackboard" && <Blackboard notes={notes} now={now} />}
+        {tab === "plan" && <PlanView runId={runId} planUpdatedAt={planUpdatedAt} />}
       </div>
+    </div>
+  );
+}
+
+/** The conductor's living mission-plan.md, refetched whenever it changes. */
+function PlanView({ runId, planUpdatedAt }: { runId: string; planUpdatedAt: number }) {
+  const [plan, setPlan] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    api
+      .fetchPlan(runId)
+      .then((text) => {
+        if (alive) {
+          setPlan(text);
+          setLoaded(true);
+        }
+      })
+      .catch(() => {
+        if (alive) setLoaded(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [runId, planUpdatedAt]);
+
+  if (!loaded) return <EmptyState glyph="◈" title="Loading plan…" sub="" />;
+  if (!plan) {
+    return (
+      <EmptyState
+        glyph="◈"
+        title="No plan yet"
+        sub="On longer missions the conductor maintains a living plan (mission-plan.md) — it appears here as it evolves."
+      />
+    );
+  }
+  return (
+    <div className="h-full overflow-y-auto px-4 py-3 text-xs leading-relaxed">
+      <Md compact dim>{plan}</Md>
     </div>
   );
 }
@@ -199,18 +246,19 @@ function ConductorFeed({ log, operatorNotes, now }: { log: ConductorSay[]; opera
   );
 }
 
-/** Decisions are the load-bearing notes — they get the solid treatment. */
+/** Decisions and conflicts are the load-bearing notes — they get the solid treatment. */
 function NoteKind({ kind }: { kind: string }) {
-  const glyph: Record<string, string> = { decision: "◆", "open-question": "?", handoff: "⇢", claim: "⚑" };
+  const glyph: Record<string, string> = { decision: "◆", conflict: "≠", "open-question": "?", handoff: "⇢", claim: "⚑" };
+  const solid = kind === "decision" || kind === "conflict";
   return (
     <span
-      className={`mono shrink-0 uppercase ${kind === "decision" ? "chip-solid" : ""}`}
+      className={`mono shrink-0 uppercase ${solid ? "chip-solid" : ""}`}
       style={{
         fontSize: 9,
         letterSpacing: "0.1em",
         padding: "1px 6px",
         borderRadius: 4,
-        border: kind === "decision" ? undefined : "1px solid var(--color-border)",
+        border: solid ? undefined : "1px solid var(--color-border)",
       }}
     >
       {glyph[kind] ?? "·"} {kind}
@@ -219,24 +267,85 @@ function NoteKind({ kind }: { kind: string }) {
 }
 
 function Blackboard({ notes, now }: { notes: BlackboardNote[]; now: number }) {
+  const [query, setQuery] = useState("");
+  const [kindFilter, setKindFilter] = useState<string | null>(null);
+
+  const kinds = useMemo(() => {
+    const seen = new Set<string>();
+    for (const n of notes) seen.add(n.kind || "finding");
+    return [...seen].sort();
+  }, [notes]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return notes.filter((n) => {
+      if (kindFilter && (n.kind || "finding") !== kindFilter) return false;
+      if (!q) return true;
+      return [n.text, n.key, n.taskId, n.url].some((f) => f && f.toLowerCase().includes(q));
+    });
+  }, [notes, query, kindFilter]);
+
   if (notes.length === 0) {
     return <EmptyState glyph="✦" title="Blackboard is empty" sub="Durable facts agents post for the rest of the swarm show up here." />;
   }
   return (
-    <div className="h-full overflow-y-auto px-3.5 py-3 space-y-2">
-      {[...notes].reverse().map((n, i) => (
-        <div key={i} className="tile p-3 text-xs" style={{ animation: "var(--animate-rise)" }}>
-          <div className="flex items-baseline gap-2 mb-1.5 text-2xs text-ink-faint">
-            {n.kind && n.kind !== "finding" && <NoteKind kind={n.kind} />}
-            {n.key && <span className="mono font-semibold text-ink truncate">{n.key.replace(/[_-]+/g, " ")}</span>}
-            {n.taskId && <span className="mono shrink-0">{n.taskId}</span>}
-            <span className="ml-auto shrink-0">{fmtAgo(n.t, now)}</span>
+    <div className="h-full flex flex-col">
+      <div className="px-3.5 pt-2.5 pb-2 space-y-2 shrink-0 border-b border-border-soft">
+        <input
+          className="input"
+          style={{ padding: "4px 10px", fontSize: 12 }}
+          placeholder={`Search ${notes.length} notes…`}
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+        />
+        {kinds.length > 1 && (
+          <div className="flex items-center gap-1.5 flex-wrap">
+            {kinds.map((k) => (
+              <button
+                key={k}
+                onClick={() => setKindFilter(kindFilter === k ? null : k)}
+                className={`mono uppercase ${kindFilter === k ? "chip-solid" : "text-ink-faint hover:text-ink-dim"}`}
+                style={{
+                  fontSize: 9,
+                  letterSpacing: "0.1em",
+                  padding: "2px 7px",
+                  borderRadius: 4,
+                  border: kindFilter === k ? undefined : "1px solid var(--color-border)",
+                }}
+              >
+                {k} {notes.filter((n) => (n.kind || "finding") === k).length}
+              </button>
+            ))}
           </div>
-          <Clamp lines={5}>
-            <Md compact dim>{n.text}</Md>
-          </Clamp>
-        </div>
-      ))}
+        )}
+      </div>
+      <div className="flex-1 overflow-y-auto px-3.5 py-3 space-y-2">
+        {filtered.length === 0 && <div className="text-xs text-ink-faint py-4 text-center">No notes match.</div>}
+        {[...filtered].reverse().map((n, i) => (
+          <div key={i} className="tile p-3 text-xs" style={{ animation: "var(--animate-rise)" }}>
+            <div className="flex items-baseline gap-2 mb-1.5 text-2xs text-ink-faint">
+              {n.kind && n.kind !== "finding" && <NoteKind kind={n.kind} />}
+              {n.key && <span className="mono font-semibold text-ink truncate">{n.key.replace(/[_-]+/g, " ")}</span>}
+              {n.taskId && <span className="mono shrink-0">{n.taskId}</span>}
+              <span className="ml-auto shrink-0">{fmtAgo(n.t, now)}</span>
+            </div>
+            <Clamp lines={5}>
+              <Md compact dim>{n.text}</Md>
+            </Clamp>
+            {n.url && (
+              <a
+                href={n.url}
+                target="_blank"
+                rel="noreferrer"
+                className="mono text-2xs text-ink-faint hover:text-ink underline underline-offset-2 block truncate mt-1.5"
+                title={n.url}
+              >
+                ↗ {n.url.replace(/^https?:\/\//, "")}
+              </a>
+            )}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

@@ -25,6 +25,11 @@ export interface ClientState {
   activity: ActivityItem[];
   usage: Usage;
   cost: number;
+  /** Sampled cumulative token spend over time (budget sparkline). */
+  budgetSeries: { t: number; tokens: number; cost: number }[];
+  /** Bumped on every plan.updated — the Plan tab refetches on change. */
+  planUpdatedAt: number;
+  planExcerpt: string;
   finalSummary?: string;
   finalReportPath?: string;
   lastSeq: number;
@@ -52,9 +57,30 @@ export function emptyState(): ClientState {
     activity: [],
     usage: { promptTokens: 0, completionTokens: 0, cacheHitTokens: 0, cacheMissTokens: 0 },
     cost: 0,
+    budgetSeries: [],
+    planUpdatedAt: 0,
+    planExcerpt: "",
     lastSeq: 0,
     lastT: 0,
   };
+}
+
+/** Mirror of the server reducer's sampling: a point per ≥0.5%-of-cap jump. */
+function pushBudgetPoint(s: ClientState, t: number): void {
+  const tokens = s.usage.promptTokens + s.usage.completionTokens;
+  const cap = s.meta?.options?.maxTokens ?? 0;
+  const minStep = cap > 0 ? Math.max(2000, cap * 0.005) : 2000;
+  const last = s.budgetSeries[s.budgetSeries.length - 1];
+  if (last && tokens - last.tokens < minStep) {
+    last.t = t;
+    last.tokens = tokens;
+    last.cost = s.cost;
+    return;
+  }
+  s.budgetSeries.push({ t, tokens, cost: s.cost });
+  if (s.budgetSeries.length > 600) {
+    s.budgetSeries = s.budgetSeries.filter((_, i) => i % 2 === 0 || i === s.budgetSeries.length - 1);
+  }
 }
 
 const MAX_ACTIVITY = 260;
@@ -82,6 +108,7 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
         cacheMissTokens: s.usage.cacheMissTokens + u.cacheMissTokens,
       };
       if (typeof ev.cost === "number" && Number.isFinite(ev.cost)) s.cost = ev.cost;
+      pushBudgetPoint(s, ev.t);
     } else if (ev.type === "tool.call") {
       pushActivity(s, {
         id: `t${ev.seq}`, t: ev.t, agentId: ev.agentId as string, taskId: ev.teamId,
@@ -92,6 +119,7 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
       s.notes.push({
         t: ev.t, taskId: ev.taskId as string | undefined, agentId: ev.agentId as string | undefined,
         key: ev.key as string | undefined, kind: ev.kind as string | undefined, text: ev.text as string,
+        url: typeof ev.url === "string" ? ev.url : undefined,
       });
       if (s.notes.length > 500) s.notes.splice(0, s.notes.length - 500);
     }
@@ -295,8 +323,13 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
         const miss = u.cacheMissTokens || Math.max(0, u.promptTokens - u.cacheHitTokens);
         s.cost += (miss * price.inMiss + u.cacheHitTokens * price.inHit + u.completionTokens * price.out) / 1e6;
       }
+      pushBudgetPoint(s, ev.t);
       break;
     }
+    case "plan.updated":
+      s.planUpdatedAt = ev.t;
+      s.planExcerpt = String(ev.excerpt ?? "");
+      break;
     case "run.final":
       s.finalSummary = ev.summary as string;
       s.finalReportPath = ev.reportPath as string | undefined;

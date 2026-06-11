@@ -29,6 +29,8 @@ export interface LiveRun {
   activity: ActivityItem[];
   usage: Usage;
   cost: number;
+  budgetSeries: { t: number; tokens: number; cost: number }[];
+  planUpdatedAt: number;
   finalSummary?: string;
   finalReportPath?: string;
   lastSeq: number;
@@ -51,6 +53,8 @@ function project(s: ClientState): LiveRun {
     activity: s.activity,
     usage: s.usage,
     cost: s.cost,
+    budgetSeries: s.budgetSeries,
+    planUpdatedAt: s.planUpdatedAt,
     finalSummary: s.finalSummary,
     finalReportPath: s.finalReportPath,
     lastSeq: s.lastSeq,

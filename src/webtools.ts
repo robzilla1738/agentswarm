@@ -223,7 +223,7 @@ async function engineFetch(
   }
 }
 
-async function tinyfishSearch(
+export async function tinyfishSearch(
   cfg: SwarmConfig,
   query: string,
   count: number,
@@ -264,7 +264,7 @@ const DDG_ENDPOINTS = [
   },
 ];
 
-async function ddgSearch(query: string, count: number, signal?: AbortSignal): Promise<Candidate[]> {
+export async function ddgSearch(query: string, count: number, signal?: AbortSignal): Promise<Candidate[]> {
   let firstErr: unknown = null;
   let reachedAny = false;
   for (const ep of DDG_ENDPOINTS) {
@@ -309,7 +309,7 @@ function parseDdgHtml(html: string, count: number, linkRe: RegExp): Candidate[] 
 }
 
 /** Bing's HTML results page: each hit is an <li class="b_algo"> with an <h2><a> link. */
-async function bingSearch(query: string, count: number, signal?: AbortSignal): Promise<Candidate[]> {
+export async function bingSearch(query: string, count: number, signal?: AbortSignal): Promise<Candidate[]> {
   const res = await engineFetch("bing", `https://www.bing.com/search?q=${encodeURIComponent(query)}`, {
     headers: { "user-agent": UA, "accept-language": "en-US,en;q=0.9" },
   }, signal);

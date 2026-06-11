@@ -519,14 +519,18 @@ async function cmdConfig(rest: string[], flags: Args["flags"]): Promise<void> {
     const cfg = loadConfig();
     if (sub === "get" && rest[1]) {
       const key = rest[1] as keyof SwarmConfig;
-      const v = key === "apiKey" || key === "tinyfishApiKey" ? maskKey(String(cfg[key])) : cfg[key];
+      const v = /apikey|token|secret/i.test(key) ? maskKey(String(cfg[key] ?? "")) : cfg[key];
       console.log(typeof v === "object" ? JSON.stringify(v, null, 2) : String(v));
       return;
     }
     console.log(ansi.bold("config") + ansi.gray(`  (${configPath()})`));
     for (const k of SETTABLE_KEYS) {
       let v: unknown = cfg[k];
-      if (k === "apiKey" || k === "tinyfishApiKey") v = v ? maskKey(String(v)) : ansi.red("(not set)");
+      // Every secret-bearing key prints masked — `config list` output ends up
+      // in terminal scrollback and pasted bug reports.
+      if (/apikey|token|secret/i.test(k)) {
+        v = v ? maskKey(String(v)) : k === "apiKey" ? ansi.red("(not set)") : "(not set)";
+      }
       console.log(`  ${k.padEnd(18)} ${ansi.gray(String(v))}`);
     }
     return;
@@ -553,11 +557,24 @@ async function cmdConfig(rest: string[], flags: Args["flags"]): Promise<void> {
     if (key === "apiKey") console.log(ansi.gray("  verify it works: ") + "swarm models");
     return;
   }
+  if (sub === "unset") {
+    const key = rest[1] as keyof SwarmConfig;
+    if (!key) throw new Error("usage: swarm config unset <key>");
+    // Only string-valued keys can sensibly clear to "" — numbers/enums keep
+    // their defaults via `set`.
+    const clearable = SETTABLE_KEYS.filter((k) => /apikey|token|secret|url|model/i.test(k));
+    if (!clearable.includes(key)) {
+      throw new Error(`not clearable. Clearable keys: ${clearable.join(", ")}`);
+    }
+    saveConfig({ [key]: "" } as Partial<SwarmConfig>);
+    console.log(ansi.green("✓ ") + `cleared ${key}`);
+    return;
+  }
   if (sub === "path") {
     console.log(configPath());
     return;
   }
-  throw new Error("usage: swarm config [list|get <key>|set <key> <value>|path]");
+  throw new Error("usage: swarm config [list|get <key>|set <key> <value>|unset <key>|path]");
 }
 
 async function cmdModels(): Promise<void> {

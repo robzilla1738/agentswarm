@@ -133,6 +133,25 @@ export function BudgetBar({ spent, cap, height = 5 }: { spent: number; cap: numb
   );
 }
 
+/** Hand-rolled SVG sparkline — no chart library for one little line. */
+export function Sparkline({ points, width = 120, height = 26 }: { points: number[]; width?: number; height?: number }) {
+  if (points.length < 2) return null;
+  const max = Math.max(...points);
+  const min = Math.min(...points);
+  const span = max - min || 1;
+  const step = width / (points.length - 1);
+  const y = (p: number) => height - 2 - ((p - min) / span) * (height - 4);
+  const d = points.map((p, i) => `${i === 0 ? "M" : "L"}${(i * step).toFixed(1)},${y(p).toFixed(1)}`).join(" ");
+  const area = `${d} L${width},${height} L0,${height} Z`;
+  return (
+    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} className="block" aria-hidden>
+      <path d={area} fill="rgb(var(--hi) / 0.06)" stroke="none" />
+      <path d={d} fill="none" stroke="currentColor" strokeWidth="1.4" opacity="0.65" />
+      <circle cx={width} cy={y(points[points.length - 1])} r="2" fill="currentColor" opacity="0.9" />
+    </svg>
+  );
+}
+
 export function Spinner({ size = 14, dark }: { size?: number; dark?: boolean }) {
   return (
     <span

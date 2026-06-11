@@ -502,6 +502,31 @@ async function phaseHubSmoke() {
     }
     ok("CORS is locked to localhost origins");
 
+    // Crawl-test diagnostic: with no backend configured it must answer
+    // instantly (no network) and say so.
+    const crawlProbe = await (await fetch(`${base}/api/crawl/test`, { method: "POST" })).json();
+    if (crawlProbe.ok !== false || !/no crawl backend/.test(String(crawlProbe.detail))) {
+      fail(`crawl test without keys should report 'no crawl backend', got ${JSON.stringify(crawlProbe)}`);
+    }
+    ok("crawl-test endpoint reports unconfigured backends cleanly");
+
+    // Key clearing round-trip: save a crawler key, clear it with "", verify.
+    let cfg2 = await (await fetch(`${base}/api/config`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ firecrawlApiKey: "fc-test-1234567890" }),
+    })).json();
+    if (!cfg2.firecrawlKeySet) fail("saving a crawler key via the hub should stick");
+    if (cfg2.crawlResolved !== "firecrawl") fail(`crawlResolved should become firecrawl, got ${cfg2.crawlResolved}`);
+    cfg2 = await (await fetch(`${base}/api/config`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ firecrawlApiKey: "" }),
+    })).json();
+    if (cfg2.firecrawlKeySet) fail("posting an empty string should clear the saved key");
+    if (cfg2.crawlResolved !== null) fail("clearing the only crawler key should unresolve the backend");
+    ok("crawler keys save, resolve, and clear through the hub config API");
+
     const launch = await (await fetch(`${base}/api/runs`, {
       method: "POST",
       headers: { "content-type": "application/json" },

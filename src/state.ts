@@ -64,6 +64,8 @@ export class RunState {
   usageByModel = new Map<string, Usage>();
   totalUsage: Usage = { ...ZERO_USAGE };
   cost = 0;
+  /** Sampled cumulative token spend over time (budget sparkline). */
+  budgetSeries: { t: number; tokens: number; cost: number }[] = [];
   finalSummary?: string;
   finalReportPath?: string;
   lastSeq = 0;
@@ -102,6 +104,7 @@ export class RunState {
         this.usageByModel.set(model, addUsage(this.usageByModel.get(model) ?? { ...ZERO_USAGE }, u));
         this.totalUsage = addUsage(this.totalUsage, u);
         this.cost += usageCost(u, this.pricing[model]);
+        this.pushBudgetPoint(ev.t);
       }
       return;
     }
@@ -268,12 +271,34 @@ export class RunState {
         this.usageByModel.set(model, addUsage(this.usageByModel.get(model) ?? { ...ZERO_USAGE }, u));
         this.totalUsage = addUsage(this.totalUsage, u);
         this.cost += usageCost(u, this.pricing[model]);
+        this.pushBudgetPoint(ev.t);
         break;
       }
       case "run.final":
         this.finalSummary = ev.summary as string;
         this.finalReportPath = ev.reportPath as string | undefined;
         break;
+    }
+  }
+
+  /**
+   * Sample the cumulative spend: a point per meaningful jump (≥0.5% of the
+   * budget cap, or 2k tokens unbounded), halving resolution past 600 points.
+   */
+  private pushBudgetPoint(t: number): void {
+    const tokens = this.totalUsage.promptTokens + this.totalUsage.completionTokens;
+    const cap = this.meta?.options?.maxTokens ?? 0;
+    const minStep = cap > 0 ? Math.max(2000, cap * 0.005) : 2000;
+    const last = this.budgetSeries[this.budgetSeries.length - 1];
+    if (last && tokens - last.tokens < minStep) {
+      last.t = t;
+      last.tokens = tokens;
+      last.cost = this.cost;
+      return;
+    }
+    this.budgetSeries.push({ t, tokens, cost: this.cost });
+    if (this.budgetSeries.length > 600) {
+      this.budgetSeries = this.budgetSeries.filter((_, i) => i % 2 === 0 || i === this.budgetSeries.length - 1);
     }
   }
 

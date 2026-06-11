@@ -9,7 +9,7 @@ import { SideRail } from "@/components/SideRail";
 import { SwarmBoard } from "@/components/SwarmBoard";
 import { TaskDetail } from "@/components/TaskDetail";
 import { TopBar } from "@/components/TopBar";
-import { BudgetBar, Spinner, StatusBadge, StatusDot } from "@/components/atoms";
+import { BudgetBar, Sparkline, Spinner, StatusBadge, StatusDot } from "@/components/atoms";
 import { api } from "@/lib/api";
 import { fmtDur, fmtMoney, fmtTokens } from "@/lib/format";
 import { useNow, useRun } from "@/lib/hooks";
@@ -199,6 +199,14 @@ function RunView() {
             <div className="flex-1 min-w-0">
               <BudgetBar spent={spent} cap={cap} height={3} />
             </div>
+            {data.budgetSeries.length > 2 && (
+              <span
+                className="shrink-0 text-ink-faint hidden sm:block"
+                title={`token spend over time (${fmtTokens(spent)} total)`}
+              >
+                <Sparkline points={data.budgetSeries.map((p) => p.tokens)} width={96} height={20} />
+              </span>
+            )}
             <span className="mono text-2xs text-ink-faint shrink-0">
               {cap > 0 ? Math.min(100, Math.round((spent / cap) * 100)) : 0}% of {fmtTokens(cap)}
             </span>
@@ -242,10 +250,12 @@ function RunView() {
         </div>
 
         <SideRail
+          runId={id}
           activity={data.activity}
           conductorLog={data.conductorLog}
           notes={data.notes}
           operatorNotes={data.operatorNotes}
+          planUpdatedAt={data.planUpdatedAt}
           now={now}
         />
       </main>

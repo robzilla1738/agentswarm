@@ -35,6 +35,21 @@ export default function SettingsPage() {
   const [testResult, setTestResult] = useState<{ status: string; message?: string } | null>(null);
   const [sbxTesting, setSbxTesting] = useState(false);
   const [sbxResult, setSbxResult] = useState<{ kind: string; ok: boolean; detail: string } | null>(null);
+  const [searchTesting, setSearchTesting] = useState(false);
+  const [searchResult, setSearchResult] = useState<{ ok: boolean; engines: { engine: string; ok: boolean; detail: string }[] } | null>(null);
+  const [crawlTesting, setCrawlTesting] = useState(false);
+  const [crawlResult, setCrawlResult] = useState<{ ok: boolean; backend: string | null; detail: string } | null>(null);
+
+  // Immediately remove a saved secret ("leave blank to keep" can't clear).
+  const clearKey = async (patch: Record<string, any>) => {
+    setSaveErr(null);
+    try {
+      await api.setConfig(patch);
+      await reload();
+    } catch (e: any) {
+      setSaveErr(e?.message || "could not remove the key");
+    }
+  };
 
   const testConnection = async () => {
     setTesting(true);
@@ -54,6 +69,8 @@ export default function SettingsPage() {
         provider: config.provider,
         model: config.model,
         conductorModel: config.conductorModel,
+        cheapModel: config.cheapModel,
+        strongModel: config.strongModel,
         maxWorkers: config.maxWorkers,
         maxTasks: config.maxTasks,
         maxStepsPerTask: config.maxStepsPerTask,
@@ -184,12 +201,19 @@ export default function SettingsPage() {
                     onChange={(e) => setProvKeys({ ...provKeys, [active.id]: e.target.value })}
                     autoComplete="off"
                   />
-                  {active.keyUrl && (
+                  {(active.keyUrl || active.keySet) && (
                     <p className="text-2xs mt-1.5 text-ink-faint">
-                      Get one at{" "}
-                      <a href={active.keyUrl} target="_blank" rel="noreferrer" className="text-ink underline underline-offset-2">
-                        {active.keyUrl.replace(/^https?:\/\//, "")}
-                      </a>
+                      {active.keyUrl && (
+                        <>
+                          Get one at{" "}
+                          <a href={active.keyUrl} target="_blank" rel="noreferrer" className="text-ink underline underline-offset-2">
+                            {active.keyUrl.replace(/^https?:\/\//, "")}
+                          </a>
+                        </>
+                      )}
+                      {active.keySet && (
+                        <ClearKey onClear={() => clearKey({ providers: { [active.id]: { apiKey: "" } } })} />
+                      )}
                     </p>
                   )}
                 </Field>
@@ -233,6 +257,14 @@ export default function SettingsPage() {
               <ModelInput value={form.conductorModel ?? ""} options={modelOptions} onChange={(v) => setForm({ ...form, conductorModel: v })} listId="conductor-models" />
             </Field>
           </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
+            <Field label="Cheap tier" hint='spawn model:"cheap" — scouts, bulk extraction' sub={form.cheapModel ? priceLine(form.cheapModel) : "blank = worker model"}>
+              <ModelInput value={form.cheapModel ?? ""} options={modelOptions} onChange={(v) => setForm({ ...form, cheapModel: v })} listId="cheap-models" />
+            </Field>
+            <Field label="Strong tier" hint='spawn model:"strong" — leads, verifiers' sub={form.strongModel ? priceLine(form.strongModel) : "blank = worker model"}>
+              <ModelInput value={form.strongModel ?? ""} options={modelOptions} onChange={(v) => setForm({ ...form, strongModel: v })} listId="strong-models" />
+            </Field>
+          </div>
           <div className="grid grid-cols-2 gap-3 mt-3">
             <Field label="Reasoning effort" hint="how hard models think">
               <select className="input" value={form.reasoningEffort} onChange={(e) => setForm({ ...form, reasoningEffort: e.target.value })}>
@@ -270,8 +302,36 @@ export default function SettingsPage() {
             />
             <p className="text-2xs mt-1.5 text-ink-faint">
               TinyFish: <a href="https://docs.tinyfish.ai" target="_blank" rel="noreferrer" className="text-ink underline underline-offset-2">tinyfish.ai</a>
+              {config.tinyfishKeySet && <ClearKey onClear={() => clearKey({ tinyfishApiKey: "" })} />}
             </p>
           </Field>
+
+          <div className="flex items-center gap-3 pt-1 flex-wrap">
+            <button
+              className="btn"
+              disabled={searchTesting}
+              onClick={async () => {
+                setSearchTesting(true);
+                setSearchResult(null);
+                try {
+                  setSearchResult(await api.searchTest());
+                } catch (e: any) {
+                  setSearchResult({ ok: false, engines: [{ engine: "request", ok: false, detail: e?.message || "failed" }] });
+                } finally {
+                  setSearchTesting(false);
+                }
+              }}
+            >
+              {searchTesting && <Spinner size={13} />} Test web search
+            </button>
+            {searchResult ? (
+              <span className="text-xs mono text-ink-dim">
+                {searchResult.engines.map((e) => `${e.ok ? "✓" : "✕"} ${e.engine} (${e.detail})`).join("  ·  ")}
+              </span>
+            ) : (
+              <span className="text-2xs text-ink-faint">runs one real query per engine — save first</span>
+            )}
+          </div>
         </Card>
 
         <Card
@@ -341,6 +401,44 @@ export default function SettingsPage() {
                 onChange={(e) => setForm({ ...form, deepcrawlBaseUrl: e.target.value })}
               />
             </Field>
+          </div>
+
+          {(config.firecrawlKeySet || config.contextdevKeySet || config.deepcrawlKeySet) && (
+            <p className="text-2xs text-ink-faint">
+              Remove a saved key:
+              {config.firecrawlKeySet && <ClearKey label="firecrawl" onClear={() => clearKey({ firecrawlApiKey: "" })} />}
+              {config.contextdevKeySet && <ClearKey label="context.dev" onClear={() => clearKey({ contextdevApiKey: "" })} />}
+              {config.deepcrawlKeySet && <ClearKey label="deepcrawl" onClear={() => clearKey({ deepcrawlApiKey: "" })} />}
+            </p>
+          )}
+
+          <div className="flex items-center gap-3 pt-1 flex-wrap">
+            <button
+              className="btn"
+              disabled={crawlTesting}
+              onClick={async () => {
+                setCrawlTesting(true);
+                setCrawlResult(null);
+                try {
+                  setCrawlResult(await api.crawlTest());
+                } catch (e: any) {
+                  setCrawlResult({ ok: false, backend: null, detail: e?.message || "request failed" });
+                } finally {
+                  setCrawlTesting(false);
+                }
+              }}
+            >
+              {crawlTesting && <Spinner size={13} />} Test crawl backend
+            </button>
+            {crawlResult ? (
+              <span className={`text-xs mono ${crawlResult.ok ? "text-ink" : "text-ink-dim"}`}>
+                {crawlResult.ok
+                  ? `✓ ${crawlResult.backend} works — ${crawlResult.detail}`
+                  : `✕ ${crawlResult.backend ?? "none"}: ${crawlResult.detail}`}
+              </span>
+            ) : (
+              <span className="text-2xs text-ink-faint">scrapes one page with the saved keys — save first</span>
+            )}
           </div>
         </Card>
 
@@ -436,6 +534,15 @@ export default function SettingsPage() {
             </Field>
           </div>
 
+          {(config.e2bKeySet || config.modalConfigured || config.vercelConfigured) && (
+            <p className="text-2xs text-ink-faint">
+              Remove a saved key:
+              {config.e2bKeySet && <ClearKey label="E2B" onClear={() => clearKey({ e2bApiKey: "" })} />}
+              {config.modalConfigured && <ClearKey label="Modal" onClear={() => clearKey({ modalTokenId: "", modalTokenSecret: "" })} />}
+              {config.vercelConfigured && <ClearKey label="Vercel" onClear={() => clearKey({ vercelToken: "" })} />}
+            </p>
+          )}
+
           <div className="flex items-center gap-3 pt-1 flex-wrap">
             <button
               className="btn"
@@ -509,6 +616,19 @@ export default function SettingsPage() {
         </div>
       </main>
     </div>
+  );
+}
+
+/** Inline "remove this saved secret" action — blank-to-keep fields can't clear. */
+function ClearKey({ label, onClear }: { label?: string; onClear: () => void }) {
+  return (
+    <button
+      type="button"
+      className="ml-2 underline underline-offset-2 hover:text-ink transition-colors"
+      onClick={onClear}
+    >
+      {label ? `clear ${label}` : "remove saved key"}
+    </button>
   );
 }
 
