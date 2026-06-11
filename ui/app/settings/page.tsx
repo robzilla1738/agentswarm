@@ -336,7 +336,7 @@ export default function SettingsPage() {
 
         <Card
           title="Crawl integrations"
-          sub="Gives agents a crawl_site tool that ingests whole sites as markdown files, and upgrades fetch_url with JS rendering and clean markdown. Auto uses the first configured service (Firecrawl → context.dev → deepcrawl)."
+          sub="Gives agents a crawl_site tool that ingests whole sites as markdown files, and upgrades fetch_url with JS rendering and clean markdown. Auto uses the first configured service (context.dev → Firecrawl → deepcrawl)."
         >
           <Field
             label="Crawl backend"
