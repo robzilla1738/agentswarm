@@ -351,7 +351,20 @@ abstract class RemoteRuntime implements SandboxRuntime {
     return r.out;
   }
 
+  /** base64-over-shell transfers buffer the whole file — refuse the huge ones. */
+  private async checkSize(abs: string, capBytes: number, what: string): Promise<void> {
+    const out = await this.execOk(`wc -c < ${shq(abs)}`, `stat ${abs}`);
+    const size = Number(out.trim());
+    if (Number.isFinite(size) && size > capBytes) {
+      throw new Error(
+        `${what}: file is ${Math.round(size / 1e6)}MB (cap ${Math.round(capBytes / 1e6)}MB) — ` +
+          `compress it or extract the relevant part in the sandbox first`
+      );
+    }
+  }
+
   async readFile(abs: string): Promise<string> {
+    await this.checkSize(abs, 4_000_000, `read ${abs}`);
     const out = await this.execOk(`base64 < ${shq(abs)}`, `read ${abs}`);
     return Buffer.from(out.replace(/\s+/g, ""), "base64").toString("utf8");
   }
@@ -369,6 +382,7 @@ abstract class RemoteRuntime implements SandboxRuntime {
   }
 
   async pull(remoteAbs: string, localAbs: string): Promise<void> {
+    await this.checkSize(remoteAbs, 32_000_000, `pull ${remoteAbs}`);
     const out = await this.execOk(`base64 < ${shq(remoteAbs)}`, `pull ${remoteAbs}`);
     ensureDir(path.dirname(localAbs));
     fs.writeFileSync(localAbs, Buffer.from(out.replace(/\s+/g, ""), "base64"));

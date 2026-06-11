@@ -75,9 +75,16 @@ export function startHub(opts: HubOptions): http.Server {
 async function handle(req: http.IncomingMessage, res: http.ServerResponse, opts: HubOptions): Promise<void> {
   const url = new URL(req.url || "/", `http://localhost:${opts.port}`);
   const p = url.pathname;
-  res.setHeader("access-control-allow-origin", "*");
-  res.setHeader("access-control-allow-methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("access-control-allow-headers", "content-type");
+  // Localhost-only CORS. The hub launches runs and reads reports with the
+  // operator's keys — a random website's JS must never get a readable
+  // response. The dev UI on another localhost port is the one legitimate
+  // cross-origin client; everyone else gets no CORS headers at all.
+  const origin = String(req.headers.origin || "");
+  if (/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(origin)) {
+    res.setHeader("access-control-allow-origin", origin);
+    res.setHeader("access-control-allow-methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader("access-control-allow-headers", "content-type");
+  }
   if (req.method === "OPTIONS") {
     res.writeHead(204);
     res.end();

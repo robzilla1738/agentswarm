@@ -2,7 +2,7 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import { home } from "./config";
-import { clip, ensureDir, oneLine } from "./util";
+import { clip, oneLine, writeJson } from "./util";
 
 /**
  * Cheap cross-run memory: a JSON file per workspace directory holding the last
@@ -12,6 +12,8 @@ import { clip, ensureDir, oneLine } from "./util";
  * unique per run, so there is nothing to remember against.
  */
 export interface RunMemoryEntry {
+  /** Entries keyed by runId update in place — interim snapshots become the final record. */
+  runId?: string;
   mission: string;
   finishedAt: number;
   status: string;
@@ -37,10 +39,11 @@ export function loadMemory(cwd: string): RunMemoryEntry[] {
 
 export function appendMemory(cwd: string, entry: RunMemoryEntry): void {
   try {
-    const file = memoryFile(cwd);
-    ensureDir(path.dirname(file));
-    const entries = [...loadMemory(cwd), entry].slice(-MAX_ENTRIES);
-    fs.writeFileSync(file, JSON.stringify({ cwd: path.resolve(cwd), entries }, null, 2), "utf8");
+    // Same-run entries replace (interim → final); writeJson is temp+rename so
+    // a crash mid-write never loses the prior history.
+    const prior = loadMemory(cwd).filter((e) => !(entry.runId && e.runId === entry.runId));
+    const entries = [...prior, entry].slice(-MAX_ENTRIES);
+    writeJson(memoryFile(cwd), { cwd: path.resolve(cwd), entries });
   } catch {
     /* memory is best-effort */
   }

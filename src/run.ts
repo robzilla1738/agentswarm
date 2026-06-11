@@ -157,6 +157,10 @@ export function listRuns(pricing: SwarmConfig["pricing"]): RunSummary[] {
     s.pid = readPid(id);
     out.push(applyLiveness(s));
   }
+  // Deleted runs must not pin their reduced state in a long-lived hub forever.
+  const live = new Set(ids);
+  for (const key of summaryCache.keys()) if (!live.has(key)) summaryCache.delete(key);
+  for (const key of liveCache.keys()) if (!live.has(key)) liveCache.delete(key);
   out.sort((a, b) => b.createdAt - a.createdAt);
   return out;
 }

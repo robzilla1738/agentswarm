@@ -66,10 +66,44 @@ function shq(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
+/**
+ * Where a write actually lands: realpath of the deepest existing ancestor plus
+ * the not-yet-created remainder. Confinement checks must use this, or a
+ * symlink inside the workdir smuggles writes anywhere on the host.
+ */
+function realDestination(abs: string): string {
+  let dir = abs;
+  const tail: string[] = [];
+  while (!fs.existsSync(dir)) {
+    tail.unshift(path.basename(dir));
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  try {
+    dir = fs.realpathSync(dir);
+  } catch {
+    /* races/permissions: keep the lexical path */
+  }
+  return path.join(dir, ...tail);
+}
+
+function realBase(base: string): string {
+  try {
+    return fs.realpathSync(base);
+  } catch {
+    return base;
+  }
+}
+
 function resolveWrite(p: string, ctx: ToolCtx): string {
   const abs = path.resolve(ctx.workdir, p);
+  // Remote sandboxes own their filesystem — host-side realpath is meaningless there.
+  const real = ctx.sandbox.localFs ? realDestination(abs) : abs;
   const ok =
-    pathInside(ctx.workdir, abs) || pathInside(ctx.runDirPath, abs) || !ctx.cfg.safeMode;
+    pathInside(realBase(ctx.workdir), real) ||
+    pathInside(realBase(ctx.runDirPath), real) ||
+    !ctx.cfg.safeMode;
   if (!ok) {
     throw new Error(
       `safeMode: writes are restricted to the working directory (${ctx.workdir}). ` +
@@ -549,8 +583,12 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
     },
     run: async (args, ctx) => {
       const name = String(args.name).replace(/^\/+/, "");
-      const dest = path.join(ctx.runDirPath, "artifacts", name);
-      if (!pathInside(path.join(ctx.runDirPath, "artifacts"), dest)) {
+      const artifactsRoot = path.join(ctx.runDirPath, "artifacts");
+      ensureDir(artifactsRoot);
+      const dest = path.join(artifactsRoot, name);
+      // Realpath-based: neither ../ traversal nor a planted symlink may move
+      // the artifact outside the run's artifacts folder.
+      if (!pathInside(realBase(artifactsRoot), realDestination(dest))) {
         throw new Error("artifact name must stay inside the artifacts folder");
       }
       ensureDir(path.dirname(dest));

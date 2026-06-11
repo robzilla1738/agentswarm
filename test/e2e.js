@@ -494,6 +494,14 @@ async function phaseHubSmoke() {
     if (config.sandboxRuntime !== "host") fail(`default sandboxRuntime should be host, got ${config.sandboxRuntime}`);
     ok("health + config endpoints answer (sandboxRuntime defaults to host)");
 
+    const evil = await fetch(`${base}/api/health`, { headers: { origin: "https://evil.example" } });
+    if (evil.headers.get("access-control-allow-origin")) fail("foreign origins must get no CORS header");
+    const local = await fetch(`${base}/api/health`, { headers: { origin: "http://localhost:7780" } });
+    if (local.headers.get("access-control-allow-origin") !== "http://localhost:7780") {
+      fail("localhost origins should be reflected for the dev UI");
+    }
+    ok("CORS is locked to localhost origins");
+
     const launch = await (await fetch(`${base}/api/runs`, {
       method: "POST",
       headers: { "content-type": "application/json" },

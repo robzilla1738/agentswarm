@@ -1496,6 +1496,18 @@ export class Executor {
         const rel = `progress-report-${n}.md`;
         fs.writeFileSync(path.join(this.runDirPath, "artifacts", rel), res.content, "utf8");
         this.journal.append("log", { level: "info", msg: `progress snapshot written: artifacts/${rel}` });
+        // Interim memory: a multi-day run that dies before synthesis still
+        // leaves the next swarm in this workspace something to build on.
+        if (!this.meta.sandbox) {
+          appendMemory(this.meta.cwd, {
+            runId: this.meta.id,
+            mission: this.meta.mission,
+            finishedAt: Date.now(),
+            status: "in-progress",
+            summary: clip(res.content, 600),
+            keyDecisions: this.notes.filter((nt) => nt.kind === "decision").slice(-10).map((nt) => nt.text),
+          });
+        }
       })
       .catch((e) => {
         if (!this.ac.signal.aborted) this.journal.append("log", { level: "warn", msg: `progress snapshot failed: ${errMsg(e)}` });
@@ -1802,6 +1814,7 @@ export class Executor {
     // Cross-run memory: real-directory runs leave a trace for the next swarm.
     if (!this.meta.sandbox && status !== "cancelled") {
       appendMemory(this.meta.cwd, {
+        runId: this.meta.id,
         mission: this.meta.mission,
         finishedAt: Date.now(),
         status,

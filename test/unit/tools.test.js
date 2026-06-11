@@ -109,3 +109,43 @@ test("ambiguous match without all=true fails the batch", async () => {
 test("replace_in_file without find/replace or edits is an error", async () => {
   await assert.rejects(() => tools.replace_in_file.run({ path: "one.txt" }, ctx), /provide find\+replace, or an edits array/);
 });
+
+// ---------- write confinement (symlink escapes) ----------
+
+test("write through a symlink pointing outside the workdir is blocked", async () => {
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-outside-"));
+  fs.symlinkSync(outside, path.join(work, "escape"));
+  await assert.rejects(
+    () => tools.write_file.run({ path: "escape/stolen.txt", content: "x" }, ctx),
+    /safeMode: writes are restricted/
+  );
+  assert.ok(!fs.existsSync(path.join(outside, "stolen.txt")), "nothing written outside");
+});
+
+test("a symlinked file inside the workdir pointing outside is blocked", async () => {
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-outside2-"));
+  const target = path.join(outside, "secret.txt");
+  fs.writeFileSync(target, "original");
+  fs.symlinkSync(target, path.join(work, "alias.txt"));
+  await assert.rejects(
+    () => tools.write_file.run({ path: "alias.txt", content: "overwritten" }, ctx),
+    /safeMode: writes are restricted/
+  );
+  assert.equal(fs.readFileSync(target, "utf8"), "original");
+});
+
+test("legitimate writes still pass (including not-yet-existing subdirs)", async () => {
+  const out = await tools.write_file.run({ path: "new/sub/file.txt", content: "ok" }, ctx);
+  assert.match(out, /wrote/);
+  assert.equal(fs.readFileSync(path.join(work, "new", "sub", "file.txt"), "utf8"), "ok");
+});
+
+test("save_artifact blocks symlink escapes from the artifacts folder", async () => {
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-outside3-"));
+  fs.mkdirSync(path.join(runDir, "artifacts"), { recursive: true });
+  fs.symlinkSync(outside, path.join(runDir, "artifacts", "leak"));
+  await assert.rejects(
+    () => tools.save_artifact.run({ name: "leak/out.txt", content: "x" }, ctx),
+    /must stay inside the artifacts folder/
+  );
+});
