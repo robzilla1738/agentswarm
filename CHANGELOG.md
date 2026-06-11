@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.6.0
+
+### Cited research
+- Citations pipeline: workers list every source behind their findings in `report(sources:[...])`; sources travel through dependency handoffs and land in the final report as inline `[n]` citations over a numbered, deduplicated bibliography. Blackboard notes can carry a `url`, and `note(kind:"conflict")` pins source disagreements into conductor digests instead of letting one side win silently.
+- New `academic_search` worker tool: keyless arXiv + Crossref search for peer-reviewed sources.
+- `fetch_url` got serious: fails loudly on error/login/bot-challenge pages instead of returning junk, decodes charsets properly, warns on paywalled pages, and extracts text from PDFs via a built-in dependency-free extractor (`src/pdftext.ts`, uses only node's zlib).
+- Search resilience: per-engine 429 cooldowns with automatic query reformulation when an engine rate-limits or a query blanks, plus freshness-biased result ranking.
+
+### Hardened verification
+- Mechanical format checks run before any LLM verifier: claimed `.json`/`.csv`/`.html` artifacts must actually parse/validate — catching broken deliverables for free.
+- Verifiers now see the reports the task depended on, so contradictions with upstream work get caught; verdicts carry structured `issues` that flow into the worker's retry prompt.
+- `--verify strict` demands tool-gathered evidence: a verifier that passes a task without using any tools is re-run and told to prove it.
+
+### Long-horizon conductor memory
+- Resume re-seeds the conductor's mission ledger from the journal — settled tasks, decisions, and the current phase all survive a restart.
+- Failure cascades block transitively in one pass and carry the *root* cause: a blocked task names the ancestor that failed and why, not just "dependency did not complete". Failed tasks attach their last failing tool call as diagnostics.
+- Per-model context windows: a `contextWindows` config map caps compaction thresholds per model, and the conductor's oldest turns compact in place before any history drops. Advisory file claims now release when the holding task settles.
+
+### Worker toolbelt
+- `grep_files`: structured content search across the workspace, portable across all sandbox runtimes.
+- `replace_in_file` accepts an `edits[]` batch applied atomically — several changes to one file in a single call.
+
+### Hardening
+- Hub CORS is localhost-only; safe-mode write confinement is symlink-safe.
+- Cross-run memory writes are atomic and keyed by runId, with interim snapshots during long runs; remote sandbox file transfers are size-bounded; the hub prunes its run cache.
+- `swarm config unset <key>` removes a key; `config list`/`get` mask secrets.
+
+### Settings diagnostics & run observability
+- Settings page: Test buttons exercise your search and crawl backends through new hub endpoints (`/api/search/test`, `/api/crawl/test`), keys can be cleared from the UI, and cheap/strong model tiers are configurable fields.
+- Run page: a Plan tab in the side rail renders the living mission plan (`/api/runs/:id/plan`), the blackboard gains search with kind-filter chips and source links, and a token-spend sparkline tracks budget burn.
+
+### Tests
+- Four new e2e phases (cascade root causes, failure diagnostics, strict-evidence verification, citations) and five new unit suites (validate, pdftext, webtools, tools, memory) — 105 unit tests total.
+
 ## 0.5.0
 
 ### Task-fit deliverables (not just markdown)
