@@ -70,6 +70,12 @@ export interface SwarmConfig {
   hubPort: number;
   uiPort: number;
   pricing: Record<string, ModelPrice>;
+  /**
+   * Known model context windows (tokens). Caps the compaction/trim threshold
+   * per model so a small-window model never overflows its prompt; edit
+   * config.json to teach the engine about new models.
+   */
+  contextWindows: Record<string, number>;
 }
 
 export const DEFAULT_PRICING: Record<string, ModelPrice> = {
@@ -87,6 +93,21 @@ export const DEFAULT_PRICING: Record<string, ModelPrice> = {
   "claude-haiku-4-5": { inMiss: 1, inHit: 0.1, out: 5 },
   "MiniMax-M2.1": { inMiss: 0.3, inHit: 0.03, out: 1.2 },
   "MiniMax-M2": { inMiss: 0.3, inHit: 0.03, out: 1.2 },
+};
+
+export const DEFAULT_WINDOWS: Record<string, number> = {
+  // tokens (June 2026 published limits; conservative where ranges exist)
+  "deepseek-v4-flash": 128_000,
+  "deepseek-v4-pro": 128_000,
+  "deepseek-chat": 128_000,
+  "deepseek-reasoner": 128_000,
+  "gpt-5.1": 272_000,
+  "gpt-5.1-mini": 272_000,
+  "claude-opus-4-8": 200_000,
+  "claude-sonnet-4-6": 200_000,
+  "claude-haiku-4-5": 200_000,
+  "MiniMax-M2.1": 192_000,
+  "MiniMax-M2": 192_000,
 };
 
 export const DEFAULTS: SwarmConfig = {
@@ -131,7 +152,18 @@ export const DEFAULTS: SwarmConfig = {
   hubPort: 7777,
   uiPort: 7780,
   pricing: DEFAULT_PRICING,
+  contextWindows: DEFAULT_WINDOWS,
 };
+
+/**
+ * Effective compaction/trim threshold for a model: the configured limit,
+ * hard-capped by the model's known context window (15% headroom for output
+ * and estimation error). Models we don't know keep the configured limit.
+ */
+export function contextLimitFor(cfg: SwarmConfig, model: string): number {
+  const win = cfg.contextWindows[model];
+  return win ? Math.min(cfg.contextTokenLimit, Math.floor(win * 0.85)) : cfg.contextTokenLimit;
+}
 
 /**
  * Env vars that must never leak into agent shell commands when they execute
@@ -199,6 +231,7 @@ export function loadConfig(): SwarmConfig {
     provider,
     providers: file.providers || {},
     pricing: { ...DEFAULT_PRICING, ...(file.pricing || {}) },
+    contextWindows: { ...DEFAULT_WINDOWS, ...(file.contextWindows || {}) },
     apiKey: cred.apiKey || "",
     baseUrl: cred.baseUrl || info.baseUrl,
   };

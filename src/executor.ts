@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { AgentOutcome, estimateMessages, runAgent } from "./agent";
-import { SwarmConfig, runDir } from "./config";
+import { SwarmConfig, contextLimitFor, runDir } from "./config";
 import { ControlReader } from "./control";
 import { ChatMsg, ChatResult, chat, gateFor, isFatalAuthError, validateAuth } from "./deepseek";
 import { JournalLike, TeamJournal } from "./journal";
@@ -892,6 +892,16 @@ export class Executor {
       if (this.conductorMessages[1]?.content?.includes(LEDGER_MARK)) this.conductorMessages[1] = msg;
       else this.conductorMessages.splice(1, 0, msg);
     };
+    // Old conductor turns carry the bulk in thinking traces and verbose prose;
+    // the durable decisions live in the ledger and the plan pin. Compact them
+    // in place before resorting to dropping whole messages. (sanitizeMessages
+    // backfills reasoning_content with "" for DeepSeek tool-call turns.)
+    for (let i = 1; i < this.conductorMessages.length - 6; i++) {
+      const m = this.conductorMessages[i];
+      if (m.role !== "assistant") continue;
+      if (m.reasoning_content) m.reasoning_content = "";
+      if (m.content && m.content.length > 400) m.content = clip(m.content, 400);
+    }
     if (this.conductorMessages.length > MAX) {
       const system = this.conductorMessages[0];
       const tail = this.conductorMessages.slice(-(MAX - 2));
@@ -903,7 +913,7 @@ export class Executor {
     // Count alone doesn't bound size: every update embeds the full task table,
     // so a deep run can blow the model window long before 60 messages. The
     // mission itself lives in the system message and always survives.
-    const budget = Math.floor(this.cfg.contextTokenLimit * 0.75);
+    const budget = Math.floor(contextLimitFor(this.cfg, this.meta.options.conductorModel) * 0.75);
     if (estimateMessages(this.conductorMessages) <= budget) return;
     setLedger();
     while (estimateMessages(this.conductorMessages) > budget && this.conductorMessages.length > 10) {

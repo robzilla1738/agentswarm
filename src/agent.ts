@@ -1,4 +1,4 @@
-import { SwarmConfig } from "./config";
+import { SwarmConfig, contextLimitFor } from "./config";
 import { ChatMsg, ChatResult, ToolSchema, chat } from "./deepseek";
 import { compactorPrompt, forcedFinal, NUDGE_USE_TOOLS, STEP_LIMIT_FINAL } from "./prompts";
 import { ToolCtx, ToolDef } from "./tools";
@@ -182,7 +182,7 @@ export async function runAgent(p: AgentParams): Promise<AgentOutcome> {
     }
     hooks.onTranscript?.(messages);
 
-    if (estimateMessages(messages) > cfg.contextTokenLimit) {
+    if (estimateMessages(messages) > contextLimitFor(cfg, p.model)) {
       messages = await compact(p, messages);
       hooks.onTranscript?.(messages);
       hooks.onLog?.("info", `${p.agentId}: context compacted`);

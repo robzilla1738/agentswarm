@@ -106,3 +106,19 @@ test("crawl_site tool only registers when a backend is configured", () => {
   );
   assert.ok(!verifierToolset().crawl_site, "verifier never gets crawl_site");
 });
+
+// ---------- v0.6.0: per-model context windows ----------
+
+const { contextLimitFor, DEFAULT_WINDOWS } = require("../../dist/config.js");
+
+test("contextLimitFor caps the configured limit by the model's window", () => {
+  const cfg = { contextTokenLimit: 120_000, contextWindows: { tiny: 32_000, huge: 1_000_000 } };
+  assert.equal(contextLimitFor(cfg, "tiny"), Math.floor(32_000 * 0.85), "small windows clamp below the config");
+  assert.equal(contextLimitFor(cfg, "huge"), 120_000, "big windows keep the configured limit");
+  assert.equal(contextLimitFor(cfg, "unknown-model"), 120_000, "unknown models keep the configured limit");
+});
+
+test("DEFAULT_WINDOWS ships entries for the default models", () => {
+  assert.ok(DEFAULT_WINDOWS["deepseek-v4-flash"] >= 100_000);
+  assert.ok(DEFAULT_WINDOWS["claude-sonnet-4-6"] >= 100_000);
+});

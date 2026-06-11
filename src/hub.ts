@@ -431,6 +431,9 @@ export function publicConfig(cfg: SwarmConfig) {
     reasoningEffort: cfg.reasoningEffort,
     safeMode: cfg.safeMode,
     contextTokenLimit: cfg.contextTokenLimit,
+    contextWindows: cfg.contextWindows,
+    cheapModel: cfg.cheapModel,
+    strongModel: cfg.strongModel,
     knownModels,
     pricing: cfg.pricing,
   };
