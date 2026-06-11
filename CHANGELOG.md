@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.8.0
+
+### Exhaustive research: 10x source depth
+- Search count defaults raised: `web_search` default 8→15 (max 25→50), `academic_search` 8→15 (max 20→40). Agents can now pull far more results per call.
+- Query expansion doubled: `expandQueries` generates up to 6 complementary phrasings (original, keyword core, guide angle, quoted phrase, recency variants) instead of 3. Questions also get precision and freshness variants.
+- Deep-mode page fetching: increased from 12→25 pages per deep search. More pages = more quotable passages extracted and ranked.
+- Per-engine result cap: raised 15→25 results per search engine, multiplied across query variants and engines.
+- Researcher role hint: made prescriptive — minimum 8 sources per task, 3-4 separate searches with different angles required. Explicit source reporting in `report(..., sources=[...])`.
+- **Result**: Each researcher task now pulls 15-25 sources instead of 2, making swarms truly exhaustive.
+
+### Context.dev priority & reliability
+- Backend priority reordered: context.dev now wins auto-selection (was: firecrawl→context.dev→deepcrawl; now: context.dev→firecrawl→deepcrawl). Cost-effective and fast by default.
+- Robust response parsing: handles multiple context.dev API response shapes (flat `{markdown}`, nested `{results[0]}`, alternative `{data}`). Crawl endpoint also handles `pages` and `data` field names.
+- Crawl filtering: skips empty pages, handles `content`/`text` fallbacks, filters by URL presence. More resilient to API variations.
+- Added CONTEXT_DEV_SETUP.md: complete setup guide, diagnostics, troubleshooting, API details, testing endpoints.
+
+### API key management via web UI
+- All API keys now configurable in Settings (no env vars needed, though supported):
+  - Web search: TinyFish key
+  - Crawl integrations: Firecrawl, context.dev, deepcrawl keys + base URLs
+  - Sandbox: E2B, Modal, Vercel keys
+  - Model provider: per-provider keys
+- Settings persist to `~/.agentswarm/config.json` and reload on next start.
+- One-click "Clear" buttons to remove saved keys without editing JSON.
+- Test endpoints for each backend: "Test search engines", "Test crawl backend", etc.
+- Updated UI description to show new context.dev priority in auto mode.
+- Added SETTINGS_UI_GUIDE.md: comprehensive guide to configuring all options.
+
 ## 0.7.0
 
 Clean sync release: comprehensive integration of all v0.6.0 features (cited research, academic search, PDF extraction, search cooldowns, freshness ranking, conductor ledger re-seeding, cascade diagnostics, mechanical verification, verifier dependency context, strict evidence mode, context windows config, grep_files + atomic multi-edit, plan tab, blackboard search filters, budget sparkline, localhost CORS, symlink-safe writes, atomic memory, plus 15 review-hardening fixes). Fully tested: 116 unit tests, 21 e2e phases. Production ready.

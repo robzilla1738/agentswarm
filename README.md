@@ -100,6 +100,31 @@ swarm run "Research the best open-source vector DBs in 2026 and write a recommen
 
 Run options (also on the UI launch form under Options): `--workers N` (parallelism), `--tasks N`, `--steps N` (tool steps per task), `--budget N` (token cap), `--model`, `--conductor`, `--verify off|normal|strict`, `--effort low|medium|high|max`, `--no-thinking`, `--sandbox host|docker|e2b|modal|vercel|auto` (shell runtime for this run), `--cwd <path>` (run against a real directory instead of an isolated workspace), `--fg` (foreground in this process).
 
+## Configuration & Guides
+
+All API keys and settings can be configured via the web UI (Settings tab) or the CLI. Keys are stored locally in `~/.agentswarm/config.json` and never shared unless sent to their respective APIs.
+
+**Quick setup**:
+```bash
+swarm serve --open                        # opens http://localhost:7777
+# Go to Settings, paste your API keys, click Save. Changes persist.
+```
+
+**Detailed guides**:
+- **[SETTINGS_UI_GUIDE.md](SETTINGS_UI_GUIDE.md)** — How to configure all API keys (model provider, TinyFish, Firecrawl, context.dev, deepcrawl, sandbox runtimes) via the web UI. Explains persistence, test buttons, and clearing keys.
+- **[CONTEXT_DEV_SETUP.md](CONTEXT_DEV_SETUP.md)** — Complete context.dev integration guide, troubleshooting, API testing, and diagnostics endpoints.
+
+**Key integrations**:
+- **Model providers**: Anthropic, OpenAI, xAI, MiniMax, OpenRouter, Ollama, LM Studio, or any OpenAI-compatible endpoint. Multi-provider support — switch anytime without losing keys.
+- **Web search**: Built-in DuckDuckGo + Bing (free), optional TinyFish (faster, requires key).
+- **Crawl backends**: Firecrawl, context.dev (default in auto mode), or custom deepcrawl. Used by `crawl_site` tool and `fetch_url` upgrades.
+- **Sandboxes**: Host (default), Docker, E2B, Modal, Vercel. Each settable per run or as your default.
+
+**Research & agent quality** (0.8.0+):
+- Search depth: web_search pulls up to 50 results (was 25), academic_search up to 40 (was 20). Queries expand to 6 variants instead of 3.
+- Deep mode: fetches and ranks passages from 25 pages instead of 12.
+- Researcher minimum: agents now report minimum 8 sources per task, with explicit source attribution.
+
 ## How it works
 
 The conductor is a model with six tools: `spawn_tasks`, `set_phase`, `update_plan`, `read_report`, `wait`, and `finish`. It reads the mission, spawns self-contained tasks (each with an objective, success criteria, a role, optional dependencies, and an optional `verify` flag), then reacts as reports come back. On long missions it declares phases (`set_phase`) whose goals and exit criteria are pinned into every update — so the plan survives even when old history is trimmed and replaced by a mission ledger (settled tasks, decisions, current phase). On resume, the conductor is re-seeded with this ledger so it picks up where it left off without losing context.
