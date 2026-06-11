@@ -41,8 +41,8 @@ test("resolveCrawlBackend: auto priority, pinned, off", () => {
   assert.equal(resolveCrawlBackend(cfgWith({ contextdevApiKey: "k" })), "contextdev");
   assert.equal(
     resolveCrawlBackend(cfgWith({ firecrawlApiKey: "f", contextdevApiKey: "k" })),
-    "firecrawl",
-    "firecrawl wins auto priority"
+    "contextdev",
+    "contextdev wins auto priority (cost-effective)"
   );
   // deepcrawl needs BOTH base url and key
   assert.equal(resolveCrawlBackend(cfgWith({ deepcrawlApiKey: "k" })), null);

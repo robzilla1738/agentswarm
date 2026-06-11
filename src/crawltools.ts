@@ -43,7 +43,8 @@ export function resolveCrawlBackend(cfg: SwarmConfig): CrawlBackendId | null {
     deepcrawl: Boolean(cfg.deepcrawlApiKey && cfg.deepcrawlBaseUrl),
   };
   if (cfg.crawlBackend !== "auto") return configured[cfg.crawlBackend] ? cfg.crawlBackend : null;
-  for (const id of ["firecrawl", "contextdev", "deepcrawl"] as const) {
+  // Auto mode: context.dev first (cost-effective), then firecrawl, then deepcrawl
+  for (const id of ["contextdev", "firecrawl", "deepcrawl"] as const) {
     if (configured[id]) return id;
   }
   return null;
@@ -113,9 +114,27 @@ export async function scrapeUrl(cfg: SwarmConfig, url: string, signal?: AbortSig
       30_000,
       signal
     );
-    const md = String(data?.markdown ?? data?.results?.[0]?.markdown ?? "");
-    if (!md.trim()) throw new Error("context.dev: empty scrape result");
-    const title = data?.metadata?.title ?? data?.results?.[0]?.metadata?.title;
+    // Handle multiple response shapes from context.dev API
+    let md = "";
+    let title = "";
+
+    // Try flat structure first (new API format)
+    if (data?.markdown) {
+      md = String(data.markdown);
+      title = String(data?.metadata?.title ?? data?.title ?? "");
+    }
+    // Try nested structure (older or alternative format)
+    else if (Array.isArray(data?.results) && data.results[0]) {
+      md = String(data.results[0].markdown ?? "");
+      title = String(data.results[0]?.metadata?.title ?? data.results[0]?.title ?? "");
+    }
+    // Try top-level title fallback
+    else if (data?.data?.markdown) {
+      md = String(data.data.markdown);
+      title = String(data?.data?.metadata?.title ?? data?.data?.title ?? "");
+    }
+
+    if (!md.trim()) throw new Error(`context.dev: empty scrape result for ${url}`);
     return title ? `# ${title}\n\n${md}` : md;
   }
   throw new Error("no scrape-capable crawl backend configured");
@@ -213,12 +232,25 @@ async function contextdevCrawl(cfg: SwarmConfig, opts: CrawlOpts): Promise<Crawl
     CRAWL_DEADLINE_MS,
     opts.signal
   );
-  const results = Array.isArray(data?.results) ? data.results : [];
-  return results.map((r: any) => ({
-    url: String(r?.metadata?.url ?? r?.url ?? ""),
-    title: String(r?.metadata?.title ?? r?.title ?? ""),
-    markdown: String(r?.markdown ?? ""),
-  }));
+
+  // Handle different response shapes from context.dev
+  let results: any[] = [];
+  if (Array.isArray(data?.results)) {
+    results = data.results;
+  } else if (Array.isArray(data?.pages)) {
+    results = data.pages;
+  } else if (Array.isArray(data?.data)) {
+    results = data.data;
+  }
+
+  return results
+    .filter((r: any) => r && (r.markdown || r.content || r.text))
+    .map((r: any) => ({
+      url: String(r?.metadata?.url ?? r?.url ?? r?.uri ?? ""),
+      title: String(r?.metadata?.title ?? r?.title ?? ""),
+      markdown: String(r?.markdown ?? r?.content ?? r?.text ?? ""),
+    }))
+    .filter((p: any) => p.url && p.markdown);
 }
 
 async function deepcrawlCrawl(cfg: SwarmConfig, opts: CrawlOpts): Promise<CrawlPage[]> {
