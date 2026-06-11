@@ -313,9 +313,21 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
       const excludes = ["node_modules", ".git", "dist", ".next", "out", "build", "target", "__pycache__", ".venv"]
         .map((d) => ` --exclude-dir=${d}`)
         .join("");
-      const cmd = `grep ${flags}${include}${excludes} -e ${shq(pattern)} ${shq(root)} | head -n ${max + 1}`;
+      // No `| head`: a pipe would mask grep's exit code, and an invalid regex
+      // or unreadable path must fail loudly, not read as "no matches".
+      // (Output volume is already bounded by the sandbox's collect cap.)
+      const cmd = `grep ${flags}${include}${excludes} -e ${shq(pattern)} ${shq(root)}`;
       const r = await ctx.sandbox.exec(cmd, { cwd: ctx.workdir, timeoutSec: 60, signal: ctx.signal });
-      const lines = r.out.split("\n").filter(Boolean);
+      // Sandbox exec merges stderr into out — separate grep's diagnostics.
+      const all = r.out.split("\n").filter(Boolean);
+      const diags = all.filter((l) => l.startsWith("grep:"));
+      const lines = all.filter((l) => !l.startsWith("grep:"));
+      // Exit 1 = clean no-match. Anything past 1 with zero matches is a real
+      // failure (bad pattern, missing path); with matches it's partial
+      // (some files unreadable) and the matches still count.
+      if (r.code !== 0 && r.code !== 1 && !lines.length) {
+        throw new Error(`grep failed (exit ${r.code}): ${diags.join("; ").slice(0, 300) || "no error detail"}`);
+      }
       if (!lines.length) return "no matches";
       const shown = lines.slice(0, max);
       const more = lines.length > max ? `\n…more matches truncated (raise max_results or narrow the pattern)` : "";

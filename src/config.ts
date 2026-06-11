@@ -235,6 +235,11 @@ export function loadConfig(): SwarmConfig {
     apiKey: cred.apiKey || "",
     baseUrl: cred.baseUrl || info.baseUrl,
   };
+  // A cleared/hand-edited model must fall back, not brick every run with
+  // model:"" requests. (cheapModel/strongModel legitimately clear to "" —
+  // they mean "use `model`".)
+  if (!cfg.model) cfg.model = info.defaultModel;
+  if (!cfg.conductorModel) cfg.conductorModel = cfg.model;
   // Env overrides: provider-specific key env, plus legacy DEEPSEEK_API_KEY.
   if (info.keyEnv && process.env[info.keyEnv]) cfg.apiKey = process.env[info.keyEnv]!;
   if (process.env.TINYFISH_API_KEY) cfg.tinyfishApiKey = process.env.TINYFISH_API_KEY;
@@ -282,6 +287,16 @@ export function saveConfig(patch: Partial<SwarmConfig> & { providers?: Partial<R
     /* best effort */
   }
   return loadConfig();
+}
+
+/**
+ * Config keys whose values must never print in cleartext — CLI output ends up
+ * in terminal scrollback and pasted bug reports. `providers` holds nested
+ * per-provider apiKeys, so it counts too. Single source of truth for the CLI
+ * masking sites (the hub's publicConfig is a strict allowlist already).
+ */
+export function isSecretConfigKey(key: string): boolean {
+  return /apikey|token|secret/i.test(key) || key === "providers";
 }
 
 export function maskKey(key: string): string {

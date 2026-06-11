@@ -56,3 +56,37 @@ test("readNewEvents tails incrementally across partial writes", async () => {
   assert.equal(evs.length, 1);
   assert.equal(evs[0].seq, 2);
 });
+
+test("flushSync recovers the chunk an in-flight async drain holds", async () => {
+  const dir = tmpRunDir();
+  const j = new Journal(dir);
+  const orig = fs.promises.appendFile;
+  let release;
+  // Hang the async write the way a SIGTERM-during-libuv-write would.
+  fs.promises.appendFile = (...args) => new Promise((res) => { release = () => res(orig(...args)); });
+  try {
+    j.append("log", { msg: "in-flight" });
+    await new Promise((r) => setImmediate(r)); // drain starts, holds the chunk
+    j.append("log", { msg: "buffered" });
+    j.flushSync(); // must persist BOTH, not just the new buffer
+  } finally {
+    fs.promises.appendFile = orig;
+  }
+  assert.deepEqual(readEvents(dir).map((e) => e.msg), ["in-flight", "buffered"]);
+  // The abandoned write lands after all — the duplicate chunk must collapse.
+  release();
+  await j.flush();
+  assert.deepEqual(readEvents(dir).map((e) => e.msg), ["in-flight", "buffered"]);
+});
+
+test("readNewEvents drops seqs already delivered (flushSync race duplicates)", () => {
+  const dir = tmpRunDir();
+  const file = eventsFile(dir);
+  const state = { offset: 0, carry: "" };
+  fs.writeFileSync(file, '{"seq":1,"t":1,"type":"log","msg":"a"}\n{"seq":2,"t":2,"type":"log","msg":"b"}\n');
+  assert.equal(readNewEvents(file, state).length, 2);
+  // A raced duplicate of seq 1-2 followed by genuinely new seq 3.
+  fs.appendFileSync(file, '{"seq":1,"t":1,"type":"log","msg":"a"}\n{"seq":3,"t":3,"type":"log","msg":"c"}\n');
+  const evs = readNewEvents(file, state);
+  assert.deepEqual(evs.map((e) => e.seq), [3]);
+});

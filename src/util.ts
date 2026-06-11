@@ -12,7 +12,35 @@ export function rid(prefix: string): string {
   return `${prefix}_${t}${r}${c}`;
 }
 
-export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+/** Resolves after ms; rejects early if the signal aborts first. */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (!signal) {
+      setTimeout(resolve, ms);
+      return;
+    }
+    if (signal.aborted) {
+      reject(new Error("aborted"));
+      return;
+    }
+    const t = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(new Error("aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** A timeout signal, combined with the caller's signal when one is given. */
+export function mergeSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+  const t = AbortSignal.timeout(timeoutMs);
+  if (!signal) return t;
+  return typeof AbortSignal.any === "function" ? AbortSignal.any([t, signal]) : signal;
+}
 
 // ---------- strings ----------
 

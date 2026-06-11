@@ -29,6 +29,8 @@ export interface AgentView {
 export interface BlackboardNote {
   t: number;
   taskId?: string;
+  /** Set when a team agent posted it — task ids only disambiguate per team. */
+  teamId?: string;
   agentId?: string;
   key?: string;
   /** finding | decision | conflict | open-question | handoff | claim (default finding) */
@@ -105,6 +107,11 @@ export class RunState {
         this.totalUsage = addUsage(this.totalUsage, u);
         this.cost += usageCost(u, this.pricing[model]);
         this.pushBudgetPoint(ev.t);
+      } else if (ev.type === "note.added") {
+        // The blackboard is shared swarm-wide at runtime, so team notes are
+        // root facts too — without this, a resume would forget every note a
+        // team agent posted (decisions included).
+        this.pushNote(ev, teamId);
       }
       return;
     }
@@ -233,25 +240,7 @@ export class RunState {
         });
         break;
       case "note.added":
-        this.notes.push({
-          t: ev.t,
-          taskId: ev.taskId as string | undefined,
-          agentId: ev.agentId as string | undefined,
-          key: ev.key as string | undefined,
-          kind: ev.kind as string | undefined,
-          text: ev.text as string,
-          url: typeof ev.url === "string" ? ev.url : undefined,
-        });
-        // Reduced state is held live by the hub and the resume seed — keep
-        // only the tail that digests/views actually use. Decisions and
-        // conflicts are never dropped: they anchor long-horizon coherence.
-        if (this.notes.length > 1000) {
-          const keep = (n: BlackboardNote) => n.kind === "decision" || n.kind === "conflict";
-          const pinned = this.notes.filter(keep);
-          const rest = this.notes.filter((n) => !keep(n));
-          rest.splice(0, rest.length - Math.max(0, 1000 - pinned.length));
-          this.notes = [...pinned, ...rest].sort((a, b) => a.t - b.t);
-        }
+        this.pushNote(ev);
         break;
       case "conductor.say":
         this.conductorLog.push({ t: ev.t, text: ev.text as string });
@@ -299,6 +288,37 @@ export class RunState {
     this.budgetSeries.push({ t, tokens, cost: this.cost });
     if (this.budgetSeries.length > 600) {
       this.budgetSeries = this.budgetSeries.filter((_, i) => i % 2 === 0 || i === this.budgetSeries.length - 1);
+    }
+  }
+
+  private pushNote(ev: SwarmEvent, teamId?: string): void {
+    this.notes.push({
+      t: ev.t,
+      taskId: ev.taskId as string | undefined,
+      teamId,
+      agentId: ev.agentId as string | undefined,
+      key: ev.key as string | undefined,
+      kind: ev.kind as string | undefined,
+      text: ev.text as string,
+      url: typeof ev.url === "string" ? ev.url : undefined,
+    });
+    // Reduced state is held live by the hub and the resume seed — keep only
+    // the tail that digests/views actually use. Decisions and conflicts are
+    // never dropped: they anchor long-horizon coherence. Forward-pass splice
+    // (mirroring the executor's addNote): the array is permanently at the cap
+    // once a long run passes it, so this runs on every note event — no
+    // filter/sort allocations on the reducer hot path.
+    if (this.notes.length > 1000) {
+      const keep = (n: BlackboardNote) => n.kind === "decision" || n.kind === "conflict";
+      let pinnedCount = 0;
+      for (const n of this.notes) if (keep(n)) pinnedCount++;
+      let toDrop = this.notes.length - Math.max(pinnedCount, 1000);
+      for (let i = 0; i < this.notes.length && toDrop > 0; ) {
+        if (!keep(this.notes[i])) {
+          this.notes.splice(i, 1);
+          toDrop--;
+        } else i++;
+      }
     }
   }
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { type ActivityGroup, groupActivity } from "@/lib/feed";
 import { fmtAgo, fmtClock, fmtClockShort } from "@/lib/format";
@@ -246,21 +246,23 @@ function ConductorFeed({ log, operatorNotes, now }: { log: ConductorSay[]; opera
   );
 }
 
+/** One chip styling for note kinds and their filter buttons, so they can't drift apart. */
+function kindChipStyle(solid: boolean, padding = "1px 6px"): CSSProperties {
+  return {
+    fontSize: 9,
+    letterSpacing: "0.1em",
+    padding,
+    borderRadius: 4,
+    border: solid ? undefined : "1px solid var(--color-border)",
+  };
+}
+
 /** Decisions and conflicts are the load-bearing notes — they get the solid treatment. */
 function NoteKind({ kind }: { kind: string }) {
   const glyph: Record<string, string> = { decision: "◆", conflict: "≠", "open-question": "?", handoff: "⇢", claim: "⚑" };
   const solid = kind === "decision" || kind === "conflict";
   return (
-    <span
-      className={`mono shrink-0 uppercase ${solid ? "chip-solid" : ""}`}
-      style={{
-        fontSize: 9,
-        letterSpacing: "0.1em",
-        padding: "1px 6px",
-        borderRadius: 4,
-        border: solid ? undefined : "1px solid var(--color-border)",
-      }}
-    >
+    <span className={`mono shrink-0 uppercase ${solid ? "chip-solid" : ""}`} style={kindChipStyle(solid)}>
       {glyph[kind] ?? "·"} {kind}
     </span>
   );
@@ -271,9 +273,12 @@ function Blackboard({ notes, now }: { notes: BlackboardNote[]; now: number }) {
   const [kindFilter, setKindFilter] = useState<string | null>(null);
 
   const kinds = useMemo(() => {
-    const seen = new Set<string>();
-    for (const n of notes) seen.add(n.kind || "finding");
-    return [...seen].sort();
+    const counts = new Map<string, number>();
+    for (const n of notes) {
+      const k = n.kind || "finding";
+      counts.set(k, (counts.get(k) ?? 0) + 1);
+    }
+    return [...counts.entries()].sort(([a], [b]) => a.localeCompare(b));
   }, [notes]);
 
   const filtered = useMemo(() => {
@@ -300,20 +305,14 @@ function Blackboard({ notes, now }: { notes: BlackboardNote[]; now: number }) {
         />
         {kinds.length > 1 && (
           <div className="flex items-center gap-1.5 flex-wrap">
-            {kinds.map((k) => (
+            {kinds.map(([k, count]) => (
               <button
                 key={k}
                 onClick={() => setKindFilter(kindFilter === k ? null : k)}
                 className={`mono uppercase ${kindFilter === k ? "chip-solid" : "text-ink-faint hover:text-ink-dim"}`}
-                style={{
-                  fontSize: 9,
-                  letterSpacing: "0.1em",
-                  padding: "2px 7px",
-                  borderRadius: 4,
-                  border: kindFilter === k ? undefined : "1px solid var(--color-border)",
-                }}
+                style={kindChipStyle(kindFilter === k, "2px 7px")}
               >
-                {k} {notes.filter((n) => (n.kind || "finding") === k).length}
+                {k} {count}
               </button>
             ))}
           </div>

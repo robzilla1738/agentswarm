@@ -14,7 +14,7 @@ import {
 } from "./config";
 import { appendControl } from "./control";
 import { crawlSite, hasScrapeBackend, resolveCrawlBackend, scrapeUrl } from "./crawltools";
-import { bingSearch, ddgSearch, tinyfishSearch } from "./webtools";
+import { searchEngines } from "./webtools";
 import { listModels, validateAuth } from "./deepseek";
 import { PROVIDERS, PROVIDER_IDS, isProviderId } from "./providers";
 import { eventsFile, readEvents, readNewEvents, TailState } from "./journal";
@@ -170,8 +170,7 @@ async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL
         return { engine, ok: false, detail: errMsg(e) };
       }
     };
-    const checks = [probe("duckduckgo", () => ddgSearch(q, 3)), probe("bing", () => bingSearch(q, 3))];
-    if (cfg.tinyfishApiKey) checks.push(probe("tinyfish", () => tinyfishSearch(cfg, q, 3)));
+    const checks = searchEngines(cfg).map((e) => probe(e.name, () => e.search(q, 3)));
     const engines = await Promise.all(checks);
     return sendJson(res, 200, { ok: engines.some((e) => e.ok), engines });
   }

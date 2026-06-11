@@ -65,10 +65,14 @@ export class Journal {
     return ev;
   }
 
+  /** The chunk an async drain is writing right now — flushSync must see it. */
+  private inFlight = "";
+
   private async drain(): Promise<void> {
     if (!this.buf) return;
     const chunk = this.buf;
     this.buf = "";
+    this.inFlight = chunk;
     try {
       await fs.promises.appendFile(this.file, chunk, "utf8");
       this.failures = 0;
@@ -81,6 +85,8 @@ export class Journal {
         this.degraded = true;
         process.stderr.write(`agentswarm: journal writes are failing (${String(e)}); run state is no longer durable\n`);
       }
+    } finally {
+      this.inFlight = "";
     }
   }
 
@@ -88,11 +94,18 @@ export class Journal {
     return this.chain.then(() => this.drain());
   }
 
-  /** Last-gasp synchronous flush for signal handlers and exit paths. */
+  /**
+   * Last-gasp synchronous flush for signal handlers and exit paths. Includes
+   * any chunk a pending async drain holds: process.exit would abandon that
+   * write, silently losing just-settled events. If the abandoned write did
+   * land first, the chunk appears twice — readers dedupe by seq.
+   */
   flushSync(): void {
-    if (!this.buf) return;
+    const pending = this.inFlight + this.buf;
+    if (!pending) return;
     try {
-      fs.appendFileSync(this.file, this.buf, "utf8");
+      fs.appendFileSync(this.file, pending, "utf8");
+      this.inFlight = "";
       this.buf = "";
     } catch {
       /* nothing left to do */
@@ -111,7 +124,23 @@ export function readEvents(runDirPath: string): SwarmEvent[] {
   } catch {
     return [];
   }
-  return parseLines(raw).events;
+  return dedupeBySeq(parseLines(raw).events);
+}
+
+/**
+ * Seq is strictly increasing in a healthy journal; a chunk can appear twice
+ * when a signal-handler flushSync raced an in-flight async append. Replays of
+ * already-seen seqs are dropped.
+ */
+function dedupeBySeq(events: SwarmEvent[], lastSeq = 0): SwarmEvent[] {
+  let max = lastSeq;
+  const out: SwarmEvent[] = [];
+  for (const ev of events) {
+    if (typeof ev.seq === "number" && ev.seq <= max) continue;
+    if (typeof ev.seq === "number") max = ev.seq;
+    out.push(ev);
+  }
+  return out;
 }
 
 export function lastSeq(runDirPath: string): number {
@@ -122,6 +151,8 @@ export function lastSeq(runDirPath: string): number {
 export interface TailState {
   offset: number;
   carry: string;
+  /** Highest seq already delivered — guards against flushSync-raced duplicates. */
+  lastSeq?: number;
 }
 
 /** Incremental read for tailing; handles partially written lines. */
@@ -139,6 +170,7 @@ export function readNewEvents(
     // Truncated/rewritten (should not happen) — start over.
     state.offset = 0;
     state.carry = "";
+    state.lastSeq = 0;
   }
   if (stat.size === state.offset) return [];
   const fd = fs.openSync(file, "r");
@@ -154,7 +186,9 @@ export function readNewEvents(
       const text = state.carry + buf.toString("utf8", 0, n);
       const parsed = parseLines(text, true);
       state.carry = parsed.carry;
-      out.push(...parsed.events);
+      const fresh = dedupeBySeq(parsed.events, state.lastSeq ?? 0);
+      if (fresh.length) state.lastSeq = fresh[fresh.length - 1].seq;
+      out.push(...fresh);
     }
     state.offset += read;
     return out;

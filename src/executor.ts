@@ -58,9 +58,22 @@ export interface ExecutorOptions {
   /** Parent's abort signal (team cancellation). */
   parentSignal?: AbortSignal;
   /** Share the parent's blackboard. */
-  sharedNotes?: { taskId?: string; key?: string; kind?: string; text: string; url?: string }[];
+  sharedNotes?: SwarmNote[];
   /** Team mode: write into the parent's run directory (artifacts, control). */
   runDirPath?: string;
+}
+
+/**
+ * A blackboard note. Root and team tasks share one T1..Tn id namespace, so
+ * claim bookkeeping must key on (teamId, taskId), not taskId alone.
+ */
+export interface SwarmNote {
+  taskId?: string;
+  teamId?: string;
+  key?: string;
+  kind?: string;
+  text: string;
+  url?: string;
 }
 
 export class Executor {
@@ -76,7 +89,7 @@ export class Executor {
   private taskCounter = 0;
   private inflight = new Map<string, Promise<void>>();
   private settledSinceUpdate: string[] = [];
-  private notes: { taskId?: string; key?: string; kind?: string; text: string; url?: string }[] = [];
+  private notes: SwarmNote[] = [];
   private phase: { name: string; goal?: string; exitCriteria?: string } | null = null;
 
   private conductorMessages: ChatMsg[] = [];
@@ -86,10 +99,9 @@ export class Executor {
   private finishNotes = "";
   private finishReason = "";
   private fatal: string | null = null;
-  private lastConductorAction: "spawn" | "wait" | "finish" | "none" = "none";
+  /** "error" = the turn ended in a call failure, not a decision. */
+  private lastConductorAction: "spawn" | "wait" | "finish" | "none" | "error" = "none";
   private conductorFailures = 0;
-  /** True when the last conductor turn ended in a call error, not a decision. */
-  private lastConductorErrored = false;
   private resumed = false;
 
   private sandbox: SandboxRuntime;
@@ -157,8 +169,10 @@ export class Executor {
       state.taskList().filter((t) => ["done", "failed", "blocked"].includes(t.status) && !reset.has(t.id)).map((t) => t.id)
     );
     this.notes = state.notes
-      .map((n) => ({ taskId: n.taskId, key: n.key, kind: n.kind, text: n.text, url: n.url }))
-      .filter((n) => !(n.kind === "claim" && n.taskId && settled.has(n.taskId)));
+      .map((n) => ({ taskId: n.taskId, teamId: n.teamId, key: n.key, kind: n.kind, text: n.text, url: n.url }))
+      // Team claims always drop: the owning child executor died with the
+      // crash, and a re-run team task re-claims from scratch.
+      .filter((n) => !(n.kind === "claim" && (n.teamId || (n.taskId && settled.has(n.taskId)))));
     const lastPhase = state.phases[state.phases.length - 1];
     if (lastPhase) this.phase = { name: lastPhase.name, goal: lastPhase.goal, exitCriteria: lastPhase.exitCriteria };
     this.spentTokens = state.totalUsage.promptTokens + state.totalUsage.completionTokens;
@@ -431,17 +445,25 @@ export class Executor {
       sharedNotes: this.notes,
     });
     await child.run();
+    // The sub-swarm is over: claims its tasks left behind (e.g. after a child
+    // cancellation) are no longer live and must not haunt the shared board.
+    for (let i = this.notes.length - 1; i >= 0; i--) {
+      const n = this.notes[i];
+      if (n.kind === "claim" && n.teamId === task.id) this.notes.splice(i, 1);
+    }
     if (this.ac.signal.aborted) {
       this.finalizeTask(task, "failed", "run cancelled");
       return;
     }
     const report = child.teamReport || "(team produced no consolidated report)";
     for (const a of child.teamArtifacts()) if (!task.artifacts.includes(a)) task.artifacts.push(a);
+    const ok = child.anyTaskDone();
+    const reportStatus: "done" | "blocked" = ok ? "done" : "blocked";
     task.report = report;
-    task.reportStatus = "done";
+    task.reportStatus = reportStatus;
     this.journal.append("team.report", { taskId: task.id, report, artifacts: task.artifacts });
-    this.journal.append("task.report", { taskId: task.id, status: "done", report, artifacts: task.artifacts });
-    this.finalizeTask(task, child.anyTaskDone() ? "done" : "failed", report);
+    this.journal.append("task.report", { taskId: task.id, status: reportStatus, report, artifacts: task.artifacts });
+    this.finalizeTask(task, ok ? "done" : "failed", report);
   }
 
   private async mainLoop(): Promise<void> {
@@ -478,7 +500,7 @@ export class Executor {
             // An errored turn is not a decision — keep looping so the breaker
             // can retry (and eventually trip) instead of misreading the error
             // as "the conductor chose to stop".
-            if (this.lastConductorAction !== "spawn" && !this.lastConductorErrored) {
+            if (this.lastConductorAction !== "spawn" && this.lastConductorAction !== "error") {
               this.finishing = true;
               this.finishReason = this.finishReason || "all tasks settled";
             }
@@ -489,7 +511,7 @@ export class Executor {
               reports
             );
             await this.conductorTurn();
-            if (this.lastConductorAction === "wait" && !this.lastConductorErrored) {
+            if (this.lastConductorAction === "wait") {
               this.finishing = true;
               this.finishReason = "stalled: dependencies unmet and conductor chose to wait";
             }
@@ -630,12 +652,10 @@ export class Executor {
         const scale = Number(process.env.SWARM_BACKOFF_SCALE || "1") || 1;
         const backoff = [2_000, 5_000, 15_000, 30_000][Math.min(this.conductorFailures - 1, 3)] * scale;
         await new Promise((r) => setTimeout(r, backoff));
-        this.lastConductorAction = "wait";
-        this.lastConductorErrored = true;
+        this.lastConductorAction = "error";
         return;
       }
       this.conductorFailures = 0;
-      this.lastConductorErrored = false;
       this.onUsage(this.meta.options.conductorModel, res.usage);
 
       if (res.content.trim()) this.journal.append("conductor.say", { text: clip(res.content, 4000) });
@@ -817,7 +837,8 @@ export class Executor {
     if (reports.length <= CAP) return reports.map(reportBlock);
     const important = reports.filter((t) => t.status !== "done");
     const done = reports.filter((t) => t.status === "done");
-    const fullDone = done.slice(-Math.max(0, CAP - important.length));
+    const room = Math.max(0, CAP - important.length);
+    const fullDone = room > 0 ? done.slice(-room) : []; // slice(-0) would return everything
     const briefDone = done.slice(0, done.length - fullDone.length);
     return [
       ...important.map(reportBlock),
@@ -1044,7 +1065,7 @@ export class Executor {
       signal: this.ac.signal,
       addCheckpoint: task ? (summary) => this.recordCheckpoint(task, agentId, summary) : undefined,
       addNote: (text, key, kind, url) => {
-        this.notes.push({ taskId: task?.id, key, kind, text, url });
+        this.notes.push({ taskId: task?.id, teamId: this.teamId, key, kind, text, url });
         // Only the recent tail ever feeds digests; without a cap a multi-day
         // run accumulates every note in memory. Decisions and conflicts are
         // kept regardless. In-place splice: teams share this array by reference.
@@ -1065,14 +1086,14 @@ export class Executor {
       readReport: (taskId) => this.readReportText(taskId),
       checkClaim: (rel) => {
         const norm = rel.replace(/^\.\//, "");
-        const claim = this.notes.find(
-          (n) =>
-            n.kind === "claim" &&
-            n.key === norm &&
-            n.taskId &&
-            n.taskId !== task?.id &&
-            ["running", "verifying"].includes(this.tasks.get(n.taskId)?.status ?? "")
-        );
+        const claim = this.notes.find((n) => {
+          if (n.kind !== "claim" || n.key !== norm || !n.taskId) return false;
+          // Another executor's claim: its tasks aren't in this.tasks, but
+          // claims are spliced out when their task settles (and when a team
+          // ends), so presence alone means the holder is still live.
+          if (n.teamId !== this.teamId) return true;
+          return n.taskId !== task?.id && ["running", "verifying"].includes(this.tasks.get(n.taskId)?.status ?? "");
+        });
         return claim
           ? `⚠ ${claim.taskId} holds a claim on ${norm} ("${oneLine(claim.text, 80)}") — coordinate via the blackboard before further edits.`
           : null;
@@ -1449,7 +1470,7 @@ export class Executor {
     // teams share this array by reference.
     for (let i = this.notes.length - 1; i >= 0; i--) {
       const n = this.notes[i];
-      if (n.kind === "claim" && n.taskId === task.id) this.notes.splice(i, 1);
+      if (n.kind === "claim" && n.taskId === task.id && n.teamId === this.teamId) this.notes.splice(i, 1);
     }
     this.journal.append("task.status", { taskId: task.id, status, attempt: task.attempt, reason });
     this.settledSinceUpdate.push(task.id);
@@ -1555,7 +1576,9 @@ export class Executor {
   private queueDelta(agentId: string, taskId: string, channel: "text" | "think", text: string): void {
     // Deltas are UI sugar, never state — thin them under load so a 100-agent
     // swarm doesn't write gigabytes of streaming chatter into the journal.
-    const load = this.activeWorkerCount();
+    // inflight.size over-counts verifying tasks slightly, but these are fuzzy
+    // thresholds and this runs per streaming token — O(1) matters here.
+    const load = this.inflight.size;
     if (channel === "think" && load > 48) {
       if (!this.thinkDropLogged) {
         this.thinkDropLogged = true;

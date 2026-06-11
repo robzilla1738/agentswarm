@@ -149,3 +149,15 @@ test("save_artifact blocks symlink escapes from the artifacts folder", async () 
     /must stay inside the artifacts folder/
   );
 });
+
+test("grep_files fails loudly on an invalid regex instead of reporting 'no matches'", async () => {
+  await assert.rejects(
+    () => tools.grep_files.run({ pattern: "broken(" }, ctx),
+    /grep failed/,
+    "exit 2 with no matches is an error, not a clean miss"
+  );
+});
+
+test("grep_files fails loudly on a nonexistent search path", async () => {
+  await assert.rejects(() => tools.grep_files.run({ pattern: "x", path: "src/no-such-dir" }, ctx), /grep failed/);
+});

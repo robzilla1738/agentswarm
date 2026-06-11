@@ -6,6 +6,7 @@ import {
   SwarmConfig,
   coerceConfigValue,
   configPath,
+  isSecretConfigKey,
   loadConfig,
   maskKey,
   runDir,
@@ -519,7 +520,18 @@ async function cmdConfig(rest: string[], flags: Args["flags"]): Promise<void> {
     const cfg = loadConfig();
     if (sub === "get" && rest[1]) {
       const key = rest[1] as keyof SwarmConfig;
-      const v = /apikey|token|secret/i.test(key) ? maskKey(String(cfg[key] ?? "")) : cfg[key];
+      if (key === "providers") {
+        // Nested per-provider creds — mask every apiKey, never dump raw.
+        const masked = Object.fromEntries(
+          Object.entries(cfg.providers ?? {}).map(([id, c]) => [
+            id,
+            { ...c, ...(c?.apiKey ? { apiKey: maskKey(c.apiKey) } : {}) },
+          ])
+        );
+        console.log(JSON.stringify(masked, null, 2));
+        return;
+      }
+      const v = isSecretConfigKey(key) ? maskKey(String(cfg[key] ?? "")) : cfg[key];
       console.log(typeof v === "object" ? JSON.stringify(v, null, 2) : String(v));
       return;
     }
@@ -528,7 +540,7 @@ async function cmdConfig(rest: string[], flags: Args["flags"]): Promise<void> {
       let v: unknown = cfg[k];
       // Every secret-bearing key prints masked — `config list` output ends up
       // in terminal scrollback and pasted bug reports.
-      if (/apikey|token|secret/i.test(k)) {
+      if (isSecretConfigKey(k)) {
         v = v ? maskKey(String(v)) : k === "apiKey" ? ansi.red("(not set)") : "(not set)";
       }
       console.log(`  ${k.padEnd(18)} ${ansi.gray(String(v))}`);
@@ -560,14 +572,15 @@ async function cmdConfig(rest: string[], flags: Args["flags"]): Promise<void> {
   if (sub === "unset") {
     const key = rest[1] as keyof SwarmConfig;
     if (!key) throw new Error("usage: swarm config unset <key>");
-    // Only string-valued keys can sensibly clear to "" — numbers/enums keep
-    // their defaults via `set`.
-    const clearable = SETTABLE_KEYS.filter((k) => /apikey|token|secret|url|model/i.test(k));
-    if (!clearable.includes(key)) {
-      throw new Error(`not clearable. Clearable keys: ${clearable.join(", ")}`);
+    if (!SETTABLE_KEYS.includes(key)) {
+      throw new Error(`unknown key. Keys: ${SETTABLE_KEYS.join(", ")}`);
     }
-    saveConfig({ [key]: "" } as Partial<SwarmConfig>);
-    console.log(ansi.green("✓ ") + `cleared ${key}`);
+    // apiKey/baseUrl route into the active provider's creds, so clearing
+    // means writing "". Everything else is deleted from the file outright —
+    // the default applies again (unset model:"" would brick every run).
+    const cred = key === "apiKey" || key === "baseUrl";
+    saveConfig({ [key]: cred ? "" : undefined } as Partial<SwarmConfig>);
+    console.log(ansi.green("✓ ") + `cleared ${key}` + (cred ? "" : ansi.gray(" — default applies")));
     return;
   }
   if (sub === "path") {

@@ -29,7 +29,6 @@ export interface ClientState {
   budgetSeries: { t: number; tokens: number; cost: number }[];
   /** Bumped on every plan.updated — the Plan tab refetches on change. */
   planUpdatedAt: number;
-  planExcerpt: string;
   finalSummary?: string;
   finalReportPath?: string;
   lastSeq: number;
@@ -59,7 +58,6 @@ export function emptyState(): ClientState {
     cost: 0,
     budgetSeries: [],
     planUpdatedAt: 0,
-    planExcerpt: "",
     lastSeq: 0,
     lastT: 0,
   };
@@ -101,13 +99,11 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
   if (typeof ev.teamId === "string") {
     if (ev.type === "usage") {
       const u = ev.usage as Usage;
-      s.usage = {
-        promptTokens: s.usage.promptTokens + u.promptTokens,
-        completionTokens: s.usage.completionTokens + u.completionTokens,
-        cacheHitTokens: s.usage.cacheHitTokens + u.cacheHitTokens,
-        cacheMissTokens: s.usage.cacheMissTokens + u.cacheMissTokens,
-      };
-      if (typeof ev.cost === "number" && Number.isFinite(ev.cost)) s.cost = ev.cost;
+      accrueUsage(s, u);
+      // ev.cost on team events is the CHILD executor's own cumulative — it
+      // must never overwrite the run total (the next root usage event resyncs
+      // s.cost to the engine's authoritative cumulative anyway).
+      s.cost += priceUsage(ev.model as string | undefined, u);
       pushBudgetPoint(s, ev.t);
     } else if (ev.type === "tool.call") {
       pushActivity(s, {
@@ -115,13 +111,9 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
         kind: "tool", name: ev.name as string, text: summarizeArgs(ev.name as string, ev.args, s.meta?.cwd),
       });
     } else if (ev.type === "note.added") {
-      // Shared blackboard: team notes are swarm-wide facts.
-      s.notes.push({
-        t: ev.t, taskId: ev.taskId as string | undefined, agentId: ev.agentId as string | undefined,
-        key: ev.key as string | undefined, kind: ev.kind as string | undefined, text: ev.text as string,
-        url: typeof ev.url === "string" ? ev.url : undefined,
-      });
-      if (s.notes.length > 500) s.notes.splice(0, s.notes.length - 500);
+      // Shared blackboard: team notes are swarm-wide facts (but they stay out
+      // of the root activity feed, like the rest of a team's chatter).
+      pushNote(s, ev, ev.teamId);
     }
     return s;
   }
@@ -279,13 +271,7 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
       break;
     }
     case "note.added": {
-      const note: BlackboardNote = {
-        t: ev.t, taskId: ev.taskId as string | undefined, agentId: ev.agentId as string | undefined,
-        key: ev.key as string | undefined, kind: ev.kind as string | undefined, text: ev.text as string,
-        url: typeof ev.url === "string" ? ev.url : undefined,
-      };
-      s.notes.push(note);
-      if (s.notes.length > 500) s.notes.splice(0, s.notes.length - 500);
+      const note = pushNote(s, ev);
       pushActivity(s, {
         id: `n${ev.seq}`, t: ev.t, agentId: (ev.agentId as string) ?? "", taskId: (ev.taskId as string) ?? "",
         kind: "note", text: (note.key ? `[${note.key}] ` : "") + note.text,
@@ -306,29 +292,19 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
     }
     case "usage": {
       const u = ev.usage as Usage;
-      s.usage = {
-        promptTokens: s.usage.promptTokens + u.promptTokens,
-        completionTokens: s.usage.completionTokens + u.completionTokens,
-        cacheHitTokens: s.usage.cacheHitTokens + u.cacheHitTokens,
-        cacheMissTokens: s.usage.cacheMissTokens + u.cacheMissTokens,
-      };
+      accrueUsage(s, u);
       if (typeof ev.cost === "number" && Number.isFinite(ev.cost)) {
         // The engine journals its cumulative cost (priced with the operator's
         // actual config) — prefer it over re-deriving from a baked-in table.
         s.cost = ev.cost;
       } else {
-        // Match the engine's semantics: unknown models cost $0 — never guess
-        // another provider's rates.
-        const price = PRICING[(ev.model as string) ?? ""] ?? { inMiss: 0, inHit: 0, out: 0 };
-        const miss = u.cacheMissTokens || Math.max(0, u.promptTokens - u.cacheHitTokens);
-        s.cost += (miss * price.inMiss + u.cacheHitTokens * price.inHit + u.completionTokens * price.out) / 1e6;
+        s.cost += priceUsage(ev.model as string | undefined, u);
       }
       pushBudgetPoint(s, ev.t);
       break;
     }
     case "plan.updated":
       s.planUpdatedAt = ev.t;
-      s.planExcerpt = String(ev.excerpt ?? "");
       break;
     case "run.final":
       s.finalSummary = ev.summary as string;
@@ -341,6 +317,33 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
 function pushActivity(s: ClientState, item: ActivityItem): void {
   s.activity.push(item);
   if (s.activity.length > MAX_ACTIVITY) s.activity.splice(0, s.activity.length - MAX_ACTIVITY);
+}
+
+function accrueUsage(s: ClientState, u: Usage): void {
+  s.usage = {
+    promptTokens: s.usage.promptTokens + u.promptTokens,
+    completionTokens: s.usage.completionTokens + u.completionTokens,
+    cacheHitTokens: s.usage.cacheHitTokens + u.cacheHitTokens,
+    cacheMissTokens: s.usage.cacheMissTokens + u.cacheMissTokens,
+  };
+}
+
+/** Incremental cost of one usage event. Unknown models cost $0 — match the engine: never guess another provider's rates. */
+function priceUsage(model: string | undefined, u: Usage): number {
+  const price = PRICING[model ?? ""] ?? { inMiss: 0, inHit: 0, out: 0 };
+  const miss = u.cacheMissTokens || Math.max(0, u.promptTokens - u.cacheHitTokens);
+  return (miss * price.inMiss + u.cacheHitTokens * price.inHit + u.completionTokens * price.out) / 1e6;
+}
+
+function pushNote(s: ClientState, ev: SwarmEvent, teamId?: string): BlackboardNote {
+  const note: BlackboardNote = {
+    t: ev.t, taskId: ev.taskId as string | undefined, teamId, agentId: ev.agentId as string | undefined,
+    key: ev.key as string | undefined, kind: ev.kind as string | undefined, text: ev.text as string,
+    url: typeof ev.url === "string" ? ev.url : undefined,
+  };
+  s.notes.push(note);
+  if (s.notes.length > 500) s.notes.splice(0, s.notes.length - 500);
+  return note;
 }
 
 function summarizeArgs(name: string, args: unknown, cwd?: string): string {

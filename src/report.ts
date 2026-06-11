@@ -12,6 +12,7 @@
 
 import { canonicalizeUrl } from "./searchcore";
 import { SourceRef, Task } from "./types";
+import { clip } from "./util";
 
 // ---------- source aggregation (citation pipeline) ----------
 
@@ -317,7 +318,7 @@ export function renderFinalHtml(o: FinalHtmlOpts): string {
   <span class="badge ${o.status}">${o.status}</span>
   <span>run ${esc(o.runId)}</span>
   <span>${esc(date)}</span>
-  <span title="${esc(o.mission.slice(0, 600))}">mission: ${esc(o.mission.length > 90 ? o.mission.slice(0, 90) + "…" : o.mission)}</span>
+  <span title="${esc(o.mission.slice(0, 600))}">mission: ${esc(clip(o.mission, 90))}</span>
 </header>
 <main>
 ${mdToHtml(o.markdown)}

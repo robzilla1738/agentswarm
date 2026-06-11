@@ -173,3 +173,42 @@ test("crossrefSearch parses works JSON", async () => {
   assert.equal(out[0].date, "2024-6");
   assert.equal(out[0].snippet, "Journal of AI");
 });
+
+test("one engine answering empty while another fails is 'no results', not an error", async () => {
+  _resetEngineCooldowns();
+  // DDG answers cleanly with zero parseable hits; Bing 500s. A worker must
+  // see an empty result set, not a thrown engine error. ("cats" cannot be
+  // reformulated further, so this is the terminal path.)
+  const fc = stubFetch((url) => {
+    if (/bing\.com/.test(url)) return { status: 500, body: "oops" };
+    return { body: "<html><body>no results markup</body></html>" };
+  });
+  const out = await webSearch(cfgWith(), "cats", 5);
+  fc.restore();
+  assert.deepEqual(out, []);
+});
+
+test("tinyfish-only backend falls back to scraping engines when tinyfish fails", async () => {
+  _resetEngineCooldowns();
+  const ddgHit =
+    '<a class="result__a" href="https://example.com/cats">Cats</a>' +
+    '<a class="result__snippet" href="#">all about cats</a>';
+  const fc = stubFetch((url) => {
+    if (/tinyfish/.test(url)) return { status: 500, body: "outage" };
+    if (/duckduckgo/.test(url)) return { body: `<html><body>${ddgHit}</body></html>` };
+    return { body: "<html></html>" }; // bing: reachable, no hits
+  });
+  const warns = [];
+  const out = await webSearch(
+    cfgWith({ searchBackend: "tinyfish", tinyfishApiKey: "tk-1" }),
+    "cats",
+    5,
+    undefined,
+    false,
+    (m) => warns.push(m)
+  );
+  fc.restore();
+  assert.ok(out.length > 0, "fallback engines must supply results during a tinyfish outage");
+  assert.equal(out[0].url, "https://example.com/cats");
+  assert.ok(warns.some((w) => /tinyfish failed/.test(w)), "the fallback is surfaced as a warning");
+});

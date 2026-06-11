@@ -105,3 +105,26 @@ test("notes are retained with keys", () => {
   assert.equal(s.notes.length, 1);
   assert.equal(s.notes[0].key, "finding");
 });
+
+test("team note.added lands on the root blackboard (resume must keep team decisions)", () => {
+  const s = new RunState();
+  s.apply(ev("note.added", { teamId: "T9", taskId: "T2", kind: "decision", text: "team picked sqlite" }));
+  assert.equal(s.notes.length, 1, "team notes are swarm-wide facts");
+  assert.equal(s.notes[0].teamId, "T9", "teamId survives so claim owners stay namespaced");
+  assert.equal(s.notes[0].text, "team picked sqlite");
+  // The team sub-state keeps its own copy for the team detail view.
+  assert.equal(s.teams.get("T9").notes.length, 1);
+  // Team tasks still stay off the root board.
+  s.apply(ev("task.created", { teamId: "T9", task: task("T1") }));
+  assert.equal(s.tasks.size, 0);
+});
+
+test("team usage events never overwrite the run's cumulative cost", () => {
+  const s = new RunState({ m1: { inMiss: 1, inHit: 0.1, out: 2 } });
+  const usage = { promptTokens: 1000000, completionTokens: 0, cacheHitTokens: 0, cacheMissTokens: 1000000 };
+  s.apply(ev("usage", { model: "m1", usage, cost: 1.0 }));
+  const before = s.cost;
+  // Child executor's own cumulative cost (tiny) rides on the event.
+  s.apply(ev("usage", { teamId: "T9", model: "m1", usage, cost: 0.01 }));
+  assert.ok(s.cost > before, `team usage must accrue (got ${s.cost} after ${before})`);
+});

@@ -47,13 +47,16 @@ function project(s: ClientState): LiveRun {
     tasks,
     agents,
     activeAgents: agents.filter((a) => a.status === "running"),
-    notes: s.notes,
-    conductorLog: s.conductorLog,
-    operatorNotes: s.operatorNotes,
-    activity: s.activity,
+    // The reducer mutates its arrays in place; hand out fresh references so
+    // downstream useMemo/useEffect deps actually invalidate (a frozen
+    // identity here freezes every memoized view built on it).
+    notes: s.notes.slice(),
+    conductorLog: s.conductorLog.slice(),
+    operatorNotes: s.operatorNotes.slice(),
+    activity: s.activity.slice(),
     usage: s.usage,
     cost: s.cost,
-    budgetSeries: s.budgetSeries,
+    budgetSeries: s.budgetSeries.slice(),
     planUpdatedAt: s.planUpdatedAt,
     finalSummary: s.finalSummary,
     finalReportPath: s.finalReportPath,

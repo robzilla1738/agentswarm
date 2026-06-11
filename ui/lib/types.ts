@@ -68,6 +68,8 @@ export interface AgentView {
 export interface BlackboardNote {
   t: number;
   taskId?: string;
+  /** Set when a team agent posted it — task ids only disambiguate per team. */
+  teamId?: string;
   agentId?: string;
   key?: string;
   /** finding | decision | conflict | open-question | handoff | claim */

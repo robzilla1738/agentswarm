@@ -98,18 +98,10 @@ export async function runAgent(p: AgentParams): Promise<AgentOutcome> {
     stopReason = p.stop?.() ?? null;
     if (stopReason) break;
     steps++;
-    let res: ChatResult;
-    try {
-      res = await callModel();
-    } catch (e) {
-      // The chat client already retries 429/5xx; this catches the rest of the
-      // transient class (connection resets, DNS blips) once per step so a
-      // single network hiccup doesn't burn a whole task attempt.
-      if (p.signal.aborted) throw e;
-      hooks.onLog?.("warn", `${p.agentId}: model call failed (${errMsg(e)}); retrying once`);
-      await new Promise((r) => setTimeout(r, 1500));
-      res = await callModel();
-    }
+    // No retry here: the chat client already retries the whole transient
+    // class (429/5xx/network) with backoff; anything that escapes it is
+    // permanent (4xx) and re-sending only doubles the doomed spend.
+    const res: ChatResult = await callModel();
     hooks.onUsage?.(p.model, res.usage);
     usage = addUsage(usage, res.usage);
 

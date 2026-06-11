@@ -1,5 +1,5 @@
 import { SwarmConfig } from "./config";
-import { truncateMiddle } from "./util";
+import { mergeSignal, sleep, truncateMiddle } from "./util";
 
 /**
  * Pluggable crawl/scrape backends (Firecrawl, context.dev, or a custom
@@ -264,12 +264,6 @@ function friendlyHttpError(service: string, status: number, body: string): Error
   return new Error(`${service}: HTTP ${status} ${truncateMiddle(body, 300, "chars")}`);
 }
 
-function mergeSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
-  const t = AbortSignal.timeout(timeoutMs);
-  if (!signal) return t;
-  return typeof AbortSignal.any === "function" ? AbortSignal.any([t, signal]) : signal;
-}
-
 async function callJson(
   service: string,
   url: string,
@@ -295,18 +289,4 @@ async function getJson(service: string, url: string, key: string, signal?: Abort
   });
   if (!res.ok) throw friendlyHttpError(service, res.status, await res.text().catch(() => ""));
   return res.json();
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const t = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(t);
-      reject(new Error("aborted"));
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
 }

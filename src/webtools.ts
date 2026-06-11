@@ -14,7 +14,7 @@ import {
   scorePage,
   selectPassages,
 } from "./searchcore";
-import { decodeEntities, htmlToText, oneLine, truncateMiddle } from "./util";
+import { decodeEntities, errMsg, htmlToText, mergeSignal, oneLine, truncateMiddle } from "./util";
 
 export interface SearchHit {
   title: string;
@@ -57,15 +57,24 @@ export async function webSearch(
   const queries = deep ? expandQueries(query) : [query];
   const perEngine = Math.min(count, 15);
 
+  const engines = searchEngines(cfg);
   const engineCalls: Promise<Candidate[]>[] = [];
   for (const q of queries) {
-    if (cfg.searchBackend === "tinyfish" && cfg.tinyfishApiKey) {
-      engineCalls.push(tinyfishSearch(cfg, q, perEngine, signal));
-    } else {
-      engineCalls.push(ddgSearch(q, perEngine, signal), bingSearch(q, perEngine, signal));
-      if (cfg.searchBackend === "auto" && cfg.tinyfishApiKey) {
-        engineCalls.push(tinyfishSearch(cfg, q, perEngine, signal));
+    for (const e of engines) {
+      let call = e.search(q, perEngine, signal);
+      // When TinyFish is the sole engine by configuration, an outage must not
+      // blank web research for the whole mission — fall back to the free
+      // scraping engines for this call.
+      if (engines.length === 1 && e.name === "tinyfish") {
+        call = call.catch(async (err) => {
+          warn?.(`tinyfish failed (${errMsg(err)}); falling back to duckduckgo/bing`);
+          const fallback = await Promise.allSettled([ddgSearch(q, perEngine, signal), bingSearch(q, perEngine, signal)]);
+          const hits = fallback.flatMap((s) => (s.status === "fulfilled" ? s.value : []));
+          if (!hits.length && fallback.every((s) => s.status === "rejected")) throw err;
+          return hits;
+        });
       }
+      engineCalls.push(call);
     }
   }
   // Scholarly questions also sweep the keyless academic APIs (deep mode only).
@@ -87,7 +96,9 @@ export async function webSearch(
         return webSearch(cfg, alt, count, signal, deep, warn, true);
       }
     }
-    if (firstErr) throw firstErr.reason;
+    // At least one engine answered with a genuine empty result set: that is
+    // "no results", not an error, even if another engine failed alongside it.
+    if (firstErr) warn?.(`no results (and ${errMsg(firstErr.reason)})`);
     return [];
   }
   const failures = settled.filter((s) => s.status === "rejected").length;
@@ -178,13 +189,31 @@ function clip(text: string): string {
   return words.slice(0, 3000).join(" ");
 }
 
-function mergeSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
-  const t = AbortSignal.timeout(timeoutMs);
-  if (!signal) return t;
-  return typeof AbortSignal.any === "function" ? AbortSignal.any([t, signal]) : signal;
+// ---------------------------------------------------------------- engines
+
+export interface SearchEngine {
+  name: string;
+  search: (query: string, count: number, signal?: AbortSignal) => Promise<Candidate[]>;
 }
 
-// ---------------------------------------------------------------- engines
+/**
+ * The engine set a web_search call fans out to under the given config —
+ * the single source of truth shared by webSearch and the settings
+ * diagnostics endpoint, so "Test search" probes exactly what runs use.
+ */
+export function searchEngines(cfg: SwarmConfig): SearchEngine[] {
+  if (cfg.searchBackend === "tinyfish" && cfg.tinyfishApiKey) {
+    return [{ name: "tinyfish", search: (q, n, s) => tinyfishSearch(cfg, q, n, s) }];
+  }
+  const engines: SearchEngine[] = [
+    { name: "duckduckgo", search: ddgSearch },
+    { name: "bing", search: bingSearch },
+  ];
+  if (cfg.searchBackend === "auto" && cfg.tinyfishApiKey) {
+    engines.push({ name: "tinyfish", search: (q, n, s) => tinyfishSearch(cfg, q, n, s) });
+  }
+  return engines;
+}
 
 /**
  * Per-engine rate-limit cooldowns: an engine that answers 429/403/503 sits

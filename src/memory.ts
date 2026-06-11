@@ -1,8 +1,7 @@
 import * as crypto from "crypto";
-import * as fs from "fs";
 import * as path from "path";
 import { home } from "./config";
-import { clip, oneLine, writeJson } from "./util";
+import { clip, oneLine, readJson, writeJson } from "./util";
 
 /**
  * Cheap cross-run memory: a JSON file per workspace directory holding the last
@@ -29,12 +28,21 @@ export function memoryFile(cwd: string): string {
 }
 
 export function loadMemory(cwd: string): RunMemoryEntry[] {
-  try {
-    const raw = JSON.parse(fs.readFileSync(memoryFile(cwd), "utf8"));
-    return Array.isArray(raw?.entries) ? (raw.entries as RunMemoryEntry[]) : [];
-  } catch {
-    return [];
-  }
+  const raw = readJson<{ entries?: unknown }>(memoryFile(cwd), {});
+  if (!Array.isArray(raw.entries)) return [];
+  // Memory is best-effort and the file is user-editable: one malformed entry
+  // must degrade to "forgotten", never crash a run at startup.
+  return raw.entries.filter(
+    (e): e is RunMemoryEntry =>
+      !!e &&
+      typeof e === "object" &&
+      typeof (e as RunMemoryEntry).mission === "string" &&
+      typeof (e as RunMemoryEntry).summary === "string" &&
+      typeof (e as RunMemoryEntry).status === "string" &&
+      Number.isFinite((e as RunMemoryEntry).finishedAt) &&
+      Array.isArray((e as RunMemoryEntry).keyDecisions) &&
+      (e as RunMemoryEntry).keyDecisions.every((d) => typeof d === "string")
+  );
 }
 
 export function appendMemory(cwd: string, entry: RunMemoryEntry): void {

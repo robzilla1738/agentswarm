@@ -122,3 +122,50 @@ test("DEFAULT_WINDOWS ships entries for the default models", () => {
   assert.ok(DEFAULT_WINDOWS["deepseek-v4-flash"] >= 100_000);
   assert.ok(DEFAULT_WINDOWS["claude-sonnet-4-6"] >= 100_000);
 });
+
+test("clearing model falls back to the provider default instead of bricking runs", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-cfg-"));
+  const prevHome = process.env.AGENTSWARM_HOME;
+  try {
+    const { saveConfig, loadConfig } = freshConfig(home);
+    // What `swarm config unset model` used to write — and what a hand-edit can still produce.
+    saveConfig({ model: "", conductorModel: "" });
+    const cfg = loadConfig();
+    assert.ok(cfg.model, "model:\"\" must not survive loadConfig");
+    assert.equal(cfg.conductorModel, cfg.model);
+  } finally {
+    if (prevHome === undefined) delete process.env.AGENTSWARM_HOME;
+    else process.env.AGENTSWARM_HOME = prevHome;
+  }
+});
+
+test("saveConfig drops keys patched to undefined so defaults re-apply", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-cfg-"));
+  const prevHome = process.env.AGENTSWARM_HOME;
+  try {
+    const { saveConfig, loadConfig, DEFAULTS } = freshConfig(home);
+    saveConfig({ maxWorkers: 99 });
+    assert.equal(loadConfig().maxWorkers, 99);
+    saveConfig({ maxWorkers: undefined }); // `swarm config unset maxWorkers`
+    assert.equal(loadConfig().maxWorkers, DEFAULTS.maxWorkers);
+  } finally {
+    if (prevHome === undefined) delete process.env.AGENTSWARM_HOME;
+    else process.env.AGENTSWARM_HOME = prevHome;
+  }
+});
+
+test("isSecretConfigKey covers nested provider creds", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-cfg-"));
+  const prevHome = process.env.AGENTSWARM_HOME;
+  try {
+    const { isSecretConfigKey } = freshConfig(home);
+    assert.ok(isSecretConfigKey("apiKey"));
+    assert.ok(isSecretConfigKey("tinyfishApiKey"));
+    assert.ok(isSecretConfigKey("modalTokenSecret"));
+    assert.ok(isSecretConfigKey("providers"), "providers holds raw per-provider apiKeys");
+    assert.ok(!isSecretConfigKey("model"));
+  } finally {
+    if (prevHome === undefined) delete process.env.AGENTSWARM_HOME;
+    else process.env.AGENTSWARM_HOME = prevHome;
+  }
+});
