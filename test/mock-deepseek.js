@@ -174,6 +174,20 @@ const server = http.createServer((req, res) => {
         }
         return sse(res, [...toolChunks("wait", { reason: "waiting" })]);
       }
+      if (SCENARIO === "citations") {
+        if (update.includes("No tasks exist yet")) {
+          return sse(res, [...toolChunks("spawn_tasks", {
+            tasks: [
+              { title: "Scout alpha", objective: "CITE-A: research alpha. Done when sourced.", role: "researcher" },
+              { title: "Scout beta", objective: "CITE-B: research beta. Done when sourced.", role: "researcher" },
+            ],
+          })]);
+        }
+        if (/T1 \[done/.test(update) && /T2 \[done/.test(update)) {
+          return sse(res, [...toolChunks("finish", { notes: "Cite the sources." })]);
+        }
+        return sse(res, [...toolChunks("wait", { reason: "scouts in flight" })]);
+      }
       if (update.includes("No tasks exist yet")) {
         if (SCENARIO === "verify-retry") {
           return sse(res, [
@@ -271,6 +285,20 @@ const server = http.createServer((req, res) => {
 
     // Synthesizer
     if (names.has("submit_final")) {
+      if (SCENARIO === "citations") {
+        // Cite only if the engine actually threaded the numbered source list
+        // (with both deduped URLs) into the synthesizer's prompt.
+        const threaded =
+          /SOURCES \(numbered/.test(sysContent) &&
+          /example\.com\/alpha/.test(sysContent) &&
+          /beta\.org\/report/.test(sysContent);
+        return sse(res, [...toolChunks("submit_final", {
+          report_markdown: threaded
+            ? "# Research Report\n\n**Outcome** — Success. Alpha is fast [1]; beta disagrees on throughput [2].\n\n## Sources\n1. [Alpha Primer](https://example.com/alpha)\n2. [Beta Report](https://beta.org/report)\n"
+            : "# Research Report\n\nNO-SOURCES-IN-PROMPT\n",
+          summary: "Synthesized with citations.",
+        })]);
+      }
       return sse(res, [
         textChunk("Composing final report."),
         ...toolChunks("submit_final", {
@@ -327,6 +355,31 @@ const server = http.createServer((req, res) => {
         return sse(res, [...toolChunks("report", {
           status: "done",
           report: "saw-structured-feedback: added the Sources section exactly as the issue's fix instructed.",
+        })]);
+      }
+      if (SCENARIO === "citations" && /CITE-A/.test(system)) {
+        if (!hasToolResult(messages)) {
+          // Post a sourced note first — exercises note(url=...).
+          return sse(res, [...toolChunks("note", {
+            text: "alpha handles 10k rps",
+            key: "alpha-perf",
+            url: "https://example.com/alpha",
+          })]);
+        }
+        return sse(res, [...toolChunks("report", {
+          status: "done",
+          report: "Alpha researched: it is fast (10k rps per the primer).",
+          sources: [{ url: "https://example.com/alpha?utm_source=tracker", title: "Alpha Primer", note: "performance numbers" }],
+        })]);
+      }
+      if (SCENARIO === "citations" && /CITE-B/.test(system)) {
+        return sse(res, [...toolChunks("report", {
+          status: "done",
+          report: "Beta researched: throughput claims conflict with alpha's primer.",
+          sources: [
+            { url: "https://example.com/alpha", title: "Alpha Primer" },
+            { url: "https://beta.org/report", title: "Beta Report", date: "2026-01-15", note: "throughput counterclaim" },
+          ],
         })]);
       }
       if (SCENARIO === "dep-chain" && /ROOTFAIL/.test(system)) {

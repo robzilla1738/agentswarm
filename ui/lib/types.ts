@@ -41,6 +41,7 @@ export interface Task {
   keyFacts?: string[];
   openQuestions?: string[];
   filesTouched?: string[];
+  sources?: { url: string; title?: string; date?: string; note?: string }[];
   modelTier?: "cheap" | "default" | "strong";
   team?: boolean;
   createdAt: number;
@@ -69,9 +70,11 @@ export interface BlackboardNote {
   taskId?: string;
   agentId?: string;
   key?: string;
-  /** finding | decision | open-question | handoff | claim */
+  /** finding | decision | conflict | open-question | handoff | claim */
   kind?: string;
   text: string;
+  /** Source URL backing the note, when it came from the web. */
+  url?: string;
 }
 
 export interface ConductorSay {

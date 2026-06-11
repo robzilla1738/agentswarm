@@ -110,6 +110,13 @@ export function taskTable(tasks: Task[]): string {
   return out.join("\n");
 }
 
+function sourcesLine(t: Task, max = 6): string {
+  if (!t.sources?.length) return "";
+  const shown = t.sources.slice(0, max).map((s) => s.url);
+  const more = t.sources.length > max ? ` (+${t.sources.length - max} more)` : "";
+  return `\nsources: ${shown.join(" · ")}${more}`;
+}
+
 export function reportBlock(t: Task): string {
   const head = `── ${t.id} (${t.role}) "${clip(t.title, 60)}" → ${t.status.toUpperCase()}${t.attempt > 1 ? ` (attempt ${t.attempt})` : ""}`;
   const body = t.report ? clip(t.report, 1600) : t.error ? `error: ${clip(t.error, 400)}` : "(no report)";
@@ -118,7 +125,7 @@ export function reportBlock(t: Task): string {
   const files = t.filesTouched?.length ? `\nfiles touched: ${t.filesTouched.join(", ")}` : "";
   const arts = t.artifacts.length ? `\nartifacts: ${t.artifacts.join(", ")}` : "";
   const fb = t.feedback ? `\nverifier: ${clip(t.feedback, 300)}` : "";
-  return `${head}\n${body}${facts}${open}${files}${arts}${fb}`;
+  return `${head}\n${body}${facts}${open}${files}${arts}${sourcesLine(t)}${fb}`;
 }
 
 /**
@@ -133,14 +140,15 @@ export function depReportBlock(t: Task): string {
   const arts = t.artifacts.length ? `\nartifacts: ${t.artifacts.join(", ")}` : "";
   const full = (t.report ?? "").length > 1200 ? `\n(excerpt — full text: read_report("${t.id}"))` : "";
   const body = t.report ? clip(t.report, 1200) : t.error ? `error: ${clip(t.error, 400)}` : "(no report)";
-  return `${head}\n${body}${facts}${files}${arts}${full}`;
+  return `${head}\n${body}${facts}${files}${arts}${sourcesLine(t)}${full}`;
 }
 
 // ============================================================ workers
 
 const ROLE_HINTS: Record<string, string> = {
   researcher:
-    "Research craft: be exhaustive. Run deep web_search (deep=true, high count) across several distinct phrasings — pull DOZENS of sources for your sub-question, not three. Triangulate across independent sources; prefer primary docs and official sources over blog spam; capture exact figures, dates, and URLs, and keep the quotable passages the search returns. Record key findings as blackboard notes (with the source URL) and save a structured markdown file of your sources+findings as an artifact so the synthesizer can build on it. " +
+    "Research craft: be exhaustive. Run deep web_search (deep=true, high count) across several distinct phrasings — pull DOZENS of sources for your sub-question, not three. Triangulate across independent sources; prefer primary docs and official sources over blog spam; capture exact figures, dates, and URLs, and keep the quotable passages the search returns. Record key findings as blackboard notes (with url=<source>) and save a structured markdown file of your sources+findings as an artifact so the synthesizer can build on it. " +
+    "A finding without a source is an opinion: list EVERY source your findings rest on in report(...)'s `sources` field (url + what it supports) — only sources reported there can be cited in the final deliverable. When independent sources disagree on a material fact, post note(kind:'conflict') naming both sources and the discrepancy — never silently pick one. " +
     "If a crawl_site tool is available, use it to ingest whole documentation sites or multi-page sources into local markdown files, then read the saved files — far cheaper and broader than fetching pages one by one.",
   coder:
     "Engineering craft: read existing code before changing it; match its conventions; build/run/test after every meaningful change and include the command + result in your report. Leave the tree compiling.",
@@ -202,7 +210,7 @@ OPERATING PROTOCOL
 - Genuinely impossible / missing prerequisite → report(status:"blocked", …) early instead of thrashing.
 - You have at most ${opts.maxSteps} tool steps. Budget them.
 - Dependency reports above are excerpts; use read_report(task_id) for full text, and search_notes(query) to find facts posted earlier in the run.
-- ALWAYS end by calling report(...). The conductor sees ONLY that report — it is the entire value of your work. Specific beats vague: what you did, what you verified, key findings, exact paths. Fill key_facts (standalone facts downstream tasks need), open_questions, and files_touched — they are handed verbatim to dependent tasks.
+- ALWAYS end by calling report(...). The conductor sees ONLY that report — it is the entire value of your work. Specific beats vague: what you did, what you verified, key findings, exact paths. Fill key_facts (standalone facts downstream tasks need), open_questions, and files_touched — they are handed verbatim to dependent tasks. If your work drew on the web, fill sources (url + what it supports): only sources reported there can be cited in the final deliverable.
 ${roleHint ? "\n" + roleHint : ""}`;
 }
 
@@ -256,6 +264,7 @@ export function synthSystem(opts: {
   blackboard: string;
   artifactList: string;
   reason: string;
+  sources?: string;
 }): string {
   return `You are the synthesis agent for a completed agent-swarm run. Compose the definitive final deliverable for the operator.
 
@@ -268,13 +277,13 @@ Conductor's closing notes: ${opts.finishNotes || "(none)"}
 ALL TASK REPORTS
 ${opts.reports}
 
-${opts.blackboard ? `BLACKBOARD\n${opts.blackboard}\n` : ""}${opts.artifactList ? `ARTIFACTS ON DISK\n${opts.artifactList}\n` : ""}
+${opts.sources ? `SOURCES (numbered, deduplicated from the task reports — the only sources that exist)\n${opts.sources}\n\n` : ""}${opts.blackboard ? `BLACKBOARD\n${opts.blackboard}\n` : ""}${opts.artifactList ? `ARTIFACTS ON DISK\n${opts.artifactList}\n` : ""}
 Working directory: ${opts.meta.cwd}
 
 PROTOCOL
 - You may read files (read_file / list_dir) to confirm specifics before writing — verify key claims you repeat.
 - The mission's PRIMARY deliverable should exist in the format that serves it best, not only as prose. If the task reports produced data, comparisons, or rankings that the artifacts don't already capture in a structured form, save them now with save_artifact (e.g. data/results.csv, data/findings.json) before submitting. Don't duplicate artifacts that already exist — point to them.
-- Then call submit_final with:
+${opts.sources ? `- CITE YOUR SOURCES: where a claim rests on a numbered source, cite it inline as [n]. End report_markdown with a \`## Sources\` section listing each number you actually cited as a markdown link ([n] [title](url)). Never invent a source or cite a number not in the list. Where sources conflict, present both positions with their citations — do not silently pick one.\n` : ""}- Then call submit_final with:
   • report_markdown — the deliverable document. Structure: # title; **Outcome** first (did the mission succeed, headline results); then What was built/found with evidence and exact paths; How to use/run it (if applicable); Open issues & recommended next steps. Write for the operator: complete, concrete, zero filler. Use real markdown tables for tabular findings. (A styled HTML rendering is generated automatically — do not hand-write one.)
   • summary — ≤8 sentences for the console.
 - The report stands alone: a reader who saw nothing else must understand what happened and where everything is.`;
@@ -299,7 +308,7 @@ ${reports}
 Reply with EXACTLY "COMPLETE" if the mission's requirements are genuinely covered. Otherwise reply with a short numbered list of concrete gaps (max 5), each one actionable enough to become a task. Do not invent nice-to-haves — only true gaps against the stated mission.`;
 }
 
-export function synthCheckPrompt(mission: string, reports: string, finalReport: string): string {
+export function synthCheckPrompt(mission: string, reports: string, finalReport: string, sources?: string): string {
   return `You are checking a final mission report for faithfulness before delivery. Compare it against the underlying task reports.
 
 MISSION
@@ -308,10 +317,10 @@ ${mission}
 TASK REPORTS (ground truth)
 ${reports}
 
-FINAL REPORT (to check)
+${sources ? `SOURCE LIST (the only citable sources)\n${sources}\n\n` : ""}FINAL REPORT (to check)
 ${finalReport}
 
-Reply with EXACTLY "OK" if the final report's claims are supported by the task reports and nothing material is misrepresented or fabricated. Otherwise list the specific discrepancies (max 5), each citing what the final report says vs what the task reports support.`;
+Reply with EXACTLY "OK" if the final report's claims are supported by the task reports and nothing material is misrepresented or fabricated${sources ? ", its inline [n] citations all reference numbers that exist in the source list, and no key web-derived factual claim is left uncited" : ""}. Otherwise list the specific discrepancies (max 5), each citing what the final report says vs what the task reports support.`;
 }
 
 // ============================================================ compaction

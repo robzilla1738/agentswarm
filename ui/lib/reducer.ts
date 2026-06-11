@@ -160,6 +160,7 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
         if (Array.isArray(ev.keyFacts)) t.keyFacts = ev.keyFacts as string[];
         if (Array.isArray(ev.openQuestions)) t.openQuestions = ev.openQuestions as string[];
         if (Array.isArray(ev.filesTouched)) t.filesTouched = ev.filesTouched as string[];
+        if (Array.isArray(ev.sources)) t.sources = ev.sources as Task["sources"];
         s.tasks.set(t.id, { ...t });
         pushActivity(s, {
           id: `r${ev.seq}`, t: ev.t, agentId: "", taskId: t.id, kind: "report",
@@ -253,6 +254,7 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
       const note: BlackboardNote = {
         t: ev.t, taskId: ev.taskId as string | undefined, agentId: ev.agentId as string | undefined,
         key: ev.key as string | undefined, kind: ev.kind as string | undefined, text: ev.text as string,
+        url: typeof ev.url === "string" ? ev.url : undefined,
       };
       s.notes.push(note);
       if (s.notes.length > 500) s.notes.splice(0, s.notes.length - 500);

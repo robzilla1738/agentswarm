@@ -82,3 +82,40 @@ test("renderFinalHtml falls back to the mission as title", () => {
   assert.match(doc, /<title>Research X<\/title>/);
   assert.match(doc, /class="badge failed"/);
 });
+
+// ---------- source aggregation (citation pipeline) ----------
+
+const { aggregateSources, sourcesBlock } = require("../../dist/report.js");
+
+function taskWith(id, sources) {
+  return { id, title: id, objective: "", role: "researcher", deps: [], verify: false,
+    status: "done", attempt: 1, wave: 1, artifacts: [], createdAt: 0, agentIds: [], sources };
+}
+
+test("aggregateSources dedupes by canonical URL and merges metadata", () => {
+  const out = aggregateSources([
+    taskWith("T1", [{ url: "https://www.example.com/alpha/?utm_source=x", note: "perf" }]),
+    taskWith("T2", [
+      { url: "https://example.com/alpha", title: "Alpha Primer" },
+      { url: "https://beta.org/report", title: "Beta", date: "2026-01" },
+    ]),
+  ]);
+  assert.equal(out.length, 2);
+  assert.equal(out[0].n, 1);
+  assert.deepEqual(out[0].taskIds, ["T1", "T2"]);
+  assert.equal(out[0].title, "Alpha Primer"); // filled in by the later task
+  assert.equal(out[0].note, "perf"); // first occurrence kept
+  assert.equal(out[1].n, 2);
+  assert.deepEqual(out[1].taskIds, ["T2"]);
+});
+
+test("aggregateSources handles tasks without sources", () => {
+  assert.deepEqual(aggregateSources([taskWith("T1", undefined), taskWith("T2", [])]), []);
+});
+
+test("sourcesBlock renders numbered, attributed lines", () => {
+  const block = sourcesBlock(aggregateSources([
+    taskWith("T1", [{ url: "https://a.com/x", title: "A", date: "2026" }]),
+  ]));
+  assert.match(block, /^\[1\] A — https:\/\/a\.com\/x \(2026\) \[cited by T1\]$/);
+});

@@ -38,7 +38,7 @@ import {
   WORKER_KICKOFF,
 } from "./prompts";
 import { appendMemory, memoryBlock } from "./memory";
-import { renderFinalHtml } from "./report";
+import { aggregateSources, renderFinalHtml, sourcesBlock } from "./report";
 import { SandboxRuntime, createSandbox } from "./sandbox";
 import { RunState } from "./state";
 import { RunMeta, RunStatus, Task, TaskSpec, Usage, usageCost } from "./types";
@@ -58,7 +58,7 @@ export interface ExecutorOptions {
   /** Parent's abort signal (team cancellation). */
   parentSignal?: AbortSignal;
   /** Share the parent's blackboard. */
-  sharedNotes?: { taskId?: string; key?: string; kind?: string; text: string }[];
+  sharedNotes?: { taskId?: string; key?: string; kind?: string; text: string; url?: string }[];
   /** Team mode: write into the parent's run directory (artifacts, control). */
   runDirPath?: string;
 }
@@ -76,7 +76,7 @@ export class Executor {
   private taskCounter = 0;
   private inflight = new Map<string, Promise<void>>();
   private settledSinceUpdate: string[] = [];
-  private notes: { taskId?: string; key?: string; kind?: string; text: string }[] = [];
+  private notes: { taskId?: string; key?: string; kind?: string; text: string; url?: string }[] = [];
   private phase: { name: string; goal?: string; exitCriteria?: string } | null = null;
 
   private conductorMessages: ChatMsg[] = [];
@@ -157,7 +157,7 @@ export class Executor {
       state.taskList().filter((t) => ["done", "failed", "blocked"].includes(t.status) && !reset.has(t.id)).map((t) => t.id)
     );
     this.notes = state.notes
-      .map((n) => ({ taskId: n.taskId, key: n.key, kind: n.kind, text: n.text }))
+      .map((n) => ({ taskId: n.taskId, key: n.key, kind: n.kind, text: n.text, url: n.url }))
       .filter((n) => !(n.kind === "claim" && n.taskId && settled.has(n.taskId)));
     const lastPhase = state.phases[state.phases.length - 1];
     if (lastPhase) this.phase = { name: lastPhase.name, goal: lastPhase.goal, exitCriteria: lastPhase.exitCriteria };
@@ -208,15 +208,15 @@ export class Executor {
   private blackboardDigest(max = 1800): string {
     if (!this.notes.length) return "";
     const fmt = (n: (typeof this.notes)[number]) =>
-      `• ${n.kind && n.kind !== "finding" ? `[${n.kind}] ` : ""}${n.key ? `[${n.key}] ` : ""}${oneLine(n.text, 160)}${n.taskId ? ` (${n.taskId})` : ""}`;
-    // Decisions anchor mission-wide coherence and are never trimmed out of the
-    // digest; everything else shows only its recent tail.
-    const decisions = this.notes.filter((n) => n.kind === "decision").map(fmt);
-    const rest = this.notes.filter((n) => n.kind !== "decision").slice(-80).map(fmt);
+      `• ${n.kind && n.kind !== "finding" ? `[${n.kind}] ` : ""}${n.key ? `[${n.key}] ` : ""}${oneLine(n.text, 160)}${n.url ? ` <${n.url}>` : ""}${n.taskId ? ` (${n.taskId})` : ""}`;
+    // Decisions and conflicts anchor mission-wide coherence and are never
+    // trimmed out of the digest; everything else shows only its recent tail.
+    const pinned = this.notes.filter((n) => n.kind === "decision" || n.kind === "conflict").map(fmt);
+    const rest = this.notes.filter((n) => n.kind !== "decision" && n.kind !== "conflict").slice(-80).map(fmt);
     let tail = rest.join("\n");
-    const budget = Math.max(400, max - decisions.join("\n").length);
+    const budget = Math.max(400, max - pinned.join("\n").length);
     if (tail.length > budget) tail = tail.slice(tail.length - budget);
-    return [decisions.join("\n"), tail].filter(Boolean).join("\n");
+    return [pinned.join("\n"), tail].filter(Boolean).join("\n");
   }
 
   private searchNotes(query: string): string {
@@ -1033,17 +1033,23 @@ export class Executor {
       taskId: task?.id,
       signal: this.ac.signal,
       addCheckpoint: task ? (summary) => this.recordCheckpoint(task, agentId, summary) : undefined,
-      addNote: (text, key, kind) => {
-        this.notes.push({ taskId: task?.id, key, kind, text });
+      addNote: (text, key, kind, url) => {
+        this.notes.push({ taskId: task?.id, key, kind, text, url });
         // Only the recent tail ever feeds digests; without a cap a multi-day
-        // run accumulates every note in memory. Decisions are kept regardless.
+        // run accumulates every note in memory. Decisions and conflicts are
+        // kept regardless. In-place splice: teams share this array by reference.
         if (this.notes.length > 4000) {
-          const decisions = this.notes.filter((n) => n.kind === "decision");
-          const rest = this.notes.filter((n) => n.kind !== "decision");
-          rest.splice(0, rest.length - Math.max(0, 4000 - decisions.length));
-          this.notes = [...decisions, ...rest];
+          const keep = (n: (typeof this.notes)[number]) => n.kind === "decision" || n.kind === "conflict";
+          const pinnedCount = this.notes.filter(keep).length;
+          let toDrop = this.notes.length - Math.max(pinnedCount, 4000);
+          for (let i = 0; i < this.notes.length && toDrop > 0; ) {
+            if (!keep(this.notes[i])) {
+              this.notes.splice(i, 1);
+              toDrop--;
+            } else i++;
+          }
         }
-        this.journal.append("note.added", { taskId: task?.id, agentId, key, kind, text: clip(text, 1200) });
+        this.journal.append("note.added", { taskId: task?.id, agentId, key, kind, url, text: clip(text, 1200) });
       },
       searchNotes: (q) => this.searchNotes(q),
       readReport: (taskId) => this.readReportText(taskId),
@@ -1213,6 +1219,7 @@ export class Executor {
       key_facts?: string[];
       open_questions?: string[];
       files_touched?: string[];
+      sources?: unknown;
     };
     const report = String(a.report ?? "(empty report)");
     const reportStatus: "done" | "blocked" = a.status === "blocked" ? "blocked" : "done";
@@ -1225,6 +1232,20 @@ export class Executor {
     task.keyFacts = strList(a.key_facts, 8);
     task.openQuestions = strList(a.open_questions, 6);
     task.filesTouched = strList(a.files_touched, 40);
+    // Structured sources: the citation pipeline's entry point. Only real
+    // http(s) URLs survive; they flow into dep handoffs and the bibliography.
+    const sources = Array.isArray(a.sources)
+      ? (a.sources as Record<string, unknown>[])
+          .filter((s) => s && typeof s === "object" && /^https?:\/\//.test(String(s.url ?? "")))
+          .slice(0, 40)
+          .map((s) => ({
+            url: clip(String(s.url), 500),
+            title: s.title ? clip(String(s.title), 200) : undefined,
+            date: s.date ? clip(String(s.date), 40) : undefined,
+            note: s.note ? clip(String(s.note), 300) : undefined,
+          }))
+      : [];
+    task.sources = sources.length ? sources : undefined;
     this.journal.append("task.report", {
       taskId: task.id,
       status: reportStatus,
@@ -1233,6 +1254,7 @@ export class Executor {
       keyFacts: task.keyFacts,
       openQuestions: task.openQuestions,
       filesTouched: task.filesTouched,
+      sources: task.sources,
     });
 
     if (reportStatus === "blocked") {
@@ -1667,6 +1689,10 @@ export class Executor {
       ? tasks.map(reportBlock).join("\n\n")
       : "(no tasks were completed)";
     const artifactList = this.listArtifacts().join("\n") || "(none)";
+    // The citation pipeline's last hop: every source any worker reported,
+    // deduplicated and numbered, becomes the synthesizer's bibliography.
+    const allSources = aggregateSources(tasks);
+    const sourcesText = allSources.length ? truncateMiddle(sourcesBlock(allSources), 40_000, "chars") : "";
     const agentId = rid("synth");
 
     let summary = "";
@@ -1685,6 +1711,7 @@ export class Executor {
           blackboard: this.blackboardDigest(6000),
           artifactList,
           reason: this.finishReason || "completed",
+          sources: sourcesText,
         }),
         kickoff: SYNTH_KICKOFF,
         tools: synthToolset(),
@@ -1713,7 +1740,8 @@ export class Executor {
                 content: synthCheckPrompt(
                   this.meta.mission,
                   truncateMiddle(reports, 60_000, "chars"),
-                  truncateMiddle(reportMarkdown, 60_000, "chars")
+                  truncateMiddle(reportMarkdown, 60_000, "chars"),
+                  sourcesText ? truncateMiddle(sourcesText, 20_000, "chars") : undefined
                 ),
               },
             ],
@@ -1775,11 +1803,22 @@ export class Executor {
 
   private fallbackReport(tasks: Task[]): string {
     const lines = [`# ${this.meta.mission}`, ``, `_Run ${this.meta.id} — ${this.finishReason}_`, ``];
+    // Even without a synthesizer, surface the cross-task essentials first.
+    const facts = tasks.flatMap((t) => (t.keyFacts ?? []).map((f) => `- ${f} _(${t.id})_`));
+    if (facts.length) lines.push(`## Key facts`, ...facts.slice(0, 60), "");
     for (const t of tasks) {
       lines.push(`## ${t.id} ${t.title} (${t.status})`);
       lines.push(t.report || t.error || "(no output)");
       if (t.artifacts.length) lines.push(`Artifacts: ${t.artifacts.join(", ")}`);
       lines.push("");
+    }
+    const sources = aggregateSources(tasks);
+    if (sources.length) {
+      lines.push(`## Sources`);
+      for (const s of sources.slice(0, 100)) {
+        lines.push(`${s.n}. [${s.title || s.url}](${s.url})${s.date ? ` (${s.date})` : ""}`);
+      }
+      if (sources.length > 100) lines.push(`…and ${sources.length - 100} more in the task reports.`);
     }
     return lines.join("\n");
   }

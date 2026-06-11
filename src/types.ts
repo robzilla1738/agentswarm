@@ -49,6 +49,16 @@ export interface RunMeta {
   options: RunOptions;
 }
 
+/** A web source a worker's findings rest on — flows into the final report's bibliography. */
+export interface SourceRef {
+  url: string;
+  title?: string;
+  /** Publication date if known (ISO or year). */
+  date?: string;
+  /** What this source supports. */
+  note?: string;
+}
+
 /** What the conductor submits via spawn_tasks. */
 export interface TaskSpec {
   title: string;
@@ -95,6 +105,8 @@ export interface Task {
   keyFacts?: string[];
   openQuestions?: string[];
   filesTouched?: string[];
+  /** Web sources the worker's findings rely on (report tool's `sources`). */
+  sources?: SourceRef[];
   createdAt: number;
   startedAt?: number;
   endedAt?: number;
@@ -146,15 +158,15 @@ export interface RunSummary {
  *  conductor.action{ kind, detail }               — spawn/wait/finish decision
  *  task.created    { task: Task }
  *  task.status     { taskId, status, attempt, reason? }
- *  task.report     { taskId, status, report, artifacts }
- *  verify.result   { taskId, pass, feedback }
+ *  task.report     { taskId, status, report, artifacts, keyFacts?, openQuestions?, filesTouched?, sources? }
+ *  verify.result   { taskId, pass, feedback, issues? }
  *  task.checkpoint { taskId, agentId, attempt, summary } — durable progress marker
  *  agent.spawned   { agentId, taskId, role, model, purpose }
  *  agent.done      { agentId, taskId, steps }
  *  agent.delta     { agentId, taskId, channel: "text"|"think", text }
  *  tool.call       { agentId, taskId, callId, name, args }
  *  tool.result     { agentId, taskId, callId, ok, summary }
- *  note.added      { taskId, agentId, key?, kind?, text }
+ *  note.added      { taskId, agentId, key?, kind?, url?, text }
  *  phase.set       { name, goal, exit_criteria }       — conductor milestone
  *  usage           { agentId, model, usage: Usage, cost }
  *  budget          { spentTokens, capTokens, cost }

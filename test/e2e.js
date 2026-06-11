@@ -871,6 +871,46 @@ async function phaseStrictVerify() {
   fs.rmSync(home, { recursive: true, force: true });
 }
 
+async function phaseCitations() {
+  console.log("\n▶ Phase 21: sources flow from workers to a cited final report");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "citations" });
+  ok(`mock model server on :${port} (citations script)`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const res = runMission(env, "Test: research alpha and beta with citations");
+  proc.kill();
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); fail(`swarm run exited ${res.status}`); }
+  const { runDir, evs } = soleRunEvents(home);
+  const byType = (t) => evs.filter((e) => e.type === t);
+
+  const t1report = byType("task.report").find((e) => e.taskId === "T1");
+  if (!Array.isArray(t1report.sources) || !/example\.com\/alpha/.test(String(t1report.sources[0]?.url))) {
+    fail("T1's report event should carry its structured sources");
+  }
+  ok("worker sources journaled on task.report");
+
+  if (!byType("note.added").some((e) => e.url === "https://example.com/alpha")) {
+    fail("note(url=...) should journal the source URL");
+  }
+  ok("blackboard notes carry source URLs");
+
+  const report = fs.readFileSync(path.join(runDir, "artifacts", "final-report.md"), "utf8");
+  if (/NO-SOURCES-IN-PROMPT/.test(report)) {
+    fail("the synthesizer never received the numbered, deduplicated source list");
+  }
+  if (!/## Sources/.test(report) || !/example\.com\/alpha/.test(report) || !/beta\.org\/report/.test(report)) {
+    fail("final report should end with a Sources section listing the cited URLs");
+  }
+  if (!/\[1\]/.test(report)) fail("final report should cite sources inline as [n]");
+  ok("final report cites inline and ships a Sources section");
+
+  if (byType("run.status").pop().status !== "done") fail("citations run did not end done");
+  ok("run finished with status=done");
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
 async function main() {
   await phaseHappy();
   await phaseAuthFail();
@@ -892,6 +932,7 @@ async function main() {
   await phaseDepChain();
   await phaseDiagnostics();
   await phaseStrictVerify();
+  await phaseCitations();
   console.log(
     "\n✅ E2E passed — pipeline, auth failure, resume (with ledger re-seed), budget cap, verify-retry, steering + cancel, compaction, hub API, checkpoint resume, conductor breaker, blind verification, SIGTERM safety, 429 limiter, model tiers, hierarchical teams, the living plan, cascade root causes, and failure diagnostics all work."
   );

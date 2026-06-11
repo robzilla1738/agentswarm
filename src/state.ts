@@ -31,9 +31,11 @@ export interface BlackboardNote {
   taskId?: string;
   agentId?: string;
   key?: string;
-  /** finding | decision | open-question | handoff (default finding) */
+  /** finding | decision | conflict | open-question | handoff | claim (default finding) */
   kind?: string;
   text: string;
+  /** Source URL backing the note, when it came from the web. */
+  url?: string;
 }
 
 export interface PhaseInfo {
@@ -163,6 +165,7 @@ export class RunState {
           if (Array.isArray(ev.keyFacts)) t.keyFacts = ev.keyFacts as string[];
           if (Array.isArray(ev.openQuestions)) t.openQuestions = ev.openQuestions as string[];
           if (Array.isArray(ev.filesTouched)) t.filesTouched = ev.filesTouched as string[];
+          if (Array.isArray(ev.sources)) t.sources = ev.sources as Task["sources"];
         }
         break;
       }
@@ -234,15 +237,17 @@ export class RunState {
           key: ev.key as string | undefined,
           kind: ev.kind as string | undefined,
           text: ev.text as string,
+          url: typeof ev.url === "string" ? ev.url : undefined,
         });
         // Reduced state is held live by the hub and the resume seed — keep
-        // only the tail that digests/views actually use. Decisions are never
-        // dropped: they anchor the conductor's long-horizon coherence.
+        // only the tail that digests/views actually use. Decisions and
+        // conflicts are never dropped: they anchor long-horizon coherence.
         if (this.notes.length > 1000) {
-          const decisions = this.notes.filter((n) => n.kind === "decision");
-          const rest = this.notes.filter((n) => n.kind !== "decision");
-          rest.splice(0, rest.length - Math.max(0, 1000 - decisions.length));
-          this.notes = [...decisions, ...rest].sort((a, b) => a.t - b.t);
+          const keep = (n: BlackboardNote) => n.kind === "decision" || n.kind === "conflict";
+          const pinned = this.notes.filter(keep);
+          const rest = this.notes.filter((n) => !keep(n));
+          rest.splice(0, rest.length - Math.max(0, 1000 - pinned.length));
+          this.notes = [...pinned, ...rest].sort((a, b) => a.t - b.t);
         }
         break;
       case "conductor.say":

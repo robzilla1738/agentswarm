@@ -10,6 +10,51 @@
  * broken markup.
  */
 
+import { canonicalizeUrl } from "./searchcore";
+import { SourceRef, Task } from "./types";
+
+// ---------- source aggregation (citation pipeline) ----------
+
+export interface NumberedSource extends SourceRef {
+  n: number;
+  /** Tasks whose reports cited this source. */
+  taskIds: string[];
+}
+
+/**
+ * Dedupe every task's reported sources (by canonical URL) into one numbered
+ * bibliography for the synthesizer. First occurrence wins the number; later
+ * tasks fill in missing titles/dates.
+ */
+export function aggregateSources(tasks: Task[]): NumberedSource[] {
+  const byKey = new Map<string, NumberedSource>();
+  for (const t of tasks) {
+    for (const s of t.sources ?? []) {
+      const key = canonicalizeUrl(s.url);
+      const cur = byKey.get(key);
+      if (cur) {
+        if (!cur.taskIds.includes(t.id)) cur.taskIds.push(t.id);
+        if (!cur.title && s.title) cur.title = s.title;
+        if (!cur.date && s.date) cur.date = s.date;
+        if (!cur.note && s.note) cur.note = s.note;
+      } else {
+        byKey.set(key, { ...s, n: byKey.size + 1, taskIds: [t.id] });
+      }
+    }
+  }
+  return [...byKey.values()];
+}
+
+/** Render the numbered source list for prompts (one line per source). */
+export function sourcesBlock(sources: NumberedSource[]): string {
+  return sources
+    .map(
+      (s) =>
+        `[${s.n}] ${s.title ? `${s.title} — ` : ""}${s.url}${s.date ? ` (${s.date})` : ""}${s.note ? ` — ${s.note}` : ""} [cited by ${s.taskIds.join(",")}]`
+    )
+    .join("\n");
+}
+
 function esc(s: string): string {
   return s
     .replace(/&/g, "&amp;")

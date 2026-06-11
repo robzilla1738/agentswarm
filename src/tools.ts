@@ -18,7 +18,7 @@ export interface ToolCtx {
   agentId: string;
   taskId?: string;
   signal: AbortSignal;
-  addNote: (text: string, key?: string, kind?: string) => void;
+  addNote: (text: string, key?: string, kind?: string, url?: string) => void;
   /** Keyword search over every blackboard note in the run (not just the digest tail). */
   searchNotes?: (query: string) => string;
   /** Full report text of a settled task (dep excerpts link here). */
@@ -330,7 +330,7 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
     schema: {
       name: "note",
       description:
-        "Post a durable fact/discovery to the swarm's shared blackboard so the conductor and other agents can see it. Use sparingly — facts other tasks need, not progress chatter. Mark kind='decision' for choices the rest of the mission must respect (these are never trimmed from digests).",
+        "Post a durable fact/discovery to the swarm's shared blackboard so the conductor and other agents can see it. Use sparingly — facts other tasks need, not progress chatter. Mark kind='decision' for choices the rest of the mission must respect, and kind='conflict' when independent sources disagree on a material fact (both are never trimmed from digests).",
       parameters: {
         type: "object",
         properties: {
@@ -338,18 +338,21 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
           key: { type: "string", description: "Optional short label" },
           kind: {
             type: "string",
-            enum: ["finding", "decision", "open-question", "handoff", "claim"],
-            description: "Category (default finding). kind='claim' with key=<file path> advertises you are editing that file",
+            enum: ["finding", "decision", "conflict", "open-question", "handoff", "claim"],
+            description:
+              "Category (default finding). kind='conflict' flags sources that disagree — name both. kind='claim' with key=<file path> advertises you are editing that file",
           },
+          url: { type: "string", description: "Source URL backing this note, when it came from the web" },
         },
         required: ["text"],
       },
     },
     run: async (args, ctx) => {
-      const kind = ["finding", "decision", "open-question", "handoff", "claim"].includes(String(args.kind))
+      const kind = ["finding", "decision", "conflict", "open-question", "handoff", "claim"].includes(String(args.kind))
         ? String(args.kind)
         : undefined;
-      ctx.addNote(String(args.text), args.key ? String(args.key) : undefined, kind);
+      const url = /^https?:\/\//.test(String(args.url ?? "")) ? String(args.url) : undefined;
+      ctx.addNote(String(args.text), args.key ? String(args.key) : undefined, kind, url);
       return "noted on the blackboard";
     },
   };
@@ -566,6 +569,21 @@ export const REPORT_TOOL: ToolSchema = {
         type: "array",
         items: { type: "string" },
         description: "Every file you created or modified (exact paths)",
+      },
+      sources: {
+        type: "array",
+        description:
+          "Web sources your findings rely on — REQUIRED whenever your work drew on the web. They flow into the final report's bibliography; a web-sourced claim without an entry here cannot be cited.",
+        items: {
+          type: "object",
+          properties: {
+            url: { type: "string" },
+            title: { type: "string" },
+            date: { type: "string", description: "Publication date if known (ISO or year)" },
+            note: { type: "string", description: "What this source supports" },
+          },
+          required: ["url"],
+        },
       },
     },
     required: ["status", "report"],
