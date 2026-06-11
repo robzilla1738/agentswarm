@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { fmtAgo, fmtClock } from "@/lib/format";
 import { PixelAvatar, personaName } from "@/lib/persona";
 import type { ActivityItem, BlackboardNote, ConductorSay, OperatorNote } from "@/lib/types";
-import { EmptyState, ToolIcon } from "./atoms";
+import { EmptyState, Md, ToolIcon } from "./atoms";
 
 type Tab = "activity" | "conductor" | "blackboard";
 
@@ -189,12 +189,31 @@ function ConductorFeed({ log, operatorNotes, now }: { log: ConductorSay[]; opera
               <div className="label mb-0.5" style={{ letterSpacing: "0.12em" }}>
                 ◉ conductor · {fmtClock(m.t)}
               </div>
-              <span className="text-ink-dim">{m.text}</span>
+              <Md compact dim>{m.text}</Md>
             </div>
           )}
         </div>
       ))}
     </div>
+  );
+}
+
+/** Decisions are the load-bearing notes — they get the solid treatment. */
+function NoteKind({ kind }: { kind: string }) {
+  const glyph: Record<string, string> = { decision: "◆", "open-question": "?", handoff: "⇢", claim: "⚑" };
+  return (
+    <span
+      className={`mono shrink-0 uppercase ${kind === "decision" ? "chip-solid" : ""}`}
+      style={{
+        fontSize: 9,
+        letterSpacing: "0.1em",
+        padding: "1px 6px",
+        borderRadius: 4,
+        border: kind === "decision" ? undefined : "1px solid var(--color-border)",
+      }}
+    >
+      {glyph[kind] ?? "·"} {kind}
+    </span>
   );
 }
 
@@ -207,11 +226,12 @@ function Blackboard({ notes, now }: { notes: BlackboardNote[]; now: number }) {
       {[...notes].reverse().map((n, i) => (
         <div key={i} className="tile p-3 text-xs" style={{ animation: "var(--animate-rise)" }}>
           <div className="flex items-baseline gap-2 mb-1.5 text-2xs text-ink-faint">
+            {n.kind && n.kind !== "finding" && <NoteKind kind={n.kind} />}
             {n.key && <span className="mono font-semibold text-ink truncate">{n.key.replace(/[_-]+/g, " ")}</span>}
             {n.taskId && <span className="mono shrink-0">{n.taskId}</span>}
             <span className="ml-auto shrink-0">{fmtAgo(n.t, now)}</span>
           </div>
-          <div className="text-ink-dim leading-relaxed">{n.text}</div>
+          <Md compact dim>{n.text}</Md>
         </div>
       ))}
     </div>

@@ -17,7 +17,15 @@ export interface ToolCtx {
   agentId: string;
   taskId?: string;
   signal: AbortSignal;
-  addNote: (text: string, key?: string) => void;
+  addNote: (text: string, key?: string, kind?: string) => void;
+  /** Keyword search over every blackboard note in the run (not just the digest tail). */
+  searchNotes?: (query: string) => string;
+  /** Full report text of a settled task (dep excerpts link here). */
+  readReport?: (taskId: string) => string;
+  /** Advisory claim check: warning text if another live task claimed this path. */
+  checkClaim?: (relPath: string) => string | null;
+  /** Journal a durable progress checkpoint for this task (warm restarts after a crash). */
+  addCheckpoint?: (summary: string) => void;
   addArtifact: (relPath: string) => void;
   readBlackboard: () => string;
   /** Journal an operator-visible diagnostic (tool infrastructure problems). */
@@ -163,7 +171,8 @@ export function workerToolset(): Record<string, ToolDef> {
       const content = String(args.content ?? "");
       if (content.length > 5_000_000) throw new Error("content too large (>5MB)");
       await writeFileVia(ctx, abs, content);
-      return `wrote ${abs} (${content.length} chars)`;
+      const warn = ctx.checkClaim?.(String(args.path));
+      return `wrote ${abs} (${content.length} chars)${warn ? `\n${warn}` : ""}`;
     },
   };
 
@@ -195,7 +204,8 @@ export function workerToolset(): Record<string, ToolDef> {
       }
       const next = args.all ? raw.split(find).join(replace) : raw.replace(find, replace);
       await writeFileVia(ctx, abs, next);
-      return `replaced ${args.all ? count : 1} occurrence(s) in ${abs}`;
+      const warn = ctx.checkClaim?.(String(args.path));
+      return `replaced ${args.all ? count : 1} occurrence(s) in ${abs}${warn ? `\n${warn}` : ""}`;
     },
   };
 
@@ -319,19 +329,89 @@ export function workerToolset(): Record<string, ToolDef> {
     schema: {
       name: "note",
       description:
-        "Post a durable fact/discovery to the swarm's shared blackboard so the conductor and other agents can see it. Use sparingly — facts other tasks need, not progress chatter.",
+        "Post a durable fact/discovery to the swarm's shared blackboard so the conductor and other agents can see it. Use sparingly — facts other tasks need, not progress chatter. Mark kind='decision' for choices the rest of the mission must respect (these are never trimmed from digests).",
       parameters: {
         type: "object",
         properties: {
           text: { type: "string" },
           key: { type: "string", description: "Optional short label" },
+          kind: {
+            type: "string",
+            enum: ["finding", "decision", "open-question", "handoff", "claim"],
+            description: "Category (default finding). kind='claim' with key=<file path> advertises you are editing that file",
+          },
         },
         required: ["text"],
       },
     },
     run: async (args, ctx) => {
-      ctx.addNote(String(args.text), args.key ? String(args.key) : undefined);
+      const kind = ["finding", "decision", "open-question", "handoff", "claim"].includes(String(args.kind))
+        ? String(args.kind)
+        : undefined;
+      ctx.addNote(String(args.text), args.key ? String(args.key) : undefined, kind);
       return "noted on the blackboard";
+    },
+  };
+
+  tools.search_notes = {
+    schema: {
+      name: "search_notes",
+      description:
+        "Keyword-search the ENTIRE blackboard history (the digest in your prompt only shows the recent tail). Use when you need a fact another agent may have posted earlier in the run.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Keywords to match against note text/labels" },
+        },
+        required: ["query"],
+      },
+    },
+    run: async (args, ctx) => {
+      if (!ctx.searchNotes) return "note search is unavailable in this context";
+      return ctx.searchNotes(String(args.query ?? ""));
+    },
+  };
+
+  tools.read_report = {
+    schema: {
+      name: "read_report",
+      description:
+        "Read the FULL report of a settled task (dependency reports in your prompt are excerpts). Use when an excerpt cuts off details you need.",
+      parameters: {
+        type: "object",
+        properties: {
+          task_id: { type: "string", description: "e.g. T3" },
+        },
+        required: ["task_id"],
+      },
+    },
+    run: async (args, ctx) => {
+      if (!ctx.readReport) return "report lookup is unavailable in this context";
+      return ctx.readReport(String(args.task_id ?? ""));
+    },
+  };
+
+  tools.checkpoint = {
+    schema: {
+      name: "checkpoint",
+      description:
+        "Journal a durable progress checkpoint: a dense summary of what you've completed, key findings, and what remains. If the run is interrupted, the next attempt resumes from your latest checkpoint instead of starting over. Use after completing each major chunk of a long task.",
+      parameters: {
+        type: "object",
+        properties: {
+          summary: {
+            type: "string",
+            description: "Completed work (exact paths/commands), key findings, and remaining steps",
+          },
+        },
+        required: ["summary"],
+      },
+    },
+    run: async (args, ctx) => {
+      const summary = String(args.summary ?? "").trim();
+      if (!summary) throw new Error("summary is required");
+      ctx.addCheckpoint?.(summary);
+      return "checkpoint saved";
     },
   };
 
@@ -412,6 +492,21 @@ export const REPORT_TOOL: ToolSchema = {
         items: { type: "string" },
         description: "Paths of files you created/changed that matter",
       },
+      key_facts: {
+        type: "array",
+        items: { type: "string" },
+        description: "3-8 standalone facts downstream tasks need (figures, paths, URLs, decisions)",
+      },
+      open_questions: {
+        type: "array",
+        items: { type: "string" },
+        description: "Unresolved questions or risks the conductor should know about",
+      },
+      files_touched: {
+        type: "array",
+        items: { type: "string" },
+        description: "Every file you created or modified (exact paths)",
+      },
     },
     required: ["status", "report"],
   },
@@ -473,12 +568,64 @@ export const SPAWN_TASKS_TOOL: ToolSchema = {
             },
             verify: { type: "boolean", description: "Adversarially verify this task's result before accepting it" },
             context: { type: "string", description: "Facts, paths, URLs, constraints the worker needs inlined" },
+            model: {
+              type: "string",
+              enum: ["cheap", "default", "strong"],
+              description: "Model tier: cheap for scouts/bulk extraction, strong for leads, integration, and verified deliverables",
+            },
+            team: {
+              type: "boolean",
+              description: "Run as a sub-swarm: this task gets its own conductor that decomposes it into parallel sub-tasks and reports one consolidated result. Use for coherent multi-task subsystems (e.g. 'build the backend'). Teams cannot spawn teams.",
+            },
+            team_max_workers: { type: "number", description: "Parallelism inside the team (default: half the run's)" },
+            team_budget_tokens: { type: "number", description: "Token slice for the team (default: a quarter of what remains)" },
           },
           required: ["title", "objective"],
         },
       },
     },
     required: ["tasks"],
+  },
+};
+
+export const CONDUCTOR_READ_REPORT_TOOL: ToolSchema = {
+  name: "read_report",
+  description:
+    "Read the full report of any settled task. Updates show one-line summaries once many tasks settle — use this when a summary isn't enough to plan from.",
+  parameters: {
+    type: "object",
+    properties: {
+      task_id: { type: "string", description: "e.g. T17" },
+    },
+    required: ["task_id"],
+  },
+};
+
+export const UPDATE_PLAN_TOOL: ToolSchema = {
+  name: "update_plan",
+  description:
+    "Maintain the mission's living plan document (artifacts/mission-plan.md, full overwrite). On missions beyond ~20 tasks, keep it current: approach, phases, what's done, what's next, open risks. Its head is pinned into every update you receive, surviving history trimming and restarts.",
+  parameters: {
+    type: "object",
+    properties: {
+      markdown: { type: "string", description: "The complete plan document (markdown)" },
+    },
+    required: ["markdown"],
+  },
+};
+
+export const SET_PHASE_TOOL: ToolSchema = {
+  name: "set_phase",
+  description:
+    "Declare the mission's current phase/milestone. Use on long missions to structure the work (e.g. 'discovery' → 'build' → 'integrate' → 'polish'). The phase and its exit criteria are pinned into every update you receive, surviving history trimming.",
+  parameters: {
+    type: "object",
+    properties: {
+      name: { type: "string", description: "Short phase name" },
+      goal: { type: "string", description: "What this phase accomplishes" },
+      exit_criteria: { type: "string", description: "Concrete conditions that end this phase" },
+    },
+    required: ["name"],
   },
 };
 

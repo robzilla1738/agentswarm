@@ -9,7 +9,7 @@ import { SideRail } from "@/components/SideRail";
 import { SwarmBoard } from "@/components/SwarmBoard";
 import { TaskDetail } from "@/components/TaskDetail";
 import { TopBar } from "@/components/TopBar";
-import { BudgetBar, Spinner, StatusBadge, StatusDot } from "@/components/atoms";
+import { BudgetBar, Md, Spinner, StatusBadge, StatusDot } from "@/components/atoms";
 import { api } from "@/lib/api";
 import { fmtDur, fmtMoney, fmtTokens } from "@/lib/format";
 import { useNow, useRun } from "@/lib/hooks";
@@ -225,7 +225,7 @@ function RunView() {
             {data.finalSummary && (
               <div className="panel p-4 mb-5" style={{ borderColor: "rgb(var(--hi) / 0.22)", background: "rgb(var(--hi) / 0.03)" }}>
                 <div className="label mb-1.5 text-ink">✓ Mission summary</div>
-                <p className="text-sm leading-relaxed text-ink-dim">{data.finalSummary}</p>
+                <Md compact>{data.finalSummary}</Md>
               </div>
             )}
             <SwarmBoard

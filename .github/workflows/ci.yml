@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install --no-fund --no-audit
+      - run: npx tsc -p tsconfig.json --noEmit
+      - run: npm run build
+      - run: npm run test:unit
+      - run: node test/e2e.js
+        env:
+          SWARM_E2E_SKIP_DOCKER: "1"

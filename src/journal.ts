@@ -7,10 +7,45 @@ import { SwarmEvent } from "./types";
  * run: the executor writes it, the terminal renderer and the hub (web UI) read
  * and tail it. Tolerant of a torn final line after a crash.
  */
+/** What the executor needs from a journal — satisfied by Journal and TeamJournal. */
+export interface JournalLike {
+  append(type: string, payload?: Record<string, unknown>): SwarmEvent;
+  flush(): Promise<void>;
+  readonly degraded: boolean;
+}
+
+/**
+ * A child swarm's view of its parent's journal: same file, same sequence,
+ * every event stamped with the owning team's task id so the reducer can
+ * partition team activity away from the root run.
+ */
+export class TeamJournal implements JournalLike {
+  constructor(
+    private inner: JournalLike,
+    private teamId: string
+  ) {}
+
+  append(type: string, payload: Record<string, unknown> = {}): SwarmEvent {
+    return this.inner.append(type, { teamId: this.teamId, ...payload });
+  }
+
+  flush(): Promise<void> {
+    return this.inner.flush();
+  }
+
+  get degraded(): boolean {
+    return this.inner.degraded;
+  }
+}
+
 export class Journal {
   private file: string;
   private seq: number;
   private chain: Promise<void> = Promise.resolve();
+  private buf = "";
+  private failures = 0;
+  /** Set after repeated append failures: the source of truth is no longer being persisted. */
+  degraded = false;
   onEvent?: (ev: SwarmEvent) => void;
 
   constructor(runDirPath: string, startSeq?: number) {
@@ -20,12 +55,8 @@ export class Journal {
 
   append(type: string, payload: Record<string, unknown> = {}): SwarmEvent {
     const ev: SwarmEvent = { seq: this.seq++, t: Date.now(), type, ...payload };
-    const line = JSON.stringify(ev) + "\n";
-    this.chain = this.chain
-      .then(() => fs.promises.appendFile(this.file, line, "utf8"))
-      .catch(() => {
-        /* never break the run on journal IO; next append retries the chain */
-      });
+    this.buf += JSON.stringify(ev) + "\n";
+    this.chain = this.chain.then(() => this.drain());
     try {
       this.onEvent?.(ev);
     } catch {
@@ -34,8 +65,38 @@ export class Journal {
     return ev;
   }
 
+  private async drain(): Promise<void> {
+    if (!this.buf) return;
+    const chunk = this.buf;
+    this.buf = "";
+    try {
+      await fs.promises.appendFile(this.file, chunk, "utf8");
+      this.failures = 0;
+    } catch (e) {
+      // Keep the unwritten events buffered so the next append/flush retries
+      // them in order; after repeated failures, stop pretending it's fine.
+      this.buf = chunk + this.buf;
+      this.failures++;
+      if (this.failures >= 5 && !this.degraded) {
+        this.degraded = true;
+        process.stderr.write(`agentswarm: journal writes are failing (${String(e)}); run state is no longer durable\n`);
+      }
+    }
+  }
+
   flush(): Promise<void> {
-    return this.chain;
+    return this.chain.then(() => this.drain());
+  }
+
+  /** Last-gasp synchronous flush for signal handlers and exit paths. */
+  flushSync(): void {
+    if (!this.buf) return;
+    try {
+      fs.appendFileSync(this.file, this.buf, "utf8");
+      this.buf = "";
+    } catch {
+      /* nothing left to do */
+    }
   }
 }
 

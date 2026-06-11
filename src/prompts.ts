@@ -34,9 +34,13 @@ DOCTRINE
 8. Watch the budget shown in every update. As it tightens, cut scope to what the mission truly needs — always deliver value before the cap, never run out mid-flight.
 9. Operator messages override everything. Adjust the plan immediately when one appears.
 10. finish only when the mission's success criteria are demonstrably met, or budget/feasibility forces it. Your finish notes steer the synthesizer that writes the final report.
+11. Model tiers: set model:"cheap" on scouts and bulk extraction, model:"strong" on leads, integration, and verified deliverables. Default tier for everything in between.
+12. Big subsystems: spawn with team:true to run the task as a sub-swarm — its own lead decomposes it into parallel sub-tasks and reports one consolidated result. Use for coherent multi-task chunks ("build the backend", "research all 12 competitors"), not for single jobs.
+13. Beyond ~20 tasks, maintain a living plan with update_plan (mission-plan.md): approach, what's done, what's next, open risks. Rewrite it at phase boundaries — it is pinned into your updates and survives restarts.
+14. Long missions: structure the work into phases with set_phase (e.g. discovery → build → integrate → polish). The current phase and its exit criteria are pinned into every update, so the plan survives even when old history is trimmed.
 
 RULES
-- Respond ONLY by calling your tools (spawn_tasks / wait / finish). Plain-text replies are ignored.
+- Respond ONLY by calling your tools (spawn_tasks / set_phase / wait / finish). Plain-text replies are ignored. set_phase alone is not a decision — pair it with spawn_tasks, wait, or finish.
 - Never spawn a task whose deps are not yet all created.
 - Keep the total task count within budget (max ${o.maxTasks} per run); make every task earn its place.`;
 }
@@ -51,6 +55,8 @@ export interface UpdateParts {
   reports?: string[];
   operatorNotes?: string[];
   blackboard?: string;
+  phase?: string;
+  plan?: string;
   nextId: number;
   taskTable: string;
   budgetLine: string;
@@ -64,6 +70,8 @@ export function conductorUpdate(p: UpdateParts): string {
   }
   if (p.reports?.length) sections.push(`NEW REPORTS\n${p.reports.join("\n\n")}`);
   if (p.blackboard) sections.push(`BLACKBOARD (shared notes digest)\n${p.blackboard}`);
+  if (p.phase) sections.push(p.phase);
+  if (p.plan) sections.push(p.plan);
   sections.push(`SWARM STATE\n${p.taskTable}`);
   sections.push(p.budgetLine);
   if (p.extra) sections.push(p.extra);
@@ -73,22 +81,58 @@ export function conductorUpdate(p: UpdateParts): string {
 
 export function taskTable(tasks: Task[]): string {
   if (!tasks.length) return "(no tasks yet)";
-  return tasks
-    .map((t) => {
-      const deps = t.deps.length ? ` deps:[${t.deps.join(",")}]` : "";
-      const extra =
-        t.status === "failed" && t.error ? ` — ${clip(t.error, 80)}` : "";
-      return `${t.id} [${t.status}${t.attempt > 1 ? ` a${t.attempt}` : ""}] (${t.role})${deps} ${clip(t.title, 70)}${extra}`;
-    })
-    .join("\n");
+  const line = (t: Task) => {
+    const deps = t.deps.length ? ` deps:[${t.deps.join(",")}]` : "";
+    const extra =
+      t.status === "failed" && t.error ? ` — ${clip(t.error, 80)}` : "";
+    return `${t.id} [${t.status}${t.attempt > 1 ? ` a${t.attempt}` : ""}] (${t.role})${deps} ${clip(t.title, 70)}${extra}`;
+  };
+  const settled = tasks.filter((t) => ["done", "failed", "blocked"].includes(t.status));
+  if (settled.length <= 30) return tasks.map(line).join("\n");
+
+  // Hundreds of tasks must not flood the conductor's prompt: collapse DONE
+  // tasks in older waves to one line per wave. Failures/blocks stay full-line
+  // forever (they're what the conductor plans around), as do active tasks and
+  // the two most recent waves.
+  const maxWave = Math.max(...tasks.map((t) => t.wave));
+  const out: string[] = [];
+  const waves = [...new Set(tasks.map((t) => t.wave))].sort((a, b) => a - b);
+  for (const w of waves) {
+    const ws = tasks.filter((t) => t.wave === w);
+    const collapsible = w < maxWave - 1 ? ws.filter((t) => t.status === "done") : [];
+    const fullLines = ws.filter((t) => !collapsible.includes(t));
+    if (collapsible.length) {
+      out.push(`wave ${w}: ${collapsible.length} done (${collapsible.map((t) => t.id).join(",")})`);
+    }
+    out.push(...fullLines.map(line));
+  }
+  return out.join("\n");
 }
 
 export function reportBlock(t: Task): string {
   const head = `── ${t.id} (${t.role}) "${clip(t.title, 60)}" → ${t.status.toUpperCase()}${t.attempt > 1 ? ` (attempt ${t.attempt})` : ""}`;
   const body = t.report ? clip(t.report, 1600) : t.error ? `error: ${clip(t.error, 400)}` : "(no report)";
+  const facts = t.keyFacts?.length ? `\nkey facts:\n${t.keyFacts.map((f) => `  • ${clip(f, 200)}`).join("\n")}` : "";
+  const open = t.openQuestions?.length ? `\nopen questions: ${t.openQuestions.map((q) => clip(q, 150)).join(" | ")}` : "";
+  const files = t.filesTouched?.length ? `\nfiles touched: ${t.filesTouched.join(", ")}` : "";
   const arts = t.artifacts.length ? `\nartifacts: ${t.artifacts.join(", ")}` : "";
   const fb = t.feedback ? `\nverifier: ${clip(t.feedback, 300)}` : "";
-  return `${head}\n${body}${arts}${fb}`;
+  return `${head}\n${body}${facts}${open}${files}${arts}${fb}`;
+}
+
+/**
+ * Compact dependency context for a downstream worker: structured handoff
+ * fields in full, prose report as an excerpt — read_report(taskId) has the
+ * rest. Keeps fan-in tasks from inheriting megabytes of ancestor prose.
+ */
+export function depReportBlock(t: Task): string {
+  const head = `── dep ${t.id} (${t.role}) "${clip(t.title, 60)}" → ${t.status.toUpperCase()}`;
+  const facts = t.keyFacts?.length ? `\nkey facts:\n${t.keyFacts.map((f) => `  • ${clip(f, 200)}`).join("\n")}` : "";
+  const files = t.filesTouched?.length ? `\nfiles touched: ${t.filesTouched.join(", ")}` : "";
+  const arts = t.artifacts.length ? `\nartifacts: ${t.artifacts.join(", ")}` : "";
+  const full = (t.report ?? "").length > 1200 ? `\n(excerpt — full text: read_report("${t.id}"))` : "";
+  const body = t.report ? clip(t.report, 1200) : t.error ? `error: ${clip(t.error, 400)}` : "(no report)";
+  return `${head}\n${body}${facts}${files}${arts}${full}`;
 }
 
 // ============================================================ workers
@@ -127,13 +171,16 @@ export function workerSystem(opts: {
       : task.attempt > 1 && task.error
         ? `\nPREVIOUS ATTEMPT FAILED: ${task.error}\nTake a different approach.\n`
         : "";
+  const checkpoint = task.lastCheckpoint
+    ? `\nPROGRESS CHECKPOINT FROM A PREVIOUS ATTEMPT (the run was interrupted or retried — do not redo completed work blindly):\n${task.lastCheckpoint}\nRe-verify the state it describes (files, commands) before re-creating anything, then continue from where it left off.\n`
+    : "";
   return `You are ${opts.agentId}, a ${opts.role} agent in a swarm pursuing this mission:
 ${meta.mission}
 
 YOUR TASK — ${task.id} (attempt ${task.attempt})
 ${task.title}
 Objective: ${task.objective}
-${task.context ? `Context from the conductor:\n${task.context}\n` : ""}${retry}
+${task.context ? `Context from the conductor:\n${task.context}\n` : ""}${retry}${checkpoint}
 CONTEXT FROM THE SWARM
 ${opts.depReports || "(no dependency reports)"}
 ${opts.blackboard ? `Blackboard digest:\n${opts.blackboard}` : ""}
@@ -147,10 +194,13 @@ OPERATING PROTOCOL
 - Evidence over assumption: read before you edit; check outputs; cite concrete paths, commands and numbers.
 - Be token-lean: targeted reads (line ranges, grep via shell) over wholesale dumps; don't re-read unchanged files.
 - Post durable discoveries other agents will need to the blackboard with note(...) — facts only, used sparingly.
+- Editing files other tasks might also touch? First search_notes for claims, then post note(kind:"claim", key:"<path>") before editing. Claims are advisory — coordinate, don't fight.
 - Save deliverable files with save_artifact so the operator sees them.
+- On long tasks, call checkpoint(...) after each major chunk so an interrupted run resumes warm instead of from scratch.
 - Genuinely impossible / missing prerequisite → report(status:"blocked", …) early instead of thrashing.
 - You have at most ${opts.maxSteps} tool steps. Budget them.
-- ALWAYS end by calling report(...). The conductor sees ONLY that report — it is the entire value of your work. Specific beats vague: what you did, what you verified, key findings, exact paths.
+- Dependency reports above are excerpts; use read_report(task_id) for full text, and search_notes(query) to find facts posted earlier in the run.
+- ALWAYS end by calling report(...). The conductor sees ONLY that report — it is the entire value of your work. Specific beats vague: what you did, what you verified, key findings, exact paths. Fill key_facts (standalone facts downstream tasks need), open_questions, and files_touched — they are handed verbatim to dependent tasks.
 ${roleHint ? "\n" + roleHint : ""}`;
 }
 
@@ -183,8 +233,12 @@ ${task.artifacts.length ? `Claimed artifacts: ${task.artifacts.join(", ")}` : ""
 Working directory: ${meta.cwd}
 
 PROTOCOL
-- Do NOT trust the report. Verify concretely with tools: read the files it claims to have written, run the build/tests/commands, fetch the URLs, check the numbers.
-- Check: objective met? success criteria satisfied? deliverables exist and are non-trivial (not stubs/placeholders)?
+- Do NOT trust the report. Verify concretely with tools: read the files it claims to have written, run the build/tests/commands, fetch the URLs, check the numbers. You see only the worker's CLAIMS — gather your own evidence; do not assume shared context.
+- RUBRIC — fail unless all hold:
+  1. Completeness: every part of the objective and its "Done when" criteria is addressed.
+  2. Evidence: each substantive claim in the report is backed by something you verified yourself.
+  3. Deliverables: claimed files/artifacts exist, are non-trivial (not stubs/placeholders), and match what the report says about them.
+  4. Correctness: commands/builds/tests the task implies actually succeed when you run them.
 - Spot-check depth over exhaustive breadth; ~5-12 tool steps.
 - Then call verdict(pass, feedback). On fail, feedback must be actionable: exactly what is wrong and where. On pass, one line citing the evidence you checked.`;
 }
@@ -225,6 +279,38 @@ PROTOCOL
 
 export const SYNTH_KICKOFF = "Compose and submit the final deliverable now via submit_final(...).";
 
+// ============================================================ completeness / synthesis checks
+
+export function completenessPrompt(mission: string, taskTableStr: string, reports: string): string {
+  return `You are a completeness critic for an agent-swarm run that is about to finish. Given the mission and what was actually delivered, list any REAL gaps: parts of the mission not addressed, claims with no supporting task, or deliverables that were promised but never produced.
+
+MISSION
+${mission}
+
+TASKS
+${taskTableStr}
+
+TASK REPORTS
+${reports}
+
+Reply with EXACTLY "COMPLETE" if the mission's requirements are genuinely covered. Otherwise reply with a short numbered list of concrete gaps (max 5), each one actionable enough to become a task. Do not invent nice-to-haves — only true gaps against the stated mission.`;
+}
+
+export function synthCheckPrompt(mission: string, reports: string, finalReport: string): string {
+  return `You are checking a final mission report for faithfulness before delivery. Compare it against the underlying task reports.
+
+MISSION
+${mission}
+
+TASK REPORTS (ground truth)
+${reports}
+
+FINAL REPORT (to check)
+${finalReport}
+
+Reply with EXACTLY "OK" if the final report's claims are supported by the task reports and nothing material is misrepresented or fabricated. Otherwise list the specific discrepancies (max 5), each citing what the final report says vs what the task reports support.`;
+}
+
 // ============================================================ compaction
 
 export function compactorPrompt(serialized: string): string {
@@ -238,5 +324,11 @@ ${serialized}`;
 
 export function budgetLine(spent: { total: number; cost: number }, cap: number): string {
   const pct = cap > 0 ? Math.round((spent.total / cap) * 100) : 0;
-  return `BUDGET: ${fmtTokens(spent.total)} of ${fmtTokens(cap)} tokens used (${pct}%) · est. cost so far $${spent.cost.toFixed(2)}`;
+  const urgency =
+    pct >= 90
+      ? " ⚠ WIND DOWN NOW: stop spawning new work, consolidate what exists, and finish before the cap."
+      : pct >= 75
+        ? " Note: budget is tightening — prefer consolidation over new exploration."
+        : "";
+  return `BUDGET: ${fmtTokens(spent.total)} of ${fmtTokens(cap)} tokens used (${pct}%) · est. cost so far $${spent.cost.toFixed(2)}${urgency}`;
 }

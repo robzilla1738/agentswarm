@@ -37,6 +37,12 @@ export interface Task {
   artifacts: string[];
   feedback?: string;
   error?: string;
+  lastCheckpoint?: string;
+  keyFacts?: string[];
+  openQuestions?: string[];
+  filesTouched?: string[];
+  modelTier?: "cheap" | "default" | "strong";
+  team?: boolean;
   createdAt: number;
   startedAt?: number;
   endedAt?: number;
@@ -63,6 +69,8 @@ export interface BlackboardNote {
   taskId?: string;
   agentId?: string;
   key?: string;
+  /** finding | decision | open-question | handoff | claim */
+  kind?: string;
   text: string;
 }
 

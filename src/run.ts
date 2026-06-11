@@ -92,8 +92,13 @@ const liveCache = new Map<string, { state: RunState; tail: TailState }>();
 
 const TERMINAL_STATUSES = ["done", "failed", "cancelled"];
 
-/** Grace before a silent, pid-less run is presumed dead (engine startup, fs lag). */
-const STALE_AFTER_MS = 20_000;
+/**
+ * Grace before a silent, pid-less run is presumed dead. The pid file is the
+ * primary live signal; this window only covers engine startup (before
+ * writePid) and filesystem lag — generous enough that slow disks and slow
+ * provider preflights never flag a healthy run as interrupted.
+ */
+const STALE_AFTER_MS = 45_000;
 
 /**
  * A run whose engine process vanished without writing a terminal status

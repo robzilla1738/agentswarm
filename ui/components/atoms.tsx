@@ -2,7 +2,22 @@
 
 import Link from "next/link";
 import { useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { statusColor } from "@/lib/format";
+
+/**
+ * The one way to render model-written text. Everything an agent or the
+ * conductor writes is markdown — raw text walls are never shown to the
+ * operator. `compact` is the 13px variant for side rails and drawers.
+ */
+export function Md({ children, compact, dim }: { children: string; compact?: boolean; dim?: boolean }) {
+  return (
+    <div className={`prose-report${compact ? " prose-compact" : ""}${dim ? " prose-dim" : ""}`}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{children}</ReactMarkdown>
+    </div>
+  );
+}
 
 /** The swarm mark (halftone bee, white on transparent). */
 export function LogoMark({ size = 30 }: { size?: number }) {

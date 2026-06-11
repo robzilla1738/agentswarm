@@ -20,11 +20,16 @@ export interface SwarmConfig {
   baseUrl: string;
   model: string;
   conductorModel: string;
+  /** Tiered models for spawn specs (model:"cheap"/"strong"); "" = use `model`. */
+  cheapModel: string;
+  strongModel: string;
   maxWorkers: number;
   maxStepsPerTask: number;
   maxTasks: number;
   maxTokensPerRun: number;
   verification: "off" | "normal" | "strict";
+  /** Max worker attempts per task (verification failures and errors trigger retries). */
+  verifyMaxAttempts: number;
   thinking: boolean;
   reasoningEffort: ReasoningEffort;
   safeMode: boolean;
@@ -50,6 +55,8 @@ export interface SwarmConfig {
   vercelToken: string;
   vercelTeamId: string;
   vercelProjectId: string;
+  /** Global cap on concurrent streaming model calls per provider endpoint. */
+  maxConcurrentCalls: number;
   requestTimeoutMs: number;
   idleTimeoutMs: number;
   /** Per-agent context size (est. tokens) that triggers compaction. */
@@ -84,11 +91,14 @@ export const DEFAULTS: SwarmConfig = {
   baseUrl: PROVIDERS.deepseek.baseUrl,
   model: "deepseek-v4-flash",
   conductorModel: "deepseek-v4-flash",
+  cheapModel: "",
+  strongModel: "",
   maxWorkers: 6,
   maxStepsPerTask: 30,
-  maxTasks: 48,
+  maxTasks: 200,
   maxTokensPerRun: 12_000_000,
   verification: "normal",
+  verifyMaxAttempts: 2,
   thinking: true,
   reasoningEffort: "high",
   safeMode: true,
@@ -104,6 +114,7 @@ export const DEFAULTS: SwarmConfig = {
   vercelToken: "",
   vercelTeamId: "",
   vercelProjectId: "",
+  maxConcurrentCalls: 16,
   requestTimeoutMs: 900_000,
   idleTimeoutMs: 180_000,
   contextTokenLimit: 120_000,
@@ -237,11 +248,14 @@ export const SETTABLE_KEYS: (keyof SwarmConfig)[] = [
   "baseUrl",
   "model",
   "conductorModel",
+  "cheapModel",
+  "strongModel",
   "maxWorkers",
   "maxStepsPerTask",
   "maxTasks",
   "maxTokensPerRun",
   "verification",
+  "verifyMaxAttempts",
   "thinking",
   "reasoningEffort",
   "safeMode",
@@ -257,6 +271,7 @@ export const SETTABLE_KEYS: (keyof SwarmConfig)[] = [
   "vercelToken",
   "vercelTeamId",
   "vercelProjectId",
+  "maxConcurrentCalls",
   "contextTokenLimit",
   "hubPort",
   "uiPort",
@@ -264,9 +279,11 @@ export const SETTABLE_KEYS: (keyof SwarmConfig)[] = [
 
 /** Allowed ranges for numeric settings (values are clamped, not rejected). */
 const NUM_RANGES: Partial<Record<keyof SwarmConfig, [number, number]>> = {
-  maxWorkers: [1, 32],
+  maxWorkers: [1, 128],
+  maxConcurrentCalls: [1, 256],
   maxStepsPerTask: [3, 200],
   maxTasks: [1, 1000],
+  verifyMaxAttempts: [1, 5],
   maxTokensPerRun: [50_000, 2_000_000_000],
   contextTokenLimit: [8_000, 900_000],
   hubPort: [0, 65535],

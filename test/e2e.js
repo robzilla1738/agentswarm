@@ -7,6 +7,9 @@ const os = require("os");
 const path = require("path");
 
 const ROOT = path.join(__dirname, "..");
+// Deterministic conductor wake-ups: no settle debounce in tests (children
+// inherit this via { ...process.env }).
+process.env.SWARM_SETTLE_DEBOUNCE_MS = "0";
 const SWARM = path.join(ROOT, "bin", "swarm.js");
 
 function fail(msg) {
@@ -245,6 +248,10 @@ async function phaseResume() {
 
 async function phaseDocker() {
   console.log("\n▶ Phase 4: docker sandbox (runs only when a docker daemon is reachable)");
+  if (process.env.SWARM_E2E_SKIP_DOCKER) {
+    console.log("  – SWARM_E2E_SKIP_DOCKER set; phase skipped");
+    return;
+  }
   const probe = spawnSync("docker", ["info", "--format", "{{.ServerVersion}}"], { encoding: "utf8", timeout: 8000 });
   if (probe.status !== 0 || !(probe.stdout || "").trim()) {
     console.log("  – docker daemon not reachable; phase skipped");
@@ -486,6 +493,260 @@ async function phaseHubSmoke() {
   fs.rmSync(home, { recursive: true, force: true });
 }
 
+async function phaseCheckpointResume() {
+  console.log("\n▶ Phase 10: warm resume from a task checkpoint");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({});
+  ok(`mock model server on :${port}`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const idOut = spawnSync(process.execPath, ["-e",
+    `const {createRun,optionsFromConfig}=require(${JSON.stringify(path.join(ROOT, "dist", "run.js"))});` +
+    `const {loadConfig}=require(${JSON.stringify(path.join(ROOT, "dist", "config.js"))});` +
+    `const cfg=loadConfig();const m=createRun({mission:"Test: scout A and B then synthesize",cwd:process.cwd(),sandbox:true,options:optionsFromConfig(cfg)});console.log(JSON.stringify(m))`,
+  ], { env, encoding: "utf8" });
+  const meta = JSON.parse((idOut.stdout || "{}").trim() || "{}");
+  if (!meta.id) { console.error(idOut.stderr); proc.kill(); fail("could not create run for checkpoint test"); }
+  const runDir = path.join(home, "runs", meta.id);
+
+  const task = (id, title, role, deps) => ({
+    id, title, objective: `${title}. Done when summarized.`, role, deps, verify: false,
+    status: "pending", attempt: 1, wave: 1, artifacts: [], createdAt: Date.now(), agentIds: [],
+  });
+  // Engine "died" while T2 was mid-flight — but it had journaled a checkpoint.
+  const pre = [
+    { type: "run.created", meta },
+    { type: "run.status", status: "planning" },
+    { type: "task.created", task: task("T1", "Scout A", "researcher", []) },
+    { type: "task.created", task: task("T2", "Scout B", "researcher", []) },
+    { type: "task.created", task: task("T3", "Synthesize", "writer", ["T1", "T2"]) },
+    { type: "run.status", status: "running" },
+    { type: "task.status", taskId: "T1", status: "running", attempt: 1 },
+    { type: "task.report", taskId: "T1", status: "done", report: "Scout A done pre-crash.", artifacts: [] },
+    { type: "task.status", taskId: "T1", status: "done", attempt: 1 },
+    { type: "task.status", taskId: "T2", status: "running", attempt: 1 },
+    { type: "task.checkpoint", taskId: "T2", agentId: "w_dead", attempt: 1, summary: "CKPT-MARKER: gathered half the facts about B; remaining: summarize them." },
+  ];
+  fs.writeFileSync(
+    path.join(runDir, "events.jsonl"),
+    pre.map((e, i) => JSON.stringify({ seq: i + 1, t: Date.now(), ...e })).join("\n") + "\n"
+  );
+
+  const res = spawnSync(process.execPath, [SWARM, "resume", meta.id, "--fg"], { env, encoding: "utf8", timeout: 60000 });
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); proc.kill(); fail(`swarm resume exited ${res.status}`); }
+
+  const evs = events(runDir);
+  const t2report = evs.find((e) => e.type === "task.report" && e.taskId === "T2" && /resumed-from-checkpoint/.test(String(e.report)));
+  if (!t2report) fail("the retry worker for T2 should have been seeded with its checkpoint (mock reports 'resumed-from-checkpoint' only when it sees one)");
+  ok("retry worker received the prior checkpoint and resumed warm");
+  if (evs.filter((e) => e.type === "run.status").pop().status !== "done") fail("checkpoint-resume run did not end as done");
+  ok("run finished with status=done");
+
+  proc.kill();
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+async function phaseConductorBreaker() {
+  console.log("\n▶ Phase 11: conductor circuit breaker (repeated call failures end the run)");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "conductor-fail" });
+  ok(`mock model server on :${port} (conductor calls fail)`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1", SWARM_BACKOFF_SCALE: "0.01" };
+
+  const res = spawnSync(process.execPath, [SWARM, "run", "Test: doomed mission", "--fg", "--dir", os.tmpdir()],
+    { env, encoding: "utf8", timeout: 90000 });
+  proc.kill(); // before asserts — fail() exits without cleanup
+  // The run must terminate on its own (no hang) with a clear reason.
+  const home2 = path.join(home, "runs");
+  const ids = fs.readdirSync(home2).filter((d) => d.startsWith("run_"));
+  if (ids.length !== 1) fail("expected exactly one run");
+  const evs = events(path.join(home2, ids[0]));
+  const last = evs.filter((e) => e.type === "run.status").pop();
+  if (!["failed", "done"].includes(last.status)) fail(`run should have terminated, got ${last.status}`);
+  if (!evs.some((e) => e.type === "run.status" && /conductor unavailable/.test(String(e.reason || "")))) {
+    fail("run should record 'conductor unavailable' after repeated conductor failures");
+  }
+  ok("run ended with 'conductor unavailable' instead of looping forever");
+
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+async function phaseBlindVerifier() {
+  console.log("\n▶ Phase 12: blind verification (verifier must not see the blackboard)");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "blind-verify" });
+  ok(`mock model server on :${port} (blind-verify script)`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const res = spawnSync(process.execPath, [SWARM, "run", "Test: write a verified brief", "--fg", "--dir", os.tmpdir()],
+    { env, encoding: "utf8", timeout: 90000 });
+  proc.kill();
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); fail(`swarm run exited ${res.status}`); }
+
+  const ids = fs.readdirSync(path.join(home, "runs")).filter((d) => d.startsWith("run_"));
+  const evs = events(path.join(home, "runs", ids[0]));
+  if (!evs.some((e) => e.type === "note.added" && /SECRET-NOTE-XYZ/.test(String(e.text)))) {
+    fail("worker should have planted a blackboard note");
+  }
+  const verdict = evs.find((e) => e.type === "verify.result");
+  if (!verdict) fail("task should have been verified");
+  if (verdict.feedback !== "clean") fail(`verifier context leaked the blackboard (feedback=${verdict.feedback})`);
+  ok("verifier judged blind — the worker's blackboard note never reached it");
+  if (evs.filter((e) => e.type === "run.status").pop().status !== "done") fail("blind-verify run did not end done");
+  ok("run finished with status=done");
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+async function phaseSigterm() {
+  console.log("\n▶ Phase 13: SIGTERM mid-run leaves a clean, resumable journal");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "note-cancel" }); // slow tasks keep the run alive
+  ok(`mock model server on :${port}`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const engine = spawn(process.execPath, [SWARM, "run", "Test: probe slowly", "--fg", "--dir", os.tmpdir()],
+    { env, stdio: ["ignore", "pipe", "pipe"] });
+  const runDir = await waitFor(() => {
+    const ids = fs.existsSync(path.join(home, "runs")) ? fs.readdirSync(path.join(home, "runs")).filter((d) => d.startsWith("run_")) : [];
+    return ids.length ? path.join(home, "runs", ids[0]) : null;
+  }, 20000, "run directory");
+  await waitFor(() => events(runDir).some((e) => e.type === "task.status" && e.status === "running"), 30000, "a task to start");
+
+  engine.kill("SIGTERM");
+  await waitFor(() => engine.exitCode !== null, 15000, "engine to exit on SIGTERM");
+  ok("engine exited on SIGTERM");
+
+  // Every journal line must parse (flushSync wrote whole lines), the run must
+  // not have a terminal status, and the pid file must be gone.
+  const raw = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8").trim().split("\n");
+  for (const line of raw) JSON.parse(line);
+  ok(`journal is intact (${raw.length} well-formed lines)`);
+  const evs = raw.map((l) => JSON.parse(l));
+  const lastStatus = evs.filter((e) => e.type === "run.status").pop();
+  if (["done", "failed", "cancelled"].includes(lastStatus.status)) fail("SIGTERM must not write a terminal status — the run stays resumable");
+  if (!evs.some((e) => e.type === "log" && /SIGTERM/.test(String(e.msg)))) fail("journal should record the SIGTERM");
+  if (fs.existsSync(path.join(runDir, "run.pid"))) fail("pid file should be cleared on SIGTERM");
+  ok("run left non-terminal (resumable) with the SIGTERM recorded");
+
+  proc.kill();
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+function runMission(env, mission) {
+  const res = spawnSync(process.execPath, [SWARM, "run", mission, "--fg", "--dir", os.tmpdir()],
+    { env, encoding: "utf8", timeout: 120000 });
+  return res;
+}
+
+function soleRunEvents(home) {
+  const ids = fs.readdirSync(path.join(home, "runs")).filter((d) => d.startsWith("run_"));
+  if (ids.length !== 1) fail(`expected exactly one run, got ${ids.length}`);
+  return { runDir: path.join(home, "runs", ids[0]), evs: events(path.join(home, "runs", ids[0])) };
+}
+
+async function phaseRateLimit() {
+  console.log("\n▶ Phase 14: AIMD limiter absorbs a 429 storm");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({ MOCK_429_FIRST: "3" });
+  ok(`mock model server on :${port} (first 3 calls get 429)`);
+  writeConfig(home, port, { maxConcurrentCalls: 4 });
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const res = runMission(env, "Test: scout A and B then synthesize");
+  proc.kill();
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); fail(`swarm run exited ${res.status}`); }
+  const { evs } = soleRunEvents(home);
+  if (evs.filter((e) => e.type === "run.status").pop().status !== "done") fail("rate-limited run should still finish done");
+  if (!evs.some((e) => e.type === "limiter.state")) fail("limiter.state event should record the AIMD ceiling drop");
+  ok("run completed through the 429s and journaled the limiter adjustment");
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+async function phaseModelTiers() {
+  console.log("\n▶ Phase 15: model tiering (cheap scouts, strong leads)");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "model-tiers" });
+  ok(`mock model server on :${port}`);
+  writeConfig(home, port, { cheapModel: "mock-cheap", strongModel: "mock-strong" });
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const res = runMission(env, "Test: tiered scouting");
+  proc.kill();
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); fail(`swarm run exited ${res.status}`); }
+  const { evs } = soleRunEvents(home);
+  const spawned = evs.filter((e) => e.type === "agent.spawned" && e.role !== "verifier");
+  const models = new Set(spawned.map((e) => e.model));
+  if (!models.has("mock-cheap") || !models.has("mock-strong")) {
+    fail(`expected workers on mock-cheap AND mock-strong, got: ${[...models].join(", ")}`);
+  }
+  ok("workers ran on their spawn-spec tiers (mock-cheap + mock-strong)");
+  if (evs.filter((e) => e.type === "run.status").pop().status !== "done") fail("tiered run did not finish done");
+  ok("run finished with status=done");
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+async function phaseTeam() {
+  console.log("\n▶ Phase 16: hierarchical team (team:true runs a sub-swarm)");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "team" });
+  ok(`mock model server on :${port} (team script)`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const res = runMission(env, "Test: build the subsystem via a team");
+  proc.kill();
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); fail(`swarm run exited ${res.status}`); }
+  const { evs } = soleRunEvents(home);
+
+  if (!evs.some((e) => e.type === "team.created" && e.taskId === "T1")) fail("team.created event missing");
+  const teamEvents = evs.filter((e) => e.teamId === "T1");
+  if (!teamEvents.some((e) => e.type === "task.created")) fail("child swarm should journal teamId-stamped task events");
+  ok(`child swarm journaled ${teamEvents.length} teamId-stamped events`);
+
+  // Root run sees exactly ONE task (the team), settled done with the consolidated report.
+  const rootCreated = evs.filter((e) => e.type === "task.created" && !e.teamId);
+  if (rootCreated.length !== 1) fail(`root should have exactly 1 task, got ${rootCreated.length}`);
+  const teamReport = evs.find((e) => e.type === "team.report" && e.taskId === "T1");
+  if (!teamReport || !/TEAM-CONSOLIDATED/.test(String(teamReport.report))) fail("consolidated team report missing");
+  ok("root settled one task carrying the team's consolidated report");
+
+  // Child usage rolls up into the same journal (budget single-truth).
+  if (!evs.some((e) => e.type === "usage" && e.teamId === "T1")) fail("team usage events should be journaled with teamId");
+  ok("team usage journaled and rolled up");
+  if (evs.filter((e) => e.type === "run.status").pop().status !== "done") fail("team run did not finish done");
+  ok("run finished with status=done");
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+async function phaseLongHorizon() {
+  console.log("\n▶ Phase 17: living plan document (update_plan)");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "long-horizon" });
+  ok(`mock model server on :${port}`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const res = runMission(env, "Test: long horizon mission");
+  proc.kill();
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); fail(`swarm run exited ${res.status}`); }
+  const { runDir: rd, evs } = soleRunEvents(home);
+  const planFile = path.join(rd, "artifacts", "mission-plan.md");
+  if (!fs.existsSync(planFile) || !/PLAN-MARKER-V1/.test(fs.readFileSync(planFile, "utf8"))) {
+    fail("mission-plan.md should exist with the conductor's plan");
+  }
+  if (!evs.some((e) => e.type === "plan.updated" && /PLAN-MARKER-V1/.test(String(e.excerpt)))) {
+    fail("plan.updated event missing");
+  }
+  ok("conductor maintained mission-plan.md and journaled plan.updated");
+  if (evs.filter((e) => e.type === "run.status").pop().status !== "done") fail("long-horizon run did not finish done");
+  ok("run finished with status=done");
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
 async function main() {
   await phaseHappy();
   await phaseAuthFail();
@@ -496,8 +757,16 @@ async function main() {
   await phaseNoteCancel();
   await phaseCompaction();
   await phaseHubSmoke();
+  await phaseCheckpointResume();
+  await phaseConductorBreaker();
+  await phaseBlindVerifier();
+  await phaseSigterm();
+  await phaseRateLimit();
+  await phaseModelTiers();
+  await phaseTeam();
+  await phaseLongHorizon();
   console.log(
-    "\n✅ E2E passed — pipeline, auth failure, resume, budget cap, verify-retry, live steering + cancel, context compaction, and the hub REST surface all work."
+    "\n✅ E2E passed — pipeline, auth failure, resume, budget cap, verify-retry, steering + cancel, compaction, hub API, checkpoint resume, conductor breaker, blind verification, SIGTERM safety, 429 limiter, model tiers, hierarchical teams, and the living plan all work."
   );
 }
 

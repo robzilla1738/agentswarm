@@ -335,10 +335,23 @@ async function execForeground(cfg: SwarmConfig, meta: RunMeta, render: boolean, 
   process.on("uncaughtException", onFatal);
   process.on("unhandledRejection", onFatal);
 
+  // SIGTERM (kill, system shutdown): flush buffered journal lines synchronously
+  // and exit WITHOUT a terminal status — the run stays resumable, and viewers
+  // show it as interrupted once the pid disappears.
+  const onTerm = () => {
+    journal.append("log", { level: "warn", msg: "engine received SIGTERM — exiting; resume with: swarm resume " + meta.id });
+    journal.flushSync();
+    clearPid(meta.id);
+    if (renderer) renderer.stop();
+    process.exit(143);
+  };
+  process.on("SIGTERM", onTerm);
+
   try {
     await executor.run();
   } finally {
     process.off("SIGINT", onSig);
+    process.off("SIGTERM", onTerm);
     process.off("uncaughtException", onFatal);
     process.off("unhandledRejection", onFatal);
     clearPid(meta.id);

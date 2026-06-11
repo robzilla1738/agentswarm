@@ -68,6 +68,35 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
   s.lastSeq = Math.max(s.lastSeq, ev.seq);
   if (typeof ev.t === "number") s.lastT = Math.max(s.lastT, ev.t);
 
+  // Hierarchical-team events (stamped teamId) belong to a sub-swarm: their
+  // tasks/agents must not pollute the root board. Cost still rolls up, and
+  // tool calls surface in the feed tagged with the owning team task.
+  if (typeof ev.teamId === "string") {
+    if (ev.type === "usage") {
+      const u = ev.usage as Usage;
+      s.usage = {
+        promptTokens: s.usage.promptTokens + u.promptTokens,
+        completionTokens: s.usage.completionTokens + u.completionTokens,
+        cacheHitTokens: s.usage.cacheHitTokens + u.cacheHitTokens,
+        cacheMissTokens: s.usage.cacheMissTokens + u.cacheMissTokens,
+      };
+      if (typeof ev.cost === "number" && Number.isFinite(ev.cost)) s.cost = ev.cost;
+    } else if (ev.type === "tool.call") {
+      pushActivity(s, {
+        id: `t${ev.seq}`, t: ev.t, agentId: ev.agentId as string, taskId: ev.teamId,
+        kind: "tool", name: ev.name as string, text: summarizeArgs(ev.name as string, ev.args),
+      });
+    } else if (ev.type === "note.added") {
+      // Shared blackboard: team notes are swarm-wide facts.
+      s.notes.push({
+        t: ev.t, taskId: ev.taskId as string | undefined, agentId: ev.agentId as string | undefined,
+        key: ev.key as string | undefined, kind: ev.kind as string | undefined, text: ev.text as string,
+      });
+      if (s.notes.length > 500) s.notes.splice(0, s.notes.length - 500);
+    }
+    return s;
+  }
+
   switch (ev.type) {
     case "run.created":
       s.meta = ev.meta as RunMeta;
@@ -127,6 +156,9 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
         t.report = ev.report as string;
         t.reportStatus = ev.status as "done" | "blocked";
         t.artifacts = (ev.artifacts as string[]) ?? t.artifacts;
+        if (Array.isArray(ev.keyFacts)) t.keyFacts = ev.keyFacts as string[];
+        if (Array.isArray(ev.openQuestions)) t.openQuestions = ev.openQuestions as string[];
+        if (Array.isArray(ev.filesTouched)) t.filesTouched = ev.filesTouched as string[];
         s.tasks.set(t.id, { ...t });
         pushActivity(s, {
           id: `r${ev.seq}`, t: ev.t, agentId: "", taskId: t.id, kind: "report",
@@ -195,10 +227,30 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
         kind: "result", name: ev.name as string, ok: ev.ok as boolean, text: String(ev.summary ?? ""),
       });
       break;
+    case "task.checkpoint": {
+      const t = s.tasks.get(ev.taskId as string);
+      if (t) {
+        t.lastCheckpoint = ev.summary as string;
+        s.tasks.set(t.id, { ...t });
+      }
+      break;
+    }
+    case "team.created": {
+      const t = s.tasks.get(ev.taskId as string);
+      if (t) {
+        t.team = true;
+        s.tasks.set(t.id, { ...t });
+      }
+      pushActivity(s, {
+        id: `tm${ev.seq}`, t: ev.t, agentId: "", taskId: (ev.taskId as string) ?? "", kind: "spawn",
+        text: `${ev.taskId} runs as a sub-swarm (${ev.maxWorkers ?? "?"} workers)`,
+      });
+      break;
+    }
     case "note.added": {
       const note: BlackboardNote = {
         t: ev.t, taskId: ev.taskId as string | undefined, agentId: ev.agentId as string | undefined,
-        key: ev.key as string | undefined, text: ev.text as string,
+        key: ev.key as string | undefined, kind: ev.kind as string | undefined, text: ev.text as string,
       };
       s.notes.push(note);
       if (s.notes.length > 500) s.notes.splice(0, s.notes.length - 500);

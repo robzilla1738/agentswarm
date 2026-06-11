@@ -31,7 +31,16 @@ export interface BlackboardNote {
   taskId?: string;
   agentId?: string;
   key?: string;
+  /** finding | decision | open-question | handoff (default finding) */
+  kind?: string;
   text: string;
+}
+
+export interface PhaseInfo {
+  t: number;
+  name: string;
+  goal?: string;
+  exitCriteria?: string;
 }
 
 /**
@@ -46,6 +55,8 @@ export class RunState {
   taskOrder: string[] = [];
   agents = new Map<string, AgentView>();
   notes: BlackboardNote[] = [];
+  phases: PhaseInfo[] = [];
+  planExcerpt = "";
   conductorLog: { t: number; text: string }[] = [];
   operatorNotes: { t: number; text: string; consumed: boolean }[] = [];
   usageByModel = new Map<string, Usage>();
@@ -64,10 +75,34 @@ export class RunState {
     this.pricing = pricing;
   }
 
+  /** Sub-states for hierarchical teams, keyed by the owning task id. */
+  teams = new Map<string, RunState>();
+
   apply(ev: SwarmEvent): void {
     this.lastSeq = ev.seq;
     this.lastT = ev.t;
     this.updatedAt = ev.t;
+    // Team-stamped events reduce into their team's sub-state so a sub-swarm's
+    // hundred tasks never pollute the root task list. Usage still rolls up
+    // here — the run's budget/cost is one number.
+    const teamId = typeof ev.teamId === "string" ? (ev.teamId as string) : undefined;
+    if (teamId) {
+      let team = this.teams.get(teamId);
+      if (!team) {
+        team = new RunState(this.pricing);
+        this.teams.set(teamId, team);
+      }
+      const { teamId: _omit, ...rest } = ev;
+      team.apply(rest as SwarmEvent);
+      if (ev.type === "usage") {
+        const u = ev.usage as Usage;
+        const model = (ev.model as string) ?? "unknown";
+        this.usageByModel.set(model, addUsage(this.usageByModel.get(model) ?? { ...ZERO_USAGE }, u));
+        this.totalUsage = addUsage(this.totalUsage, u);
+        this.cost += usageCost(u, this.pricing[model]);
+      }
+      return;
+    }
     switch (ev.type) {
       case "run.created": {
         this.meta = ev.meta as RunMeta;
@@ -125,7 +160,15 @@ export class RunState {
           t.report = ev.report as string;
           t.reportStatus = ev.status as "done" | "blocked";
           t.artifacts = (ev.artifacts as string[]) ?? t.artifacts;
+          if (Array.isArray(ev.keyFacts)) t.keyFacts = ev.keyFacts as string[];
+          if (Array.isArray(ev.openQuestions)) t.openQuestions = ev.openQuestions as string[];
+          if (Array.isArray(ev.filesTouched)) t.filesTouched = ev.filesTouched as string[];
         }
+        break;
+      }
+      case "task.checkpoint": {
+        const t = this.tasks.get(ev.taskId as string);
+        if (t) t.lastCheckpoint = ev.summary as string;
         break;
       }
       case "verify.result": {
@@ -172,17 +215,35 @@ export class RunState {
         }
         break;
       }
+      case "plan.updated":
+        this.planExcerpt = String(ev.excerpt ?? "");
+        break;
+      case "phase.set":
+        this.phases.push({
+          t: ev.t,
+          name: String(ev.name ?? ""),
+          goal: ev.goal as string | undefined,
+          exitCriteria: ev.exit_criteria as string | undefined,
+        });
+        break;
       case "note.added":
         this.notes.push({
           t: ev.t,
           taskId: ev.taskId as string | undefined,
           agentId: ev.agentId as string | undefined,
           key: ev.key as string | undefined,
+          kind: ev.kind as string | undefined,
           text: ev.text as string,
         });
         // Reduced state is held live by the hub and the resume seed — keep
-        // only the tail that digests/views actually use.
-        if (this.notes.length > 1000) this.notes.splice(0, this.notes.length - 1000);
+        // only the tail that digests/views actually use. Decisions are never
+        // dropped: they anchor the conductor's long-horizon coherence.
+        if (this.notes.length > 1000) {
+          const decisions = this.notes.filter((n) => n.kind === "decision");
+          const rest = this.notes.filter((n) => n.kind !== "decision");
+          rest.splice(0, rest.length - Math.max(0, 1000 - decisions.length));
+          this.notes = [...decisions, ...rest].sort((a, b) => a.t - b.t);
+        }
         break;
       case "conductor.say":
         this.conductorLog.push({ t: ev.t, text: ev.text as string });

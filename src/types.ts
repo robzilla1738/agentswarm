@@ -57,6 +57,12 @@ export interface TaskSpec {
   deps?: string[];
   verify?: boolean;
   context?: string;
+  /** Model tier: cheap for scouts/bulk, strong for leads and verified deliverables. */
+  model?: "cheap" | "default" | "strong";
+  /** Run this task as a sub-swarm with its own conductor (one level deep). */
+  team?: boolean;
+  teamMaxWorkers?: number;
+  teamBudgetTokens?: number;
 }
 
 export interface Task {
@@ -70,11 +76,23 @@ export interface Task {
   status: TaskStatus;
   attempt: number;
   wave: number;
+  /** Resolved model tier from the spawn spec. */
+  modelTier?: "cheap" | "default" | "strong";
+  /** This task runs as a sub-swarm (hierarchical team). */
+  team?: boolean;
+  teamMaxWorkers?: number;
+  teamBudgetTokens?: number;
   report?: string;
   reportStatus?: "done" | "blocked";
   artifacts: string[];
   feedback?: string;
   error?: string;
+  /** Latest progress summary journaled by a worker (compaction or checkpoint tool). */
+  lastCheckpoint?: string;
+  /** Structured handoff fields from the worker's report. */
+  keyFacts?: string[];
+  openQuestions?: string[];
+  filesTouched?: string[];
   createdAt: number;
   startedAt?: number;
   endedAt?: number;
@@ -128,12 +146,14 @@ export interface RunSummary {
  *  task.status     { taskId, status, attempt, reason? }
  *  task.report     { taskId, status, report, artifacts }
  *  verify.result   { taskId, pass, feedback }
+ *  task.checkpoint { taskId, agentId, attempt, summary } — durable progress marker
  *  agent.spawned   { agentId, taskId, role, model, purpose }
  *  agent.done      { agentId, taskId, steps }
  *  agent.delta     { agentId, taskId, channel: "text"|"think", text }
  *  tool.call       { agentId, taskId, callId, name, args }
  *  tool.result     { agentId, taskId, callId, ok, summary }
- *  note.added      { taskId, agentId, key?, text }
+ *  note.added      { taskId, agentId, key?, kind?, text }
+ *  phase.set       { name, goal, exit_criteria }       — conductor milestone
  *  usage           { agentId, model, usage: Usage, cost }
  *  budget          { spentTokens, capTokens, cost }
  *  operator.note   { text }

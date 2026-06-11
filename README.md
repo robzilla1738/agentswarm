@@ -101,9 +101,15 @@ Run options (also on the UI launch form under Options): `--workers N` (paralleli
 
 ## How it works
 
-The conductor is a model with three tools: `spawn_tasks`, `wait`, and `finish`. It reads the mission, spawns self-contained tasks (each with an objective, success criteria, a role, optional dependencies, and an optional `verify` flag), then reacts as reports come back.
+The conductor is a model with six tools: `spawn_tasks`, `set_phase`, `update_plan`, `read_report`, `wait`, and `finish`. It reads the mission, spawns self-contained tasks (each with an objective, success criteria, a role, optional dependencies, and an optional `verify` flag), then reacts as reports come back. On long missions it declares phases (`set_phase`) whose goals and exit criteria are pinned into every update — so the plan survives even when old history is trimmed and replaced by a mission ledger (settled tasks, decisions, current phase).
 
-Each task becomes an autonomous agent with a tool budget. It works in small steps, posts durable findings to the blackboard, saves artifacts, and ends by reporting back. The report is the only thing the conductor sees, which keeps reports specific.
+Each task becomes an autonomous agent with a tool budget. It works in small steps, posts durable findings to the blackboard (decisions are never trimmed from digests; `search_notes` searches the full history), journals progress checkpoints on long tasks, saves artifacts, and ends by reporting back with structured handoff fields (`key_facts`, `open_questions`, `files_touched`). Dependent tasks receive report excerpts plus those fields, and can pull full text with `read_report`.
+
+**Scale.** A global AIMD limiter (`maxConcurrentCalls`) bounds concurrent model calls per endpoint — a 429 halves the ceiling, successes recover it, and conductor calls always jump the queue, so a 100-agent swarm degrades gracefully instead of melting down. Settles are debounced before waking the conductor; on big runs the task table collapses settled waves (failures stay itemized) and excess reports become one-liners the conductor can expand with `read_report`. Spawn specs take a `model` tier (`cheap` for scouts, `strong` for leads/verifiers via `cheapModel`/`strongModel` config) and `team:true` to run a task as a full sub-swarm — its own conductor decomposes it in parallel and reports one consolidated result, with all activity journaled under its `teamId`.
+
+**Long horizon.** The conductor maintains a living `mission-plan.md` (`update_plan`) pinned into every update and restored on resume; every 25 settled tasks a progress snapshot lands in `artifacts/` so multi-day runs always have a partial deliverable; and real-directory runs leave a memory (`~/.agentswarm/memory/`) of missions, outcomes, and decisions that seeds the next swarm in the same workspace.
+
+Verified tasks pass two gates: a free mechanical check (claimed artifacts must exist and be non-empty), then a blind LLM verifier that judges the deliverables against the objective with its own tools — it never sees the worker's blackboard. In `--verify strict` mode, a completeness critic reviews the whole run for gaps before synthesis (the conductor gets one round to fill them), and the final report is checked for faithfulness against the task reports.
 
 The scheduler starts a task as soon as its dependencies are done, up to the parallelism cap. Tasks whose dependencies failed are blocked and surfaced to the conductor for re-planning.
 
@@ -111,7 +117,16 @@ When the conductor finishes (or the budget forces it), a synthesizer composes `f
 
 The journal is the source of truth. Every run is an append-only `events.jsonl`; the terminal dashboard, the web UI, and `swarm ls` all reduce the same file. That's why runs survive crashes and can be resumed or replayed. Runs live under `~/.agentswarm/runs/<id>/`.
 
-If the engine process dies without writing a terminal status (kill -9, reboot), the hub notices the missing process and shows the run as interrupted instead of leaving it "running" forever.
+If the engine process dies without writing a terminal status (kill -9, reboot), the hub notices the missing process and shows the run as interrupted instead of leaving it "running" forever. `swarm resume <id>` continues it: settled tasks keep their results, and tasks that were mid-flight restart *warm* from their last journaled checkpoint instead of from scratch. SIGTERM flushes the journal synchronously and leaves the run resumable.
+
+## Troubleshooting
+
+- **"interrupted — the engine process is no longer running"** — the engine died without a terminal status (kill -9, reboot, crash). Check `~/.agentswarm/runs/<id>/exec.log` for the crash output, then `swarm resume <id>`.
+- **Run ended with "conductor unavailable"** — five consecutive conductor API calls failed (after backoff). Usually a provider outage or a bad model name; check the run's activity log for the underlying error, fix, and resume.
+- **"journal writes are failing"** — the engine could not append to `events.jsonl` (disk full, permissions). The run aborts deliberately rather than doing unrecorded work.
+- **A verified task keeps failing with "Claimed artifact(s) do not exist"** — the worker reported files it never wrote. That's the mechanical pre-verifier doing its job; the retry prompt tells the worker to actually create them.
+- **Docker sandbox fails to start** — confirm `docker info` works as your user, and that the configured `sandboxImage` can be pulled. `swarm sandbox test` checks the configured runtime end-to-end.
+- **Hung or wedged run** — `swarm cancel <id>` aborts in-flight agents within ~1s; sandbox teardown is bounded by a 15s timeout so it can't hang shutdown.
 
 ## Architecture
 

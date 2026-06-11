@@ -13,6 +13,8 @@ export interface AgentHooks {
   onUsage?: (model: string, usage: Usage) => void;
   onTranscript?: (messages: ChatMsg[]) => void;
   onLog?: (level: "info" | "warn" | "error", msg: string) => void;
+  /** Fired with the compaction summary — a free durable progress checkpoint. */
+  onCheckpoint?: (summary: string) => void;
 }
 
 export interface AgentParams {
@@ -96,7 +98,18 @@ export async function runAgent(p: AgentParams): Promise<AgentOutcome> {
     stopReason = p.stop?.() ?? null;
     if (stopReason) break;
     steps++;
-    const res = await callModel();
+    let res: ChatResult;
+    try {
+      res = await callModel();
+    } catch (e) {
+      // The chat client already retries 429/5xx; this catches the rest of the
+      // transient class (connection resets, DNS blips) once per step so a
+      // single network hiccup doesn't burn a whole task attempt.
+      if (p.signal.aborted) throw e;
+      hooks.onLog?.("warn", `${p.agentId}: model call failed (${errMsg(e)}); retrying once`);
+      await new Promise((r) => setTimeout(r, 1500));
+      res = await callModel();
+    }
     hooks.onUsage?.(p.model, res.usage);
     usage = addUsage(usage, res.usage);
 
@@ -251,6 +264,7 @@ async function compact(p: AgentParams, messages: ChatMsg[]): Promise<ChatMsg[]> 
     });
     p.hooks.onUsage?.(p.model, res.usage);
     summary = res.content || "(compaction produced no summary)";
+    if (res.content) p.hooks.onCheckpoint?.(res.content);
   } catch (e) {
     // Compaction is best-effort; fall back to hard truncation.
     summary = "(compaction failed: " + errMsg(e) + ") Earlier steps were dropped.";

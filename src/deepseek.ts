@@ -41,6 +41,8 @@ export interface ChatOpts {
   thinking: boolean;
   reasoningEffort?: ReasoningEffort;
   signal?: AbortSignal;
+  /** "high" jumps the global call queue (conductor/orchestration calls). */
+  priority?: "high" | "normal";
   onDelta?: (d: { text?: string; think?: string }) => void;
 }
 
@@ -55,10 +57,13 @@ export interface ChatResult {
 export class ApiError extends Error {
   status: number;
   body: string;
-  constructor(status: number, body: string) {
+  /** Parsed Retry-After (ms) when the server sent one with a 429. */
+  retryAfterMs?: number;
+  constructor(status: number, body: string, retryAfterMs?: number) {
     super(`API ${status}: ${body.slice(0, 600)}`);
     this.status = status;
     this.body = body;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
@@ -107,23 +112,143 @@ function sanitizeMessages(messages: ChatMsg[], thinking: boolean): unknown[] {
   });
 }
 
+// ---------- global call gate (AIMD concurrency limiter, per endpoint) ----------
+
+export interface GateState {
+  ceiling: number;
+  active: number;
+  queued: number;
+}
+
 /**
- * One streaming chat-completions call with retries. Streams deltas (text and
- * reasoning), accumulates tool calls, captures usage from the final chunk.
+ * Bounds concurrent streaming calls per provider endpoint so a 100-agent swarm
+ * doesn't turn into a 429 storm. AIMD: a 429 halves the ceiling (min 2) and
+ * imposes the server's Retry-After as a cool-down; sustained successes recover
+ * it additively back toward the configured max. Two-tier FIFO: "high" priority
+ * (conductor/orchestration) jumps ahead so queued workers can't starve the
+ * brain of the swarm.
+ */
+export class CallGate {
+  private max: number;
+  private ceiling: number;
+  private active = 0;
+  private high: Array<() => void> = [];
+  private low: Array<() => void> = [];
+  private successes = 0;
+  private cooldownUntil = 0;
+  onState?: (s: GateState) => void;
+
+  constructor(max: number) {
+    this.max = Math.max(1, max);
+    this.ceiling = this.max;
+  }
+
+  state(): GateState {
+    return { ceiling: this.ceiling, active: this.active, queued: this.high.length + this.low.length };
+  }
+
+  configure(max: number): void {
+    this.max = Math.max(1, max);
+    if (this.ceiling > this.max) this.ceiling = this.max;
+    this.pump();
+  }
+
+  async acquire(priority: "high" | "normal", signal?: AbortSignal): Promise<void> {
+    const wait = this.cooldownUntil - Date.now();
+    if (wait > 0) await sleep(wait);
+    if (signal?.aborted) throw new CancelledError();
+    if (this.active < this.ceiling) {
+      this.active++;
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const queue = priority === "high" ? this.high : this.low;
+      const entry = () => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      };
+      const onAbort = () => {
+        const i = queue.indexOf(entry);
+        if (i >= 0) queue.splice(i, 1);
+        reject(new CancelledError());
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      queue.push(entry);
+    });
+  }
+
+  release(): void {
+    this.active = Math.max(0, this.active - 1);
+    this.pump();
+  }
+
+  reportRateLimit(retryAfterMs?: number): void {
+    this.ceiling = Math.max(2, Math.floor(this.ceiling / 2));
+    this.successes = 0;
+    if (retryAfterMs && retryAfterMs > 0) {
+      this.cooldownUntil = Math.max(this.cooldownUntil, Date.now() + Math.min(retryAfterMs, 60_000));
+    }
+    this.onState?.(this.state());
+  }
+
+  reportSuccess(): void {
+    if (this.ceiling >= this.max) return;
+    if (++this.successes >= 10) {
+      this.successes = 0;
+      this.ceiling++;
+      this.onState?.(this.state());
+      this.pump();
+    }
+  }
+
+  private pump(): void {
+    while (this.active < this.ceiling) {
+      const next = this.high.shift() ?? this.low.shift();
+      if (!next) break;
+      this.active++;
+      next();
+    }
+  }
+}
+
+const gates = new Map<string, CallGate>();
+
+export function gateFor(cfg: SwarmConfig): CallGate {
+  const key = cfg.baseUrl;
+  let g = gates.get(key);
+  if (!g) {
+    g = new CallGate(cfg.maxConcurrentCalls);
+    gates.set(key, g);
+  }
+  g.configure(cfg.maxConcurrentCalls);
+  return g;
+}
+
+/**
+ * One streaming chat-completions call with retries, behind the global gate.
+ * The retry backoff sleeps OUTSIDE the gate so a waiting call never holds a
+ * concurrency slot.
  */
 export async function chat(cfg: SwarmConfig, o: ChatOpts): Promise<ChatResult> {
+  const gate = gateFor(cfg);
   let lastErr: unknown;
   const attempts = 4;
   for (let i = 0; i < attempts; i++) {
+    await gate.acquire(o.priority ?? "normal", o.signal);
     try {
-      return await chatOnce(cfg, o);
+      const res = await chatOnce(cfg, o);
+      gate.reportSuccess();
+      return res;
     } catch (e) {
       lastErr = e;
+      if (e instanceof ApiError && e.status === 429) gate.reportRateLimit(e.retryAfterMs);
       if (!retryable(e) || i === attempts - 1) throw e;
-      const backoff = [1500, 5000, 15000][i] ?? 15000;
-      await sleep(backoff + Math.random() * 1000);
-      if (o.signal?.aborted) throw new CancelledError();
+    } finally {
+      gate.release();
     }
+    const backoff = [1500, 5000, 15000][i] ?? 15000;
+    await sleep(backoff + Math.random() * 1000);
+    if (o.signal?.aborted) throw new CancelledError();
   }
   throw lastErr;
 }
@@ -192,7 +317,8 @@ async function chatOnce(cfg: SwarmConfig, o: ChatOpts): Promise<ChatResult> {
 
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new ApiError(res.status, text);
+      const ra = Number(res.headers.get("retry-after"));
+      throw new ApiError(res.status, text, Number.isFinite(ra) && ra >= 0 ? ra * 1000 : undefined);
     }
     if (!res.body) throw new ApiError(0, "empty response body");
 

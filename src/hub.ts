@@ -250,7 +250,7 @@ async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL
     }
 
     if (sub === "/stream" && method === "GET") {
-      return streamEvents(res, id);
+      return streamEvents(res, id, url.searchParams.get("quiet") === "1");
     }
 
     if (sub === "/note" && method === "POST") {
@@ -315,7 +315,7 @@ async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL
   sendJson(res, 404, { error: "not found" });
 }
 
-function streamEvents(res: http.ServerResponse, id: string): void {
+function streamEvents(res: http.ServerResponse, id: string, quiet = false): void {
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache, no-transform",
@@ -335,6 +335,8 @@ function streamEvents(res: http.ServerResponse, id: string): void {
       return;
     }
     for (const ev of evs) {
+      // quiet mode: skip streaming chatter for clients rendering many agents.
+      if (quiet && ev.type === "agent.delta") continue;
       res.write(`data: ${JSON.stringify(ev)}\n\n`);
     }
   };

@@ -1,13 +1,11 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { api } from "@/lib/api";
 import { fmtDur, statusColor } from "@/lib/format";
 import { PixelAvatar, personaName } from "@/lib/persona";
 import type { AgentView, Task } from "@/lib/types";
-import { StatusBadge } from "./atoms";
+import { Md, StatusBadge } from "./atoms";
 
 export function TaskDetail({
   runId,
@@ -67,6 +65,10 @@ export function TaskDetail({
           <h2 className="text-lg font-semibold leading-snug">{task.title}</h2>
           <div className="flex flex-wrap gap-x-3 gap-y-1 text-2xs mt-1.5 text-ink-faint">
             <span>wave {task.wave}</span>
+            {task.team && <span className="text-ink-dim">⌬ sub-swarm</span>}
+            {task.modelTier && task.modelTier !== "default" && (
+              <span className="mono text-ink-dim">{task.modelTier} tier</span>
+            )}
             {task.deps.length > 0 && <span className="mono">⇠ {task.deps.join(", ")}</span>}
             {task.verify && <span className="text-ink-dim">⊛ adversarially verified</span>}
             {task.attempt > 1 && <span className="text-ink-dim">attempt {task.attempt}</span>}
@@ -76,16 +78,12 @@ export function TaskDetail({
 
         <div className="px-6 py-5">
           <Section title="Objective">
-            <p className="text-sm leading-relaxed whitespace-pre-wrap text-ink-dim">
-              {task.objective}
-            </p>
+            <Md compact>{task.objective}</Md>
           </Section>
 
           {task.context && (
             <Section title="Context from the conductor">
-              <p className="text-xs leading-relaxed whitespace-pre-wrap text-ink-faint">
-                {task.context}
-              </p>
+              <Md compact dim>{task.context}</Md>
             </Section>
           )}
 
@@ -95,9 +93,54 @@ export function TaskDetail({
                 className="rounded-xl px-4 py-3.5 border border-border-soft"
                 style={{ background: "var(--input-bg)" }}
               >
-                <div className="prose-report" style={{ fontSize: 13 }}>
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{task.report}</ReactMarkdown>
-                </div>
+                <Md compact>{task.report}</Md>
+              </div>
+            </Section>
+          )}
+
+          {task.keyFacts && task.keyFacts.length > 0 && (
+            <Section title="Key facts (handoff)">
+              <ul className="space-y-1.5">
+                {task.keyFacts.map((f, i) => (
+                  <li key={i} className="flex items-start gap-2 text-xs leading-relaxed text-ink-dim">
+                    <span className="text-ink-faint shrink-0" style={{ marginTop: 1 }}>◆</span>
+                    <Md compact dim>{f}</Md>
+                  </li>
+                ))}
+              </ul>
+            </Section>
+          )}
+
+          {task.openQuestions && task.openQuestions.length > 0 && (
+            <Section title="Open questions">
+              <ul className="space-y-1.5">
+                {task.openQuestions.map((q, i) => (
+                  <li key={i} className="flex items-start gap-2 text-xs leading-relaxed text-ink-faint">
+                    <span className="shrink-0" style={{ marginTop: 1 }}>?</span>
+                    <Md compact dim>{q}</Md>
+                  </li>
+                ))}
+              </ul>
+            </Section>
+          )}
+
+          {task.filesTouched && task.filesTouched.length > 0 && (
+            <Section title={`Files touched · ${task.filesTouched.length}`}>
+              <div className="flex flex-wrap gap-1.5">
+                {task.filesTouched.map((f) => (
+                  <span key={f} className="chip">{f}</span>
+                ))}
+              </div>
+            </Section>
+          )}
+
+          {task.lastCheckpoint && task.status !== "done" && (
+            <Section title="Latest checkpoint">
+              <div
+                className="rounded-xl px-3.5 py-3 border border-border-soft"
+                style={{ background: "rgb(var(--hi) / 0.02)" }}
+              >
+                <Md compact dim>{task.lastCheckpoint}</Md>
               </div>
             </Section>
           )}
@@ -105,10 +148,10 @@ export function TaskDetail({
           {task.feedback && (
             <Section title="Verifier feedback">
               <div
-                className="text-xs leading-relaxed whitespace-pre-wrap rounded-xl p-3.5 text-ink-dim"
+                className="rounded-xl p-3.5"
                 style={{ background: "rgb(var(--hi) / 0.03)", border: "1px solid rgb(var(--hi) / 0.16)" }}
               >
-                {task.feedback}
+                <Md compact dim>{task.feedback}</Md>
               </div>
             </Section>
           )}
@@ -193,8 +236,8 @@ function AgentBlock({ agent, now, expanded, attempt }: { agent: AgentView; now: 
           {agent.lastText && (
             <div>
               <div className="label mb-1">output</div>
-              <div className="text-xs leading-relaxed whitespace-pre-wrap text-ink-dim" style={{ maxHeight: 180, overflow: "auto" }}>
-                {agent.lastText.slice(-1400)}
+              <div style={{ maxHeight: 180, overflow: "auto" }}>
+                <Md compact dim>{agent.lastText.slice(-1400)}</Md>
               </div>
             </div>
           )}

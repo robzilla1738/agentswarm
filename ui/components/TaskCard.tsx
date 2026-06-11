@@ -51,6 +51,14 @@ export function TaskCard({
         <span className="mono text-2xs font-bold shrink-0" style={{ color }}>{task.id}</span>
         <span className="text-2xs font-medium shrink-0 text-ink-dim">{personaName(task.id)}</span>
         <span className="text-2xs shrink-0 text-ink-faint">· {role}</span>
+        {task.team && (
+          <span title="runs as a sub-swarm" className="text-2xs text-ink-dim">⌬</span>
+        )}
+        {task.modelTier && task.modelTier !== "default" && (
+          <span title={`${task.modelTier} model tier`} className="mono text-2xs shrink-0 text-ink-faint">
+            {task.modelTier === "strong" ? "S" : "¢"}
+          </span>
+        )}
         {task.verify && (
           <span title="adversarially verified" className="text-2xs text-ink-dim">⊛</span>
         )}

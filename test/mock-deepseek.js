@@ -12,7 +12,10 @@ const PORT = Number(process.argv[2]) || 0;
 const AUTH_INVALID = process.env.MOCK_AUTH === "invalid";
 // Alternate scripts: default | verify-retry | note-cancel | compact
 const SCENARIO = process.env.MOCK_SCENARIO || "default";
+// Return 429 (Retry-After: 0) for the first N chat calls — limiter testing.
+let rateLimitFirst = Number(process.env.MOCK_429_FIRST || "0");
 let verdictCalls = 0;
+const seenModels = new Set();
 
 function unauthorized(res) {
   res.writeHead(401, { "content-type": "application/json" });
@@ -36,6 +39,18 @@ function textChunk(s) {
 function thinkChunk(s) {
   return { choices: [{ delta: { reasoning_content: s } }] };
 }
+// Multiple tool calls in one assistant turn (e.g. update_plan + spawn_tasks).
+function multiToolChunks(calls) {
+  const chunks = calls.map((c, i) => ({
+    choices: [{ delta: { tool_calls: [{ index: i, id: `call_m${i}`, type: "function", function: { name: c.name, arguments: JSON.stringify(c.args) } }] } }],
+  }));
+  return [
+    ...chunks,
+    { choices: [{ finish_reason: "tool_calls" }] },
+    { usage: { prompt_tokens: 800, completion_tokens: 120, prompt_cache_hit_tokens: 128 } },
+  ];
+}
+
 // Split tool-call arguments across two deltas to exercise accumulation.
 function toolChunks(name, argsObj) {
   const args = JSON.stringify(argsObj);
@@ -70,6 +85,12 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (AUTH_INVALID) return unauthorized(res);
+  if (rateLimitFirst > 0) {
+    rateLimitFirst--;
+    res.writeHead(429, { "content-type": "application/json", "retry-after": "0" });
+    res.end(JSON.stringify({ error: { message: "synthetic rate limit", type: "rate_limit_error" } }));
+    return;
+  }
   let body = "";
   req.on("data", (c) => (body += c));
   req.on("end", () => {
@@ -78,9 +99,38 @@ const server = http.createServer((req, res) => {
     const tools = (parsed.tools || []).map((t) => t.function?.name);
     const names = new Set(tools);
     const messages = parsed.messages || [];
+    if (parsed.model) seenModels.add(parsed.model);
+    const sysContent = String((messages[0] && messages[0].content) || "");
+
+    // Team-lead conductor (child swarm): its mission carries the TEAMOBJ marker.
+    if (SCENARIO === "team" && names.has("spawn_tasks") && sysContent.includes("TEAMOBJ")) {
+      const update = lastUser(messages);
+      if (update.includes("No tasks exist yet")) {
+        return sse(res, [...toolChunks("spawn_tasks", {
+          tasks: [
+            { title: "Part A", objective: "Do part A. Done when reported.", role: "researcher" },
+            { title: "Part B", objective: "Do part B. Done when reported.", role: "researcher" },
+          ],
+        })]);
+      }
+      if (/T1 \[done/.test(update) && /T2 \[done/.test(update)) {
+        return sse(res, [...toolChunks("finish", { notes: "Both parts complete." })]);
+      }
+      return sse(res, [...toolChunks("wait", { reason: "team in flight" })]);
+    }
+    // Team consolidation call (no tools, distinctive prompt).
+    if (SCENARIO === "team" && !tools.length && lastUser(messages).includes("Consolidate your team's work")) {
+      return sse(res, [textChunk("TEAM-CONSOLIDATED: parts A and B are complete with evidence."), { usage: { prompt_tokens: 50, completion_tokens: 20 } }]);
+    }
 
     // Conductor
     if (names.has("spawn_tasks")) {
+      if (SCENARIO === "conductor-fail") {
+        // Non-retryable, non-auth error: exercises the executor's circuit breaker.
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "synthetic conductor failure", type: "invalid_request_error" } }));
+        return;
+      }
       const update = lastUser(messages);
       if (update.includes("No tasks exist yet")) {
         if (SCENARIO === "verify-retry") {
@@ -110,6 +160,33 @@ const server = http.createServer((req, res) => {
             }),
           ]);
         }
+        if (SCENARIO === "team") {
+          return sse(res, [...toolChunks("spawn_tasks", {
+            tasks: [{ title: "Subsystem", objective: "TEAMOBJ: complete parts A and B.", role: "generalist", team: true, team_max_workers: 2 }],
+          })]);
+        }
+        if (SCENARIO === "model-tiers") {
+          return sse(res, [...toolChunks("spawn_tasks", {
+            tasks: [
+              { title: "Cheap scout", objective: "Scout quickly. Done when reported.", role: "researcher", model: "cheap" },
+              { title: "Strong lead", objective: "Lead deeply. Done when reported.", role: "analyst", model: "strong" },
+            ],
+          })]);
+        }
+        if (SCENARIO === "long-horizon") {
+          return sse(res, [...multiToolChunks([
+            { name: "update_plan", args: { markdown: "# Mission Plan\n\nPLAN-MARKER-V1: one task, then finish." } },
+            { name: "spawn_tasks", args: { tasks: [{ title: "Do the thing", objective: "Do it. Done when reported.", role: "generalist" }] } },
+          ])]);
+        }
+        if (SCENARIO === "blind-verify") {
+          return sse(res, [
+            textChunk("Spawning one verified writing task."),
+            ...toolChunks("spawn_tasks", {
+              tasks: [{ title: "Write brief", objective: "Write a short brief. Done when reported.", role: "writer", verify: true }],
+            }),
+          ]);
+        }
         return sse(res, [
           thinkChunk("Decompose into two scouts and a synthesis step."),
           textChunk("Spawning the first wave."),
@@ -126,8 +203,12 @@ const server = http.createServer((req, res) => {
       if (SCENARIO === "note-cancel") {
         return sse(res, [...toolChunks("wait", { reason: "monitoring the probes" })]);
       }
+      // Two-task scenarios finish when both settle.
+      if (SCENARIO === "model-tiers" && /T1 \[done/.test(update) && /T2 \[done/.test(update)) {
+        return sse(res, [...toolChunks("finish", { notes: "Both tiers reported." })]);
+      }
       // Single-task scenarios finish once T1 is done.
-      if ((SCENARIO === "verify-retry" || SCENARIO === "compact") && /T1 \[done/.test(update)) {
+      if ((SCENARIO === "verify-retry" || SCENARIO === "compact" || SCENARIO === "blind-verify" || SCENARIO === "team" || SCENARIO === "long-horizon") && /T1 \[done/.test(update)) {
         return sse(res, [...toolChunks("finish", { notes: "Task complete." })]);
       }
       // Default: finish only once the final dependent task (T3) is done;
@@ -158,6 +239,11 @@ const server = http.createServer((req, res) => {
     // Verifier
     if (names.has("verdict")) {
       verdictCalls++;
+      if (SCENARIO === "blind-verify") {
+        // Report whether the swarm's blackboard leaked into the verifier's context.
+        const leaked = JSON.stringify(messages).includes("SECRET-NOTE-XYZ");
+        return sse(res, [...toolChunks("verdict", { pass: true, feedback: leaked ? "LEAK" : "clean" })]);
+      }
       if (SCENARIO === "verify-retry" && verdictCalls === 1) {
         return sse(res, [
           thinkChunk("The report is missing required evidence."),
@@ -190,6 +276,31 @@ const server = http.createServer((req, res) => {
         return sse(res, [
           textChunk("Done."),
           ...toolChunks("report", { status: "done", report: "Read bulk outputs; context stayed manageable.", artifacts: [] }),
+        ]);
+      }
+      if (SCENARIO === "blind-verify") {
+        if (!hasToolResult(messages)) {
+          // Post a distinctive note to the blackboard, then report next turn.
+          return sse(res, [...toolChunks("note", { text: "SECRET-NOTE-XYZ planted by the worker", key: "probe" })]);
+        }
+        return sse(res, [
+          ...toolChunks("report", {
+            status: "done",
+            report: "Wrote the brief as asked; content reviewed and complete.",
+            artifacts: [],
+            key_facts: ["the brief covers all three sections"],
+          }),
+        ]);
+      }
+      if (system.includes("PROGRESS CHECKPOINT FROM A PREVIOUS ATTEMPT")) {
+        // The engine seeded this worker with a prior checkpoint — prove it.
+        return sse(res, [
+          textChunk("Resuming from checkpoint."),
+          ...toolChunks("report", {
+            status: "done",
+            report: "resumed-from-checkpoint: verified prior progress and completed the remainder.",
+            artifacts: [],
+          }),
         ]);
       }
       if (hasToolResult(messages)) {
