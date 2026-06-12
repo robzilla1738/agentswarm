@@ -232,7 +232,7 @@ export interface SearchEngine {
  */
 export function searchEngines(cfg: SwarmConfig): SearchEngine[] {
   if (cfg.searchBackend === "tinyfish" && cfg.tinyfishApiKey) {
-    return [{ name: "tinyfish", search: (q, n, s) => tinyfishSearch(cfg, q, n, s) }];
+    return [{ name: "tinyfish", search: (q, n, s, _deep, fresh) => tinyfishSearch(cfg, q, n, s, fresh) }];
   }
   if (cfg.searchBackend === "contextdev" && cfg.contextdevApiKey) {
     return [{ name: "contextdev", once: true, search: (q, n, s, deep) => contextdevSearch(cfg, q, n, s, deep) }];
@@ -242,7 +242,7 @@ export function searchEngines(cfg: SwarmConfig): SearchEngine[] {
     { name: "bing", search: (q, n, s, _deep, fresh) => bingSearch(q, n, s, fresh) },
   ];
   if (cfg.searchBackend === "auto" && cfg.tinyfishApiKey) {
-    engines.push({ name: "tinyfish", search: (q, n, s) => tinyfishSearch(cfg, q, n, s) });
+    engines.push({ name: "tinyfish", search: (q, n, s, _deep, fresh) => tinyfishSearch(cfg, q, n, s, fresh) });
   }
   if (cfg.searchBackend === "auto" && cfg.contextdevApiKey) {
     engines.push({ name: "contextdev", once: true, search: (q, n, s, deep) => contextdevSearch(cfg, q, n, s, deep) });
@@ -328,11 +328,15 @@ export async function contextdevSearch(
     }));
 }
 
+/** Days back each freshness window reaches (used to post-filter engines with no native date filter). */
+const FRESHNESS_DAYS: Record<Freshness, number> = { day: 1, week: 7, month: 31, year: 366 };
+
 export async function tinyfishSearch(
   cfg: SwarmConfig,
   query: string,
   count: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  freshness?: Freshness
 ): Promise<Candidate[]> {
   const url = `https://api.search.tinyfish.ai?query=${encodeURIComponent(query)}`;
   const res = await fetch(url, {
@@ -341,13 +345,23 @@ export async function tinyfishSearch(
   });
   if (!res.ok) throw new Error(`tinyfish search ${res.status}`);
   const data: any = await res.json();
-  return (data.results || []).slice(0, count).map((r: any, i: number) => ({
+  const hits: Candidate[] = (data.results || []).slice(0, count).map((r: any, i: number) => ({
     title: r.title || r.site_name || r.url,
     url: r.url,
     snippet: r.snippet || "",
     rank: i + 1,
     engine: "tinyfish",
+    date: detectDate(String(r.snippet || "")),
   }));
+  // The API has no date filter — drop hits whose detected date is clearly
+  // outside the window; undated hits stay (freshness is best-effort per engine).
+  if (!freshness) return hits;
+  const cutoff = Date.now() - FRESHNESS_DAYS[freshness] * 86_400_000;
+  return hits.filter((h) => {
+    if (!h.date) return true;
+    const t = Date.parse(/^\d{4}$/.test(h.date) ? `${h.date}-07-01` : h.date);
+    return !Number.isFinite(t) || t >= cutoff;
+  });
 }
 
 /**

@@ -271,23 +271,39 @@ export function daysToIso(days: number): string {
 
 // ---------------------------------------------------------------- evidence independence
 
+function jaccard(a: Set<string>, b: Set<string>): number {
+  let inter = 0;
+  for (const x of a) if (b.has(x)) inter++;
+  const union = a.size + b.size - inter;
+  return union ? inter / union : 0;
+}
+
+function hostOf(url: string): string {
+  try {
+    return new URL(canonicalizeUrl(url)).hostname.replace(/^www\./, "");
+  } catch {
+    return url.toLowerCase();
+  }
+}
+
 /**
- * Mean pairwise Jaccard overlap of the panel's cited source sets (canonical
- * URLs). 0 = fully independent evidence, 1 = everyone read the same pages.
- * Pairs where either panelist cited nothing are skipped — silence is not
- * agreement; no valid pairs → 0.
+ * Mean pairwise overlap of the panel's cited source sets: 0.7 × Jaccard on
+ * canonical URLs + 0.3 × Jaccard on domains. Exact-URL matching alone
+ * under-detects shared sourcing (two panelists on different pages of the same
+ * outlet still share an editorial line), which left k too high. 0 = fully
+ * independent evidence, 1 = everyone read the same pages. Pairs where either
+ * panelist cited nothing are skipped — silence is not agreement; no valid
+ * pairs → 0.
  */
 export function evidenceOverlap(sourceSets: string[][]): number {
-  const sets = sourceSets.map((urls) => new Set(urls.map((u) => canonicalizeUrl(u))));
+  const urlSets = sourceSets.map((urls) => new Set(urls.map((u) => canonicalizeUrl(u))));
+  const domainSets = sourceSets.map((urls) => new Set(urls.map(hostOf)));
   let sum = 0;
   let pairs = 0;
-  for (let i = 0; i < sets.length; i++) {
-    for (let j = i + 1; j < sets.length; j++) {
-      if (!sets[i].size || !sets[j].size) continue;
-      let inter = 0;
-      for (const u of sets[i]) if (sets[j].has(u)) inter++;
-      const union = sets[i].size + sets[j].size - inter;
-      sum += union ? inter / union : 0;
+  for (let i = 0; i < urlSets.length; i++) {
+    for (let j = i + 1; j < urlSets.length; j++) {
+      if (!urlSets[i].size || !urlSets[j].size) continue;
+      sum += 0.7 * jaccard(urlSets[i], urlSets[j]) + 0.3 * jaccard(domainSets[i], domainSets[j]);
       pairs++;
     }
   }

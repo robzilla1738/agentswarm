@@ -204,8 +204,16 @@ test("evidenceOverlap: identical sets → 1, disjoint → 0, empty pairs skipped
   // no valid pairs at all → 0
   assert.equal(evidenceOverlap([[], []]), 0);
   assert.equal(evidenceOverlap([a]), 0);
-  // half overlap: {1,2} vs {2,3} → 1/3
-  near(evidenceOverlap([["https://x.com/1", "https://x.com/2"], ["https://x.com/2", "https://x.com/3"]]), 1 / 3, 1e-9);
+  // same-domain partial overlap: 0.7·urlJaccard(1/3) + 0.3·domainJaccard(1) —
+  // two panelists reading the same outlet share sourcing beyond exact URLs
+  near(
+    evidenceOverlap([["https://x.com/1", "https://x.com/2"], ["https://x.com/2", "https://x.com/3"]]),
+    0.7 * (1 / 3) + 0.3,
+    1e-9
+  );
+  // cross-domain partial overlap stays lower than same-domain at equal URL overlap
+  const cross = evidenceOverlap([["https://x.com/1", "https://a.com/2"], ["https://a.com/2", "https://y.com/3"]]);
+  near(cross, 0.7 * (1 / 3) + 0.3 * (1 / 3), 1e-9);
 });
 
 test("scaleK: full independence keeps k, full overlap kills extremization", () => {

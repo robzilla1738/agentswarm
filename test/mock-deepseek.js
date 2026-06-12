@@ -328,8 +328,9 @@ const server = http.createServer((req, res) => {
       }
       const prob = { "outside-view": 60, "inside-view": 70, trend: 80 }[method];
       const prior = { "outside-view": 55, "inside-view": 65, trend: 70 }[method];
-      // Distinct sources per panelist: evidence overlap must compute to 0.
-      const src = { "outside-view": "https://example.com/base-rates", "inside-view": "https://example.com/inside", trend: "https://example.com/trend" }[method];
+      // Distinct sources AND distinct domains per panelist: evidence overlap
+      // must compute to 0 (the overlap blend also scores shared domains).
+      const src = { "outside-view": "https://base-rates.example/data", "inside-view": "https://inside.example/report", trend: "https://trend.example/series" }[method];
       return sse(res, [...toolChunks("submit_forecast", {
         probability: prob,
         prior,

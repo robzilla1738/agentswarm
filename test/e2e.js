@@ -18,12 +18,24 @@ function fail(msg) {
 }
 const ok = (m) => console.log("  ✓ " + m);
 
+// A mock that outlives the suite inherits our stdio and wedges any piped
+// consumer (`npm test | tail` never sees EOF) — reap every mock on exit,
+// including the fail() path, which used to orphan the failing phase's mock.
+const liveMocks = new Set();
+process.on("exit", () => {
+  for (const p of liveMocks) {
+    try { p.kill("SIGKILL"); } catch { /* already gone */ }
+  }
+});
+
 function startMock(extraEnv) {
   return new Promise((resolve, reject) => {
     const proc = spawn(process.execPath, [path.join(__dirname, "mock-deepseek.js"), "0"], {
       stdio: ["ignore", "pipe", "inherit"],
       env: { ...process.env, ...extraEnv },
     });
+    liveMocks.add(proc);
+    proc.on("exit", () => liveMocks.delete(proc));
     const t = setTimeout(() => reject(new Error("mock did not start")), 5000);
     proc.stdout.on("data", (b) => {
       const m = /MOCK_PORT=(\d+)/.exec(b.toString());

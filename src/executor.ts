@@ -2328,8 +2328,9 @@ PROTOCOL
     if (this.ac.signal.aborted) return true;
 
     // Strict mode: a pass verdict backed by zero tool calls is an opinion,
-    // not a verification. One re-run demanding evidence; if that also passes
-    // tool-free, accept but say so in the journal.
+    // not a verification. One re-run demanding evidence; a second tool-free
+    // pass FAILS the task back to the worker — strict means verified, and an
+    // unverifiable pass is exactly what strict mode exists to refuse.
     if (strict && outcome.terminal && Boolean((outcome.terminal.args as { pass?: boolean }).pass) && evidenceCalls === 0) {
       this.journal.append("log", {
         level: "info",
@@ -2341,10 +2342,17 @@ PROTOCOL
       );
       if (this.ac.signal.aborted) return true;
       if (second.outcome.terminal) {
-        if (second.evidenceCalls === 0) {
-          this.journal.append("log", { level: "warn", msg: `verifier passed ${task.id} without gathering evidence` });
-        }
         outcome = second.outcome;
+        if (second.evidenceCalls === 0 && Boolean((second.outcome.terminal.args as { pass?: boolean }).pass)) {
+          this.journal.append("log", {
+            level: "warn",
+            msg: `verifier passed ${task.id} twice without gathering evidence — failing closed (strict)`,
+          });
+          task.feedback =
+            "Verification could not be completed with concrete evidence. Make the deliverable independently checkable: exact file paths, runnable commands, and source URLs in the report.";
+          this.journal.append("verify.result", { taskId: task.id, pass: false, feedback: task.feedback });
+          return false;
+        }
       }
     }
 
