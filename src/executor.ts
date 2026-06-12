@@ -42,7 +42,7 @@ import { aggregateSources, renderFinalHtml, sourcesBlock } from "./report";
 import { SandboxRuntime, createSandbox } from "./sandbox";
 import { RunState } from "./state";
 import { RunMeta, RunStatus, Task, TaskSpec, Usage, usageCost } from "./types";
-import { clip, ensureDir, errMsg, oneLine, rid, sleep, truncateMiddle, validateArtifactFormat } from "./util";
+import { canonicalArtifactRel, clip, ensureDir, errMsg, oneLine, rid, sleep, truncateMiddle, validateArtifactFormat } from "./util";
 
 
 export interface ExecutorOptions {
@@ -1254,7 +1254,27 @@ export class Executor {
     };
     const report = String(a.report ?? "(empty report)");
     const reportStatus: "done" | "blocked" = a.status === "blocked" ? "blocked" : "done";
-    const reportedArtifacts = Array.isArray(a.artifacts) ? a.artifacts.map(String) : [];
+    // Normalize before merging: "artifacts/x.md", "workspace/x.md", "./x.md"
+    // and absolute paths are all the same file save_artifact registered as
+    // "x.md" — verbatim merging used to create phantom entries the mechanical
+    // verifier then failed as "missing". When the canonical form resolves to
+    // nothing but the verbatim name does (a real artifacts/ subdir in a
+    // user-supplied cwd), the verbatim name wins; an unresolvable name is kept
+    // verbatim so preVerify can fail it honestly instead of it vanishing.
+    const artDir = path.join(this.runDirPath, "artifacts");
+    const fileAt = (rel: string) =>
+      this.artifactStat(path.join(artDir, rel)) || this.artifactStat(path.resolve(this.meta.cwd, rel));
+    const reportedArtifacts = Array.isArray(a.artifacts)
+      ? a.artifacts
+          .map((x) => {
+            const raw = String(x).trim();
+            const canon = canonicalArtifactRel(raw, artDir, this.meta.cwd);
+            if (!canon) return raw;
+            if (canon !== raw && this.sandbox.localFs && !fileAt(canon) && fileAt(raw)) return raw;
+            return canon;
+          })
+          .filter(Boolean)
+      : [];
     for (const art of reportedArtifacts) if (!task.artifacts.includes(art)) task.artifacts.push(art);
     task.report = report;
     task.reportStatus = reportStatus;
@@ -1312,6 +1332,16 @@ export class Executor {
     return "done";
   }
 
+  /** True iff `p` is a non-empty regular file — directories never count as artifacts. */
+  private artifactStat(p: string): boolean {
+    try {
+      const st = fs.statSync(p);
+      return st.isFile() && st.size > 0;
+    } catch {
+      return false;
+    }
+  }
+
   /** Zero-token sanity checks before the LLM verifier. Returns failure feedback or null. */
   private preVerify(task: Task): string | null {
     const report = task.report ?? "";
@@ -1322,24 +1352,37 @@ export class Executor {
     const malformed: string[] = [];
     // Remote sandboxes own their filesystem — only check host-visible paths.
     if (this.sandbox.localFs) {
-      const okAt = (p: string) => {
-        try {
-          return fs.statSync(p).size > 0;
-        } catch {
-          return false;
-        }
-      };
+      const okAt = (p: string) => this.artifactStat(p);
+      const artDir = path.join(this.runDirPath, "artifacts");
       for (const rel of task.artifacts) {
-        const inArtifacts = path.join(this.runDirPath, "artifacts", rel);
-        const inWorkdir = path.resolve(this.meta.cwd, rel);
-        if (!okAt(inArtifacts) && !okAt(inWorkdir)) {
+        // Check the canonical form too — names are normalized at report
+        // intake, but resumed runs may carry pre-normalization entries.
+        const canon = canonicalArtifactRel(rel, artDir, this.meta.cwd);
+        const candidates = [...new Set([rel, canon].filter(Boolean))].flatMap((r) => [
+          path.join(artDir, r),
+          path.resolve(this.meta.cwd, r),
+        ]);
+        const found = candidates.find(okAt);
+        if (!found) {
           missing.push(rel);
           continue;
+        }
+        // A deliverable that exists only in the workspace is invisible to the
+        // operator (the hub serves runDir/artifacts) — copy it in so the
+        // Artifacts tab link works. Best-effort: verification already passed.
+        const inArtifacts = path.join(artDir, canon || rel);
+        if (!found.startsWith(artDir + path.sep) && !okAt(inArtifacts)) {
+          try {
+            fs.mkdirSync(path.dirname(inArtifacts), { recursive: true });
+            fs.copyFileSync(found, inArtifacts);
+          } catch {
+            /* leave it where it is */
+          }
         }
         // Structural format check (json parses, csv is rectangular, html is
         // not a stub) — free, and catches what the LLM verifier wastes a whole
         // agent run discovering.
-        const problem = validateArtifactFormat(okAt(inArtifacts) ? inArtifacts : inWorkdir);
+        const problem = validateArtifactFormat(found);
         if (problem) malformed.push(`${rel}: ${problem}`);
       }
     }
@@ -1625,9 +1668,9 @@ export class Executor {
         this.flushDeltas(agentId);
         this.journal.append("tool.call", { agentId, taskId, callId, name, args });
       },
-      onToolResult: (callId: string, name: string, ok: boolean, summary: string) => {
+      onToolResult: (callId: string, name: string, ok: boolean, summary: string, urls?: string[]) => {
         if (!ok && trackErrorsOn) trackErrorsOn.lastToolError = `${name}: ${oneLine(summary, 200)}`;
-        this.journal.append("tool.result", { agentId, taskId, callId, name, ok, summary });
+        this.journal.append("tool.result", { agentId, taskId, callId, name, ok, summary, ...(urls ? { urls } : {}) });
       },
       onUsage: this.onUsage,
       onLog: (level: "info" | "warn" | "error", msg: string) => {

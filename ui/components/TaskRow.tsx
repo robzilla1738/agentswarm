@@ -34,6 +34,14 @@ export function TaskRow({ task, now, onClick }: { task: Task; now: number; onCli
       {task.attempt > 1 && (
         <span className="text-2xs shrink-0 hidden sm:inline text-ink-faint">retry {task.attempt}</span>
       )}
+      {(task.sources?.length ?? 0) > 0 && (
+        <span
+          className="mono text-2xs shrink-0 text-right text-ink-faint hidden sm:inline"
+          title={`${task.sources!.length} cited sources`}
+        >
+          ⌕ {task.sources!.length}
+        </span>
+      )}
       <span className="mono text-2xs shrink-0 w-9 text-right text-ink-faint" title={task.artifacts.join(", ")}>
         {task.artifacts.length > 0 ? `↧ ${task.artifacts.length}` : ""}
       </span>

@@ -34,8 +34,8 @@ export interface SwarmConfig {
   reasoningEffort: ReasoningEffort;
   safeMode: boolean;
   tinyfishApiKey: string;
-  /** Web search engines: auto = DDG + Bing + TinyFish (if keyed) merged; ddg = free engines only. */
-  searchBackend: "auto" | "tinyfish" | "ddg";
+  /** Web search engines: auto = DDG + Bing + TinyFish + context.dev (if keyed) merged; ddg = free engines only. */
+  searchBackend: "auto" | "tinyfish" | "contextdev" | "ddg";
   firecrawlApiKey: string;
   contextdevApiKey: string;
   deepcrawlApiKey: string;
@@ -361,7 +361,7 @@ const NUM_RANGES: Partial<Record<keyof SwarmConfig, [number, number]>> = {
 const ENUMS: Partial<Record<keyof SwarmConfig, string[]>> = {
   verification: ["off", "normal", "strict"],
   reasoningEffort: ["low", "medium", "high", "max"],
-  searchBackend: ["auto", "tinyfish", "ddg"],
+  searchBackend: ["auto", "tinyfish", "contextdev", "ddg"],
   crawlBackend: ["auto", "firecrawl", "contextdev", "deepcrawl", "off"],
   sandboxRuntime: ["auto", "host", "docker", "e2b", "modal", "vercel"],
   provider: Object.keys(PROVIDERS),

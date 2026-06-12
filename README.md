@@ -41,8 +41,9 @@ You give it a mission. A conductor model breaks the mission into tasks and hands
 - Runs execute in an isolated per-run workspace on your machine by default. Nothing extra to install, no daemon to start. Want stronger isolation? Run in a Docker container or an E2B/Modal/Vercel cloud sandbox, per run (`--sandbox docker`) or as your default (`swarm config set sandboxRuntime auto` picks the strongest one you've configured). `swarm sandbox test` boots whichever is active and tells you whether it works.
 - Tasks flagged `verify` get a second agent whose whole job is to prove the first one wrong. Failures bounce back for a retry with the verifier's feedback attached.
 - You can steer a live run. `swarm note <id> "skip the pricing section"` and the conductor re-plans on its next tick.
-- Workers get real tools: shell, file read/write/patch, web search and fetch, the blackboard, and an artifacts folder that lands on your disk. Search uses [SearchKit](https://github.com/robzilla1738/script-search) if it's installed (local, returns quotable passages; agents can pass `deep=true` when they need grounded sources), TinyFish if you have a key, DuckDuckGo otherwise.
-- The web UI streams every tool call live and renders the final report. Each task gets a deterministic name and pixel avatar so you can tell agents apart at a glance.
+- Workers get real tools: shell, file read/write/patch, web search and fetch, the blackboard, and an artifacts folder that lands on your disk. Search fans out across DuckDuckGo + Bing (free) plus TinyFish and context.dev when keyed (agents can pass `deep=true` when they need grounded sources with quotable passages).
+- Styled deliverables, no hand-written HTML: agents save markdown under a `.html` artifact name and the engine renders it into a clean, self-contained document (typography, tables, dark mode) — with ` ```chart ` blocks for inline SVG line/bar/donut charts and stat cards. Stock analyses, crypto dashboards, and research reports all come out in one house style.
+- The web UI streams every tool call live, counts distinct web sources in real time (run header, per-task badges), and renders the final report plus an Artifacts tab grouped by folder. Each task gets a deterministic name and pixel avatar so you can tell agents apart at a glance.
 - Provider keys are stored per provider, so switching between DeepSeek, OpenAI, Anthropic, Grok, MiniMax, OpenRouter, Ollama, and LM Studio never loses a key. Reasoning effort maps to whatever each API actually supports.
 
 ## Install
@@ -116,7 +117,7 @@ swarm serve --open                        # opens http://localhost:7777
 
 **Key integrations**:
 - **Model providers**: Anthropic, OpenAI, xAI, MiniMax, OpenRouter, Ollama, LM Studio, or any OpenAI-compatible endpoint. Multi-provider support — switch anytime without losing keys.
-- **Web search**: Built-in DuckDuckGo + Bing (free), optional TinyFish (faster, requires key).
+- **Web search**: Built-in DuckDuckGo + Bing (free), optional TinyFish, optional context.dev Web Search (relevance-ranked, joins the fan-out automatically when keyed; deep mode uses its server-side query fan-out).
 - **Crawl backends**: Firecrawl, context.dev (default in auto mode), or custom deepcrawl. Used by `crawl_site` tool and `fetch_url` upgrades.
 - **Sandboxes**: Host (default), Docker, E2B, Modal, Vercel. Each settable per run or as your default.
 
@@ -124,6 +125,18 @@ swarm serve --open                        # opens http://localhost:7777
 - Search depth: web_search pulls up to 50 results (was 25), academic_search up to 40 (was 20). Queries expand to 6 variants instead of 3.
 - Deep mode: fetches and ranks passages from 25 pages instead of 12.
 - Researcher minimum: agents now report minimum 8 sources per task, with explicit source attribution.
+- Live source tracking (0.9.0+): every URL a tool touches is journaled and counted — the run header, dashboard, CLI status line, and per-task badges show true distinct-source counts as agents work.
+
+**Styled artifacts & charts** (0.9.0+): `save_artifact` with a `.html` name renders markdown through the engine's document shell — agents never write HTML/CSS. Embed charts as fenced blocks:
+
+````markdown
+```chart
+{"type":"line","title":"BTC 90d","unit":"$","labels":["Mar","Apr","May"],
+ "series":[{"name":"BTC","values":[61000,68000,72000]}]}
+```
+````
+
+Types: `line` (multi-series trends), `bar` (grouped), `donut` (proportions), `stat` (metric cards with ▲/▼ deltas). All dependency-free inline SVG, monochrome, dark-mode aware.
 
 ## How it works
 

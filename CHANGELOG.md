@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.9.0
+
+### context.dev: fixed scrape endpoint + new search engine
+- **Fixed a dead scrape endpoint**: fetch_url/scrape was POSTing `api.context.dev/v1/web/scrape` (does not exist, HTTP 403) and silently falling back to direct fetch — context.dev showed zero usage. Now uses the real `GET /v1/web/scrape/markdown`.
+- Crawl request corrected: camelCase `maxPages` (capped at 500) and `urlRegex` (the API ignores `max_pages`/`include_paths`). `include_paths` globs (`/docs/*`) translate to proper wildcards.
+- **context.dev Web Search** joins the search fan-out when a key is set (`POST /v1/web/search`, relevance-ranked, 1 credit/result). Deep mode uses the API's server-side `queryFanout` — one billed call per search, not one per expanded phrasing. New `searchBackend: "contextdev"` pinned mode with free-engine fallback on outage.
+- Scrape/TinyFish fallbacks now log a visible warning instead of failing silently.
+
+### True live source tracking
+- Tool results journal a structured `urls[]` harvested from the FULL result text (the 200-char display summary holds 1-2 URLs; a search result names dozens). The run header, dashboard cards, CLI status line, and per-task badges all count real distinct sources, live.
+- Server-side rollup: `RunSummary.sourceCount` (canonical-URL deduped, team sub-swarms included).
+- Per-task live `⌕ n sources` badges on running cards; TaskDetail gained a Sources section with clickable cited links.
+
+### Verification: artifact path normalization
+- **Fixed false "claimed artifact(s) do not exist" failures**: agents narrate the same file as `artifacts/x.md`, `workspace/x.md`, `./x.md`, or an absolute path; the mechanical verifier now canonicalizes all forms to the registered name (with a tolerant existence check as a second layer). Previously this failed real work and burned retries.
+- Workspace-only deliverables that pass verification are copied into the run's artifacts folder so operator links work.
+- Directories no longer satisfy the artifact existence check (files only).
+
+### Styled artifacts & charts
+- `save_artifact` with a `.html` name renders MARKDOWN content through the house document shell — agents never hand-write HTML/CSS; every artifact matches the product style (typography, hairline tables, dark mode, self-contained, no scripts).
+- New ` ```chart ` fenced blocks render dependency-free inline SVG: `line` (multi-series with gaps), `bar` (grouped), `donut`, and `stat` metric cards with deltas. Monochrome, currentColor-based; malformed specs render a visible error block.
+- Final report HTML restyled: 720px measure, mono uppercase meta strip, hairline tables, understated links.
+
+### UI polish
+- **Artifacts tab** on the run page: deliverables grouped by folder, final report pinned first.
+- Activity feed decluttered: ok results fold into their call rows, duplicate note/report rows removed, task identity shown once per burst, `[exit 0]` prefixes stripped.
+- Typography uniformity: one label style and one `HH:MM` clock across Activity/Conductor/Blackboard; note keys render as sans titles; conductor feed matches the rest of the rail.
+- Header now shows true `⌕ sources` and `↧ artifacts` separately (sources was previously the artifact count, mislabeled).
+
 ## 0.8.0
 
 ### Exhaustive research: 10x source depth

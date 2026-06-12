@@ -64,6 +64,50 @@ export function oneLine(s: string, max = 140): string {
   return clip(s.replace(/\s+/g, " ").trim(), max);
 }
 
+/** The one HTML escaper — every string interpolated into generated HTML goes through here. */
+export function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+/**
+ * Canonicalize an artifact name an agent reported. Agents narrate the same
+ * file as "gpt-timeline.md", "artifacts/gpt-timeline.md", "workspace/…", "./…"
+ * or an absolute path into the run dir — all must resolve to the name
+ * save_artifact registered, or the mechanical verifier flunks real work.
+ */
+export function canonicalArtifactRel(raw: string, artifactsDir: string, cwd: string): string {
+  let rel = raw.trim().replace(/^\.\//, "");
+  if (path.isAbsolute(rel)) {
+    if (pathInside(artifactsDir, rel) || rel === artifactsDir) return path.relative(artifactsDir, rel);
+    if (pathInside(cwd, rel) || rel === cwd) return path.relative(cwd, rel);
+    return rel;
+  }
+  return rel.replace(/^(artifacts|workspace)\//, "");
+}
+
+/** Tools whose results name web sources — their URLs feed the live source counter. */
+export const WEB_SOURCE_TOOLS = new Set(["web_search", "web_search_scholar", "fetch_url", "crawl_site"]);
+
+/**
+ * Extract distinct http(s) URLs from free text (normalized: no hash, no
+ * trailing slash or punctuation). Capped — a crawl result can name thousands.
+ */
+export function harvestUrls(text: string, max = 50): string[] {
+  const out = new Set<string>();
+  for (const m of text.matchAll(/https?:\/\/[^\s)\]>"'`…]+/g)) {
+    const raw = m[0].replace(/[.,;:!?]+$/, "");
+    try {
+      const u = new URL(raw);
+      u.hash = "";
+      out.add(u.toString().replace(/\/$/, ""));
+    } catch {
+      /* not a URL */
+    }
+    if (out.size >= max) break;
+  }
+  return [...out];
+}
+
 /** Rough token estimate — good enough for budgets and compaction triggers. */
 export function estTokens(s: string): number {
   return Math.ceil(s.length / 3.5);

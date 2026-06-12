@@ -27,6 +27,10 @@ export interface ClientState {
   cost: number;
   /** Sampled cumulative token spend over time (budget sparkline). */
   budgetSeries: { t: number; tokens: number; cost: number }[];
+  /** Distinct web source URLs touched so far (fetches, search hits, cited sources) — live counter. */
+  sourceUrls: Set<string>;
+  /** Per-task slices of the same counter, for live badges on running cards. */
+  sourcesByTask: Map<string, Set<string>>;
   /** Bumped on every plan.updated — the Plan tab refetches on change. */
   planUpdatedAt: number;
   finalSummary?: string;
@@ -57,6 +61,8 @@ export function emptyState(): ClientState {
     usage: { promptTokens: 0, completionTokens: 0, cacheHitTokens: 0, cacheMissTokens: 0 },
     cost: 0,
     budgetSeries: [],
+    sourceUrls: new Set(),
+    sourcesByTask: new Map(),
     planUpdatedAt: 0,
     lastSeq: 0,
     lastT: 0,
@@ -106,10 +112,13 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
       s.cost += priceUsage(ev.model as string | undefined, u);
       pushBudgetPoint(s, ev.t);
     } else if (ev.type === "tool.call") {
+      trackWebTool(s, ev, ev.teamId);
       pushActivity(s, {
         id: `t${ev.seq}`, t: ev.t, agentId: ev.agentId as string, taskId: ev.teamId,
         kind: "tool", name: ev.name as string, text: summarizeArgs(ev.name as string, ev.args, s.meta?.cwd),
       });
+    } else if (ev.type === "tool.result") {
+      trackWebTool(s, ev, ev.teamId);
     } else if (ev.type === "note.added") {
       // Shared blackboard: team notes are swarm-wide facts (but they stay out
       // of the root activity feed, like the rest of a team's chatter).
@@ -180,7 +189,10 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
         if (Array.isArray(ev.keyFacts)) t.keyFacts = ev.keyFacts as string[];
         if (Array.isArray(ev.openQuestions)) t.openQuestions = ev.openQuestions as string[];
         if (Array.isArray(ev.filesTouched)) t.filesTouched = ev.filesTouched as string[];
-        if (Array.isArray(ev.sources)) t.sources = ev.sources as Task["sources"];
+        if (Array.isArray(ev.sources)) {
+          t.sources = ev.sources as Task["sources"];
+          for (const src of t.sources ?? []) addSource(s, src.url, t.id);
+        }
         s.tasks.set(t.id, { ...t });
         pushActivity(s, {
           id: `r${ev.seq}`, t: ev.t, agentId: "", taskId: t.id, kind: "report",
@@ -231,6 +243,7 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
       break;
     }
     case "tool.call": {
+      trackWebTool(s, ev, ev.taskId as string);
       const a = s.agents.get(ev.agentId as string);
       if (a) {
         a.lastTool = ev.name as string;
@@ -244,6 +257,7 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
       break;
     }
     case "tool.result":
+      trackWebTool(s, ev, ev.taskId as string);
       pushActivity(s, {
         id: `x${ev.seq}`, t: ev.t, agentId: ev.agentId as string, taskId: ev.taskId as string,
         kind: "result", name: ev.name as string, ok: ev.ok as boolean,
@@ -314,6 +328,57 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
   return s;
 }
 
+const WEB_TOOLS = new Set(["web_search", "web_search_scholar", "fetch_url", "crawl_site"]);
+
+/** Record a distinct source URL (normalized: no hash, no trailing slash). */
+function addSource(s: ClientState, raw: unknown, taskId?: string): void {
+  if (typeof raw !== "string" || !/^https?:\/\//i.test(raw)) return;
+  let url: string;
+  try {
+    const u = new URL(raw);
+    u.hash = "";
+    url = u.toString().replace(/\/$/, "");
+  } catch {
+    return; // not a URL
+  }
+  s.sourceUrls.add(url);
+  if (!taskId) return;
+  let set = s.sourcesByTask.get(taskId);
+  if (!set) {
+    set = new Set();
+    s.sourcesByTask.set(taskId, set);
+  }
+  set.add(url);
+  // Mirror onto the task so cards re-render with the live badge.
+  const t = s.tasks.get(taskId);
+  if (t && t.liveSourceCount !== set.size) {
+    t.liveSourceCount = set.size;
+    s.tasks.set(taskId, { ...t });
+  }
+}
+
+/** Pull every URL out of free text (search-result summaries) into the source set.
+ *  Keep the character class in sync with src/util.ts harvestUrls. */
+function harvestUrls(s: ClientState, text: string, taskId?: string): void {
+  for (const m of text.matchAll(/https?:\/\/[^\s)\]>"'`…]+/g)) addSource(s, m[0].replace(/[.,;:!?]+$/, ""), taskId);
+}
+
+/** Live source tracking for a web tool event (call args or result urls/summary). */
+function trackWebTool(s: ClientState, ev: SwarmEvent, taskId: string): void {
+  const name = ev.name as string;
+  if (!WEB_TOOLS.has(name)) return;
+  if (ev.type === "tool.call") {
+    const args = ev.args as Record<string, unknown> | undefined;
+    if (args && typeof args === "object") addSource(s, args.url, taskId);
+    return;
+  }
+  if (!ev.ok) return;
+  // Engine ≥0.8.1 journals the full URL list on tool.result; the regex over
+  // the (200-char-clipped) summary is only a fallback for older journals.
+  if (Array.isArray(ev.urls)) for (const u of ev.urls) addSource(s, u, taskId);
+  else harvestUrls(s, String(ev.summary ?? ""), taskId);
+}
+
 function pushActivity(s: ClientState, item: ActivityItem): void {
   s.activity.push(item);
   if (s.activity.length > MAX_ACTIVITY) s.activity.splice(0, s.activity.length - MAX_ACTIVITY);
@@ -341,6 +406,7 @@ function pushNote(s: ClientState, ev: SwarmEvent, teamId?: string): BlackboardNo
     key: ev.key as string | undefined, kind: ev.kind as string | undefined, text: ev.text as string,
     url: typeof ev.url === "string" ? ev.url : undefined,
   };
+  if (note.url) addSource(s, note.url, note.teamId ?? note.taskId);
   s.notes.push(note);
   if (s.notes.length > 500) s.notes.splice(0, s.notes.length - 500);
   return note;

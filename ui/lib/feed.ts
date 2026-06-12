@@ -37,40 +37,73 @@ export function summarizeToolError(raw: string, cwd?: string): string {
   return cleaned.length > 120 ? cleaned.slice(0, 117) + "…" : cleaned || "failed";
 }
 
-export type ActivityGroup = ActivityItem & { count?: number };
+export type ActivityGroup = ActivityItem & {
+  count?: number;
+  /** Ok-result summary folded into its call row (one row per call, not two). */
+  result?: string;
+};
 
 /**
  * File-shaped tools whose ok-result summary adds nothing the call row didn't
- * already say — absorbing them lets back-to-back calls fold into one row.
- * Shell/search/fetch results stay: their summaries carry real signal.
+ * already say — dropped entirely so back-to-back calls fold into one row.
  */
-const ABSORB_OK_RESULT = new Set(["read_file", "list_dir", "write_file", "replace_in_file", "save_artifact"]);
+const ABSORB_OK_RESULT = new Set(["read_file", "list_dir", "write_file", "replace_in_file", "save_artifact", "checkpoint"]);
 
 /**
- * Collapse runs of repeated tool calls into single rows ("read_file ×4").
- * Quiet ok results between same-tool calls are absorbed; a failed result
- * always surfaces and breaks the group.
+ * Calls that already produce a richer dedicated row (✦ note.added, ✓
+ * task.report) — the raw tool row and its "noted/saved" confirmation are
+ * pure duplication.
+ */
+const DROP_CALLS = new Set(["note", "report"]);
+
+/** "[exit 0 in 0.2s] output" → "output" — a clean exit is the expected case. */
+function tidyResult(name: string | undefined, text: string): string {
+  if (name === "shell") return text.replace(/^\[exit 0 in [^\]]*\]\s*/, "").trim() || "ok";
+  return text.trim();
+}
+
+/**
+ * Shape the raw event stream into a scannable feed:
+ *  - runs of the same tool collapse into one row ("read_file ×4")
+ *  - an ok result folds INTO its call row as trailing context, never its own row
+ *  - note/report tool rows vanish (their note.added / task.report rows carry more)
+ *  - failed results always surface as their own row and break the group
  */
 export function groupActivity(items: ActivityItem[]): ActivityGroup[] {
   const out: ActivityGroup[] = [];
   for (const item of items) {
     const last = out[out.length - 1];
-    if (
-      item.kind === "result" &&
-      item.ok &&
-      last?.kind === "tool" &&
-      last.name === item.name &&
-      last.taskId === item.taskId &&
-      ABSORB_OK_RESULT.has(item.name ?? "")
-    ) {
+    if (item.kind === "tool" && DROP_CALLS.has(item.name ?? "")) continue;
+    if (item.kind === "result" && item.ok) {
+      if (DROP_CALLS.has(item.name ?? "") || ABSORB_OK_RESULT.has(item.name ?? "")) continue;
+      // Fold the summary into the call row it answers. Concurrent agents
+      // interleave events, so look back a few rows for the matching call —
+      // copy-on-write: rows in `out` may still be reducer-owned state objects.
+      const at = findCallRow(out, item);
+      if (at >= 0) {
+        out[at] = { ...out[at], result: tidyResult(item.name, item.text) };
+        continue;
+      }
+      out.push(item); // no visible call row to fold into — a result must never vanish
       continue;
     }
     if (item.kind === "tool" && last?.kind === "tool" && last.name === item.name && last.taskId === item.taskId) {
       // Keep the first item's id so the React key stays stable as the group grows.
-      out[out.length - 1] = { ...item, id: last.id, count: (last.count ?? 1) + 1 };
+      out[out.length - 1] = { ...item, id: last.id, count: (last.count ?? 1) + 1, result: last.result };
       continue;
     }
     out.push(item);
   }
   return out;
+}
+
+/** Nearest preceding call row (same tool + task, not yet folded) within a short window. */
+function findCallRow(out: ActivityGroup[], result: ActivityItem): number {
+  for (let i = out.length - 1, seen = 0; i >= 0 && seen < 6; i--, seen++) {
+    const row = out[i];
+    if (row.kind === "tool" && row.name === result.name && row.taskId === result.taskId && row.result === undefined) {
+      return i;
+    }
+  }
+  return -1;
 }

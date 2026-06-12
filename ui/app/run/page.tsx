@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useMemo, useState } from "react";
+import { ArtifactsPanel } from "@/components/ArtifactsPanel";
 import { ReportPanel } from "@/components/ReportPanel";
 import { CancelButton, NoteComposer } from "@/components/RunControls";
 import { SideRail } from "@/components/SideRail";
@@ -21,7 +22,7 @@ function RunView() {
   const { data, connected, engineLive } = useRun(id);
   const now = useNow(1000);
   const [selected, setSelected] = useState<string | null>(null);
-  const [tab, setTab] = useState<"swarm" | "report">("swarm");
+  const [tab, setTab] = useState<"swarm" | "report" | "artifacts">("swarm");
   const [autoSwitched, setAutoSwitched] = useState(false);
   const [connectingSlow, setConnectingSlow] = useState(false);
 
@@ -188,7 +189,9 @@ function RunView() {
             <span>·</span>
             <span>{fmtTokens(spent)} tok{cacheHitPct > 0 ? ` · ${cacheHitPct}% cached` : ""}</span>
             <span>·</span>
-            <span title="total artifacts saved by the swarm">↧ {artifactCount} sources</span>
+            <span title="distinct web sources touched so far — searches, fetches, and cited sources">⌕ {data.sourceCount} sources</span>
+            <span>·</span>
+            <span title="total artifacts saved by the swarm">↧ {artifactCount} artifacts</span>
             <span>·</span>
             <span>{fmtMoney(data.cost)}</span>
             <span>·</span>
@@ -227,6 +230,9 @@ function RunView() {
           <button className="tab" data-active={tab === "report"} onClick={() => setTab("report")}>
             Report
             {data.finalSummary ? <span className="text-ink">✓</span> : null}
+          </button>
+          <button className="tab" data-active={tab === "artifacts"} onClick={() => setTab("artifacts")}>
+            Artifacts
             {artifactCount > 0 && <span className="mono text-2xs text-ink-faint">{artifactCount}</span>}
           </button>
         </div>
@@ -244,8 +250,10 @@ function RunView() {
               onOpenReport={() => setTab("report")}
             />
           </div>
-        ) : (
+        ) : tab === "report" ? (
           <ReportPanel id={id} hasFinal={!!data.finalSummary} live={live} />
+        ) : (
+          <ArtifactsPanel id={id} refreshKey={artifactCount} />
         )}
         </div>
 
@@ -256,7 +264,6 @@ function RunView() {
           notes={data.notes}
           operatorNotes={data.operatorNotes}
           planUpdatedAt={data.planUpdatedAt}
-          now={now}
         />
       </main>
 

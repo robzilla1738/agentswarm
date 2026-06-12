@@ -10,6 +10,8 @@ import {
   usageCost,
 } from "./types";
 import { ModelPrice } from "./types";
+import { canonicalizeUrl } from "./searchcore";
+import { WEB_SOURCE_TOOLS } from "./util";
 
 export interface AgentView {
   id: string;
@@ -68,6 +70,8 @@ export class RunState {
   cost = 0;
   /** Sampled cumulative token spend over time (budget sparkline). */
   budgetSeries: { t: number; tokens: number; cost: number }[] = [];
+  /** Distinct web sources touched (fetches, search hits, cited sources) — canonical URLs. */
+  sourceUrls = new Set<string>();
   finalSummary?: string;
   finalReportPath?: string;
   lastSeq = 0;
@@ -112,6 +116,10 @@ export class RunState {
         // root facts too — without this, a resume would forget every note a
         // team agent posted (decisions included).
         this.pushNote(ev, teamId);
+      } else if (ev.type === "tool.call" || ev.type === "tool.result") {
+        // Sources roll up to the root like usage — a sub-swarm's research is
+        // the run's research.
+        this.trackSourceEvent(ev);
       }
       return;
     }
@@ -175,7 +183,10 @@ export class RunState {
           if (Array.isArray(ev.keyFacts)) t.keyFacts = ev.keyFacts as string[];
           if (Array.isArray(ev.openQuestions)) t.openQuestions = ev.openQuestions as string[];
           if (Array.isArray(ev.filesTouched)) t.filesTouched = ev.filesTouched as string[];
-          if (Array.isArray(ev.sources)) t.sources = ev.sources as Task["sources"];
+          if (Array.isArray(ev.sources)) {
+            t.sources = ev.sources as Task["sources"];
+            for (const s of t.sources ?? []) this.addSource(s.url);
+          }
         }
         break;
       }
@@ -221,6 +232,7 @@ export class RunState {
         break;
       }
       case "tool.call": {
+        this.trackSourceEvent(ev);
         const a = this.agents.get(ev.agentId as string);
         if (a) {
           a.lastTool = ev.name as string;
@@ -228,6 +240,9 @@ export class RunState {
         }
         break;
       }
+      case "tool.result":
+        this.trackSourceEvent(ev);
+        break;
       case "plan.updated":
         this.planExcerpt = String(ev.excerpt ?? "");
         break;
@@ -291,7 +306,25 @@ export class RunState {
     }
   }
 
+  /** Record a distinct web source URL (canonicalized for dedup). */
+  private addSource(raw: unknown): void {
+    if (typeof raw !== "string" || !/^https?:\/\//i.test(raw)) return;
+    this.sourceUrls.add(canonicalizeUrl(raw));
+  }
+
+  /** Pull source URLs out of a web tool.call (args.url) or tool.result (urls[]). */
+  private trackSourceEvent(ev: SwarmEvent): void {
+    if (!WEB_SOURCE_TOOLS.has(String(ev.name))) return;
+    if (ev.type === "tool.call") {
+      const args = ev.args as Record<string, unknown> | undefined;
+      if (args && typeof args === "object") this.addSource(args.url);
+    } else if (ev.ok && Array.isArray(ev.urls)) {
+      for (const u of ev.urls) this.addSource(u);
+    }
+  }
+
   private pushNote(ev: SwarmEvent, teamId?: string): void {
+    if (typeof ev.url === "string") this.addSource(ev.url);
     this.notes.push({
       t: ev.t,
       taskId: ev.taskId as string | undefined,
@@ -358,6 +391,7 @@ export class RunState {
       agentsActive: this.activeAgents().length,
       usage: this.totalUsage,
       cost: this.cost,
+      sourceCount: this.sourceUrls.size,
       finalSummary: this.finalSummary,
     };
   }

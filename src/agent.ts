@@ -3,13 +3,14 @@ import { ChatMsg, ChatResult, ToolSchema, chat } from "./deepseek";
 import { compactorPrompt, forcedFinal, NUDGE_USE_TOOLS, STEP_LIMIT_FINAL } from "./prompts";
 import { ToolCtx, ToolDef } from "./tools";
 import { ReasoningEffort, Usage, ZERO_USAGE, addUsage } from "./types";
-import { clip, errMsg, safeJson, truncateMiddle } from "./util";
+import { WEB_SOURCE_TOOLS, clip, errMsg, harvestUrls, safeJson, truncateMiddle } from "./util";
 
 export interface AgentHooks {
   onDelta?: (channel: "text" | "think", text: string) => void;
   onMessage?: (content: string) => void;
   onToolCall?: (callId: string, name: string, args: unknown) => void;
-  onToolResult?: (callId: string, name: string, ok: boolean, summary: string) => void;
+  /** `urls` is the full set of web sources named in the result (the summary is clipped). */
+  onToolResult?: (callId: string, name: string, ok: boolean, summary: string, urls?: string[]) => void;
   onUsage?: (model: string, usage: Usage) => void;
   onTranscript?: (messages: ChatMsg[]) => void;
   onLog?: (level: "info" | "warn" | "error", msg: string) => void;
@@ -168,8 +169,12 @@ export async function runAgent(p: AgentParams): Promise<AgentOutcome> {
         }
       }
       if (p.signal.aborted) throw new Error("cancelled");
+      // Harvest source URLs from the FULL result before any truncation — the
+      // 200-char summary holds 1-2 URLs, and a middle-truncated result can
+      // splice a URL into a phantom prefix.
+      const urls = ok && WEB_SOURCE_TOOLS.has(name) ? harvestUrls(result) : undefined;
       result = truncateMiddle(result, cfg.maxToolResultChars, "chars");
-      hooks.onToolResult?.(call.id, name, ok, clip(result.replace(/\s+/g, " "), 200));
+      hooks.onToolResult?.(call.id, name, ok, clip(result.replace(/\s+/g, " "), 200), urls?.length ? urls : undefined);
       messages.push({ role: "tool", tool_call_id: call.id, content: result });
     }
     hooks.onTranscript?.(messages);

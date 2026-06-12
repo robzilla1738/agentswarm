@@ -119,3 +119,59 @@ test("sourcesBlock renders numbered, attributed lines", () => {
   ]));
   assert.match(block, /^\[1\] A — https:\/\/a\.com\/x \(2026\) \[cited by T1\]$/);
 });
+
+test("chart blocks render to inline SVG in the house shell", () => {
+  const { mdToHtml } = require("../../dist/report.js");
+  const md = [
+    "# Portfolio",
+    "```chart",
+    '{"type":"line","title":"BTC 90d","unit":"$","labels":["Mar","Apr","May"],"series":[{"name":"BTC","values":[61000,68000,72000]},{"name":"ETH","values":[3000,3400,3900]}]}',
+    "```",
+    "```chart",
+    '{"type":"donut","title":"Allocation","segments":[{"label":"BTC","value":52},{"label":"ETH","value":31},{"label":"Cash","value":17}]}',
+    "```",
+    "```chart",
+    '{"type":"stat","items":[{"label":"Market cap","value":"$2.1T","delta":"+4.2%"}]}',
+    "```",
+  ].join("\n");
+  const html = mdToHtml(md);
+  assert.match(html, /<figure class="chart">/);
+  assert.match(html, /<svg viewBox/);
+  assert.match(html, /BTC 90d/);
+  assert.match(html, /stroke-dasharray="6 3"/, "second series gets a dashed stroke");
+  assert.match(html, /class="stat-value">\$2\.1T/);
+  assert.match(html, /Allocation/);
+  assert.doesNotMatch(html, /<script/i, "charts are script-free");
+});
+
+test("a malformed chart spec renders a visible error, not a crash", () => {
+  const { mdToHtml } = require("../../dist/report.js");
+  const html = mdToHtml('```chart\n{"type":"sankey","nope":true}\n```');
+  assert.match(html, /chart-error/);
+  assert.match(html, /unknown chart type/);
+});
+
+test("renderDocHtml wraps markdown in the styled shell with chart CSS", () => {
+  const { renderDocHtml } = require("../../dist/report.js");
+  const html = renderDocHtml({ markdown: "# Vitals Summary\n\nAll within range." });
+  assert.match(html, /<title>Vitals Summary<\/title>/);
+  assert.match(html, /stat-grid/, "chart css inlined");
+  assert.match(html, /<h1>Vitals Summary<\/h1>/);
+  assert.doesNotMatch(html, /<header class="run-meta">/, "no meta strip unless provided");
+});
+
+test("fmtNum keeps axis labels short", () => {
+  const { fmtNum } = require("../../dist/charts.js");
+  assert.equal(fmtNum(2_100_000_000), "2.1B");
+  assert.equal(fmtNum(72_000), "72k");
+  assert.equal(fmtNum(0.0042), "0.0042");
+});
+
+test("line chart keeps gaps in place instead of shifting points", () => {
+  const { mdToHtml } = require("../../dist/report.js");
+  const html = mdToHtml('```chart\n{"type":"line","labels":["Jan","Feb","Mar"],"series":[{"values":[10,null,30]}]}\n```');
+  // Two disjoint subpaths: M…M… (pen lifted over the gap), no L bridging it.
+  const d = /<path d="(M[^"]+)" fill="none"/.exec(html);
+  assert.ok(d, "line path rendered");
+  assert.equal((d[1].match(/M/g) || []).length, 2, "gap splits the path into two segments");
+});

@@ -188,9 +188,62 @@ test("scrapeUrl uses firecrawl scrape and prepends the title", async () => {
   }
 });
 
+test("scrapeUrl uses context.dev GET /web/scrape/markdown", async () => {
+  const fc = stubFetch((url, init) => {
+    assert.match(url, /api\.context\.dev\/v1\/web\/scrape\/markdown\?url=https%3A%2F%2Fx\.y%2Fpage/);
+    assert.notEqual(init.method, "POST", "scrape is a GET");
+    assert.equal(init.headers.authorization, "Bearer ck");
+    return { json: { success: true, markdown: "body text", url: "https://x.y/page" } };
+  });
+  try {
+    const text = await scrapeUrl(cfgWith({ contextdevApiKey: "ck" }), "https://x.y/page");
+    assert.equal(text, "body text");
+  } finally {
+    fc.restore();
+  }
+});
+
+test("context.dev crawl sends camelCase maxPages and urlRegex for includePaths", async () => {
+  const fc = stubFetch((url, init) => {
+    assert.match(url, /api\.context\.dev\/v1\/web\/crawl$/);
+    const body = JSON.parse(init.body);
+    assert.equal(body.maxPages, 5);
+    assert.equal(body.max_pages, undefined);
+    assert.match(body.urlRegex, /docs/);
+    return { json: { results: [{ markdown: "# D", metadata: { url: "https://d.c/docs/a", title: "D" } }] } };
+  });
+  try {
+    const out = await crawlSite(cfgWith({ contextdevApiKey: "ck" }), {
+      url: "https://d.c",
+      maxPages: 5,
+      includePaths: ["/docs/"],
+    });
+    assert.equal(out.pages[0].url, "https://d.c/docs/a");
+  } finally {
+    fc.restore();
+  }
+});
+
 test("scrapeUrl throws when only deepcrawl is configured", async () => {
   await assert.rejects(
     scrapeUrl(cfgWith({ deepcrawlApiKey: "dk", deepcrawlBaseUrl: "https://c.x" }), "https://a.b"),
     /no scrape-capable/
   );
+});
+
+test("context.dev urlRegex treats include_paths globs as wildcards", async () => {
+  const fc = stubFetch((url, init) => {
+    const body = JSON.parse(init.body);
+    assert.equal(body.urlRegex, "^https?://[^/]+(/docs/[^?#]*|/guides/)");
+    return { json: { results: [{ markdown: "# D", metadata: { url: "https://d.c/docs/a", title: "D" } }] } };
+  });
+  try {
+    await crawlSite(cfgWith({ contextdevApiKey: "ck" }), {
+      url: "https://d.c",
+      maxPages: 5,
+      includePaths: ["/docs/*", "guides/"],
+    });
+  } finally {
+    fc.restore();
+  }
 });

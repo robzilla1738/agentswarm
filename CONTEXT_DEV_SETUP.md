@@ -139,12 +139,10 @@ Then restart the server.
 
 ### Scrape endpoint (single page)
 ```
-POST https://api.context.dev/v1/web/scrape
+GET https://api.context.dev/v1/web/scrape/markdown?url=https://example.com/page
 Authorization: Bearer <API_KEY>
-Content-Type: application/json
-
-{ "url": "https://example.com/page" }
 ```
+Response: `{ "success": true, "markdown": "...", "url": "..." }` — 1 credit per call.
 
 ### Crawl endpoint (multi-page site)
 ```
@@ -154,10 +152,11 @@ Content-Type: application/json
 
 {
   "url": "https://docs.example.com/",
-  "max_pages": 50,
-  "include_paths": ["/docs/", "/guides/"]  // optional
+  "maxPages": 50,              // camelCase; hard cap 500
+  "urlRegex": "^https?://[^/]+/docs/"  // optional path filter
 }
 ```
+Response: `{ "results": [{ "markdown": "...", "metadata": { "url", "title", ... } }] }` — 1 credit per page.
 
 ## Expected Performance
 

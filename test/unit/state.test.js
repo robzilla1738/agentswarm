@@ -128,3 +128,29 @@ test("team usage events never overwrite the run's cumulative cost", () => {
   s.apply(ev("usage", { teamId: "T9", model: "m1", usage, cost: 0.01 }));
   assert.ok(s.cost > before, `team usage must accrue (got ${s.cost} after ${before})`);
 });
+
+test("source tracking: tool events, notes, and reports roll up deduped", () => {
+  const s = new RunState();
+  s.apply(ev("task.created", { task: task("T1") }));
+  // fetch_url call args count immediately
+  s.apply(ev("tool.call", { agentId: "a1", taskId: "T1", name: "fetch_url", args: { url: "https://example.com/page" } }));
+  // tool.result urls[] is the full harvested list (www + trailing slash canonicalize away)
+  s.apply(
+    ev("tool.result", {
+      agentId: "a1", taskId: "T1", name: "web_search", ok: true, summary: "…",
+      urls: ["https://www.example.com/page/", "https://other.org/a?utm_source=x", "https://third.net/b"],
+    })
+  );
+  // non-web tools never count
+  s.apply(ev("tool.result", { agentId: "a1", taskId: "T1", name: "shell", ok: true, summary: "https://not-a-source.com" }));
+  // failed web calls never count
+  s.apply(ev("tool.result", { agentId: "a1", taskId: "T1", name: "web_search", ok: false, urls: ["https://failed.example.com"] }));
+  // blackboard note url + reported sources
+  s.apply(ev("note.added", { taskId: "T1", text: "fact", url: "https://noted.io/x" }));
+  s.apply(ev("task.report", { taskId: "T1", status: "done", report: "r", artifacts: [], sources: [{ url: "https://cited.dev/paper" }] }));
+  assert.equal(s.sourceUrls.size, 5, [...s.sourceUrls].join(", "));
+  assert.equal(s.summary().sourceCount, 5);
+  // team-stamped tool events roll up to the root like usage
+  s.apply(ev("tool.result", { teamId: "T1", agentId: "b1", taskId: "X1", name: "fetch_url", ok: true, urls: ["https://team.dev/page"] }));
+  assert.equal(s.sourceUrls.size, 6);
+});

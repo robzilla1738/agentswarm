@@ -141,6 +141,8 @@ export interface RunSummary {
   agentsActive: number;
   usage: Usage;
   cost: number;
+  /** Distinct web sources touched so far (searches, fetches, cited sources). */
+  sourceCount?: number;
   finalSummary?: string;
 }
 

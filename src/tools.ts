@@ -5,8 +5,9 @@ import { ToolSchema } from "./deepseek";
 import { SandboxRuntime } from "./sandbox";
 import { RunMeta } from "./types";
 import { crawlSite, resolveCrawlBackend, slugForUrl } from "./crawltools";
+import { renderDocHtml } from "./report";
 import { mergeCandidates } from "./searchcore";
-import { ensureDir, errMsg, pathInside, truncateMiddle } from "./util";
+import { ensureDir, errMsg, escapeHtml, pathInside, truncateMiddle } from "./util";
 import { arxivSearch, crossrefSearch, fetchUrl, webSearch } from "./webtools";
 
 export interface ToolCtx {
@@ -481,7 +482,7 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
     run: async (args, ctx) => {
       const url = String(args.url);
       if (!/^https?:\/\//.test(url)) throw new Error("only http(s) URLs are supported");
-      return fetchUrl(ctx.cfg, url, Boolean(args.raw), 60_000, ctx.signal);
+      return fetchUrl(ctx.cfg, url, Boolean(args.raw), 60_000, ctx.signal, (m) => ctx.log?.("warn", m));
     },
   };
 
@@ -582,7 +583,11 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
     schema: {
       name: "save_artifact",
       description:
-        "Save a deliverable into the run's artifacts folder (shown prominently to the operator). Provide content, or from_path to copy an existing file. Any file type works — save deliverables in the format that fits them (.csv/.json for data, .html for documents, runnable code files), not just markdown.",
+        "Save a deliverable into the run's artifacts folder (shown prominently to the operator). Provide content, or from_path to copy an existing file. Any file type works — save deliverables in the format that fits them (.csv/.json for data, .html for documents, runnable code files), not just markdown. " +
+        "POLISHED DOCUMENTS: save MARKDOWN content under a .html name and it is rendered into the swarm's styled document automatically (typography, tables, dark mode) — never hand-write HTML/CSS. Embed charts with ```chart fenced blocks containing JSON: " +
+        '{"type":"line","title":"BTC 90d","unit":"$","labels":["Mar","Apr"],"series":[{"name":"BTC","values":[61000,68000]}]} · ' +
+        '{"type":"bar","labels":[...],"series":[{"values":[...]}]} · {"type":"donut","segments":[{"label":"BTC","value":52}]} · ' +
+        '{"type":"stat","items":[{"label":"Market cap","value":"$2.1T","delta":"+4.2%"}]}.',
       parameters: {
         type: "object",
         properties: {
@@ -604,8 +609,22 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
         throw new Error("artifact name must stay inside the artifacts folder");
       }
       ensureDir(path.dirname(dest));
+      let rendered = false;
       if (typeof args.content === "string") {
-        fs.writeFileSync(dest, args.content, "utf8");
+        let body = args.content;
+        // .html + markdown content → the house document shell (agents write
+        // markdown + chart blocks; the style is the engine's job). Content
+        // already starting with a tag/comment is real HTML — write verbatim,
+        // or mdToHtml would escape its markup into visible text.
+        if (/\.html?$/i.test(name) && !/^\s*</.test(body)) {
+          const date = new Date().toISOString().slice(0, 10);
+          body = renderDocHtml({
+            markdown: body,
+            metaHtml: `<span>${escapeHtml(path.basename(name))}</span><span>${date}</span>`,
+          });
+          rendered = true;
+        }
+        fs.writeFileSync(dest, body, "utf8");
       } else if (args.from_path) {
         // Artifacts always land on the host so the operator can open them,
         // even when the workspace lives in a remote sandbox.
@@ -614,7 +633,7 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
         throw new Error("provide content or from_path");
       }
       ctx.addArtifact(name);
-      return `saved artifacts/${name}`;
+      return `saved artifacts/${name}${rendered ? " (markdown rendered into the styled document shell)" : ""}`;
     },
   };
 
@@ -716,7 +735,8 @@ export const REPORT_TOOL: ToolSchema = {
       artifacts: {
         type: "array",
         items: { type: "string" },
-        description: "Paths of files you created/changed that matter",
+        description:
+          "Deliverable files, by the exact name you passed to save_artifact (e.g. 'timeline.md', not 'artifacts/timeline.md'). Files you only wrote to the workspace go in files_touched instead.",
       },
       key_facts: {
         type: "array",

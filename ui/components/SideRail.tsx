@@ -3,7 +3,7 @@
 import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { type ActivityGroup, groupActivity } from "@/lib/feed";
-import { fmtAgo, fmtClock, fmtClockShort } from "@/lib/format";
+import { fmtClockShort } from "@/lib/format";
 import { PixelAvatar, personaName } from "@/lib/persona";
 import type { ActivityItem, BlackboardNote, ConductorSay, OperatorNote } from "@/lib/types";
 import { Clamp, EmptyState, Md, ToolIcon } from "./atoms";
@@ -17,7 +17,6 @@ export function SideRail({
   notes,
   operatorNotes,
   planUpdatedAt,
-  now,
 }: {
   runId: string;
   activity: ActivityItem[];
@@ -25,7 +24,6 @@ export function SideRail({
   notes: BlackboardNote[];
   operatorNotes: OperatorNote[];
   planUpdatedAt: number;
-  now: number;
 }) {
   const [tab, setTab] = useState<Tab>("activity");
   const tabs: { id: Tab; label: string; count?: number }[] = [
@@ -47,9 +45,9 @@ export function SideRail({
       </div>
 
       <div className="flex-1 overflow-hidden relative">
-        {tab === "activity" && <ActivityFeed activity={activity} now={now} />}
-        {tab === "conductor" && <ConductorFeed log={conductorLog} operatorNotes={operatorNotes} now={now} />}
-        {tab === "blackboard" && <Blackboard notes={notes} now={now} />}
+        {tab === "activity" && <ActivityFeed activity={activity} />}
+        {tab === "conductor" && <ConductorFeed log={conductorLog} operatorNotes={operatorNotes} />}
+        {tab === "blackboard" && <Blackboard notes={notes} />}
         {tab === "plan" && <PlanView runId={runId} planUpdatedAt={planUpdatedAt} />}
       </div>
     </div>
@@ -96,7 +94,7 @@ function PlanView({ runId, planUpdatedAt }: { runId: string; planUpdatedAt: numb
   );
 }
 
-function ActivityFeed({ activity, now }: { activity: ActivityItem[]; now: number }) {
+function ActivityFeed({ activity }: { activity: ActivityItem[] }) {
   const ref = useRef<HTMLDivElement>(null);
   const [stick, setStick] = useState(true);
   const rows = useMemo(() => groupActivity(activity), [activity]);
@@ -119,8 +117,8 @@ function ActivityFeed({ activity, now }: { activity: ActivityItem[]; now: number
         }}
         className="h-full overflow-y-auto px-3 py-2 space-y-0.5"
       >
-        {rows.map((item) => (
-          <ActivityRow key={item.id} item={item} />
+        {rows.map((item, i) => (
+          <ActivityRow key={item.id} item={item} showTask={rows[i - 1]?.taskId !== item.taskId} />
         ))}
       </div>
       {!stick && (
@@ -146,9 +144,10 @@ function ActivityFeed({ activity, now }: { activity: ActivityItem[]; now: number
 /**
  * One activity row. Layout: [avatar · task id] [content] [time]. Identifiers
  * stay mono; everything prose-like is sans and clamped — the rail should scan
- * like a feed, not a log dump.
+ * like a feed, not a log dump. The avatar/task id renders only when the task
+ * changes (`showTask`), so a burst from one agent reads as one block.
  */
-function ActivityRow({ item }: { item: ActivityGroup }) {
+function ActivityRow({ item, showTask = true }: { item: ActivityGroup; showTask?: boolean }) {
   const isResult = item.kind === "result";
   let head: React.ReactNode = null;
   let text = item.text ?? "";
@@ -181,21 +180,24 @@ function ActivityRow({ item }: { item: ActivityGroup }) {
     <div
       className="flex items-center gap-2 py-1 text-xs leading-snug"
       style={{ animation: "var(--animate-rise)" }}
-      title={`${new Date(item.t).toLocaleString()}${item.taskId ? ` · ${item.taskId} ${personaName(item.taskId)}` : " · conductor"}${item.name ? `\n${item.name}` : ""}${text ? `\n${text}` : ""}`}
+      title={`${new Date(item.t).toLocaleString()}${item.taskId ? ` · ${item.taskId} ${personaName(item.taskId)}` : " · conductor"}${item.name ? `\n${item.name}` : ""}${text ? `\n${text}` : ""}${item.result ? `\n↳ ${item.result}` : ""}`}
     >
       <span className="flex items-center gap-1.5 shrink-0 w-[52px]">
-        {item.taskId ? (
-          <>
-            <PixelAvatar seed={item.taskId} size={18} />
-            <span className="mono text-2xs text-ink-faint">{item.taskId}</span>
-          </>
-        ) : (
-          <span className="mono text-2xs text-ink-faint inline-flex items-center justify-center" style={{ width: 18 }}>◉</span>
-        )}
+        {showTask ? (
+          item.taskId ? (
+            <>
+              <PixelAvatar seed={item.taskId} size={18} />
+              <span className="mono text-2xs text-ink-faint">{item.taskId}</span>
+            </>
+          ) : (
+            <span className="mono text-2xs text-ink-faint inline-flex items-center justify-center" style={{ width: 18 }}>◉</span>
+          )
+        ) : null}
       </span>
       <span className={`min-w-0 flex-1 truncate ${isResult ? "pl-2 border-l border-border-soft" : ""}`}>
         {head}
         <span className={tone}>{text}</span>
+        {item.result && <span className="text-ink-faint"> ↳ {item.result}</span>}
       </span>
       <span className="mono text-2xs shrink-0 w-[36px] text-right text-ink-faint">
         {fmtClockShort(item.t)}
@@ -204,7 +206,7 @@ function ActivityRow({ item }: { item: ActivityGroup }) {
   );
 }
 
-function ConductorFeed({ log, operatorNotes, now }: { log: ConductorSay[]; operatorNotes: OperatorNote[]; now: number }) {
+function ConductorFeed({ log, operatorNotes }: { log: ConductorSay[]; operatorNotes: OperatorNote[] }) {
   const merged = [
     ...log.map((l) => ({ t: l.t, kind: "say" as const, text: l.text })),
     ...operatorNotes.map((o) => ({ t: o.t, kind: "op" as const, text: o.text })),
@@ -227,15 +229,17 @@ function ConductorFeed({ log, operatorNotes, now }: { log: ConductorSay[]; opera
               className="rounded-lg p-2.5 text-xs"
               style={{ background: "rgb(var(--hi) / 0.05)", border: "1px solid rgb(var(--hi) / 0.18)" }}
             >
-              <div className="label mb-1 text-ink" style={{ letterSpacing: "0.12em" }}>
-                you · {fmtAgo(m.t, now)}
+              <div className="flex items-baseline justify-between mb-1">
+                <span className="label text-ink">You</span>
+                <span className="mono text-2xs text-ink-faint">{fmtClockShort(m.t)}</span>
               </div>
               <div className="text-ink-dim">{m.text}</div>
             </div>
           ) : (
             <div className="text-xs leading-relaxed">
-              <div className="label mb-0.5" style={{ letterSpacing: "0.12em" }}>
-                ◉ conductor · {fmtClock(m.t)}
+              <div className="flex items-baseline justify-between mb-1">
+                <span className="label">◉ Conductor</span>
+                <span className="mono text-2xs text-ink-faint">{fmtClockShort(m.t)}</span>
               </div>
               <Md compact dim>{m.text}</Md>
             </div>
@@ -244,6 +248,12 @@ function ConductorFeed({ log, operatorNotes, now }: { log: ConductorSay[]; opera
       ))}
     </div>
   );
+}
+
+/** "gpt56_gpt6-prediction_synthesis" → "Gpt56 gpt6 prediction synthesis" — note keys read as titles. */
+function titleCase(key: string): string {
+  const s = key.replace(/[_-]+/g, " ").trim();
+  return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
 /** One chip styling for note kinds and their filter buttons, so they can't drift apart. */
@@ -268,7 +278,7 @@ function NoteKind({ kind }: { kind: string }) {
   );
 }
 
-function Blackboard({ notes, now }: { notes: BlackboardNote[]; now: number }) {
+function Blackboard({ notes }: { notes: BlackboardNote[] }) {
   const [query, setQuery] = useState("");
   const [kindFilter, setKindFilter] = useState<string | null>(null);
 
@@ -322,11 +332,11 @@ function Blackboard({ notes, now }: { notes: BlackboardNote[]; now: number }) {
         {filtered.length === 0 && <div className="text-xs text-ink-faint py-4 text-center">No notes match.</div>}
         {[...filtered].reverse().map((n, i) => (
           <div key={i} className="tile p-3 text-xs" style={{ animation: "var(--animate-rise)" }}>
-            <div className="flex items-baseline gap-2 mb-1.5 text-2xs text-ink-faint">
+            <div className="flex items-baseline gap-2 mb-1.5">
               {n.kind && n.kind !== "finding" && <NoteKind kind={n.kind} />}
-              {n.key && <span className="mono font-semibold text-ink truncate">{n.key.replace(/[_-]+/g, " ")}</span>}
-              {n.taskId && <span className="mono shrink-0">{n.taskId}</span>}
-              <span className="ml-auto shrink-0">{fmtAgo(n.t, now)}</span>
+              {n.key && <span className="font-medium text-ink truncate text-xs">{titleCase(n.key)}</span>}
+              {n.taskId && <span className="mono text-2xs text-ink-faint shrink-0">{n.taskId}</span>}
+              <span className="mono text-2xs text-ink-faint ml-auto shrink-0">{fmtClockShort(n.t)}</span>
             </div>
             <Clamp lines={5}>
               <Md compact dim>{n.text}</Md>
@@ -336,10 +346,10 @@ function Blackboard({ notes, now }: { notes: BlackboardNote[]; now: number }) {
                 href={n.url}
                 target="_blank"
                 rel="noreferrer"
-                className="mono text-2xs text-ink-faint hover:text-ink underline underline-offset-2 block truncate mt-1.5"
+                className="mono text-2xs text-ink-faint hover:text-ink transition-colors block truncate mt-1.5"
                 title={n.url}
               >
-                ↗ {n.url.replace(/^https?:\/\//, "")}
+                ↗ {n.url.replace(/^https?:\/\/(www\.)?/, "")}
               </a>
             )}
           </div>

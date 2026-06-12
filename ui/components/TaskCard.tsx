@@ -90,6 +90,7 @@ export function TaskCard({
             ↧ {task.artifacts.length} artifact{task.artifacts.length > 1 ? "s" : ""}
           </span>
         )}
+        <SourceBadge cited={task.sources?.length ?? 0} live={task.liveSourceCount ?? 0} />
       </div>
 
       {active && agent && (
@@ -115,6 +116,17 @@ export function TaskCard({
         </div>
       )}
     </button>
+  );
+}
+
+/** Cited sources once reported; the live touched-count until then (an empty citation list must not hide it). */
+function SourceBadge({ cited, live }: { cited: number; live: number }) {
+  const n = cited || live;
+  if (!n) return null;
+  return (
+    <span className="mono text-2xs text-ink-dim" title={cited ? `${cited} cited sources` : `${live} sources touched so far`}>
+      ⌕ {n} source{n > 1 ? "s" : ""}
+    </span>
   );
 }
 

@@ -135,7 +135,8 @@ export class TerminalRenderer {
     const bar = ansi.cyan("█".repeat(filled)) + ansi.gray("░".repeat(barW - filled));
     const spent = s.totalUsage.promptTokens + s.totalUsage.completionTokens;
     L.push(
-      `  ${bar} ${pct}%  ${ansi.gray(fmtTokens(spent) + "/" + fmtTokens(cap) + " tok")}  ${ansi.green(fmtMoney(s.cost))}`
+      `  ${bar} ${pct}%  ${ansi.gray(fmtTokens(spent) + "/" + fmtTokens(cap) + " tok")}  ${ansi.green(fmtMoney(s.cost))}` +
+        (s.sourceUrls.size ? `  ${ansi.gray(`⌕ ${s.sourceUrls.size} sources`)}` : "")
     );
 
     const tasks = s.taskList();

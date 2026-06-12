@@ -60,3 +60,20 @@ test("unchecked formats pass through", () => {
 test("missing file is not this check's problem", () => {
   assert.equal(validateArtifactFormat(path.join(tmp, "missing.json")), null);
 });
+
+test("canonicalArtifactRel maps every agent phrasing to the registered name", () => {
+  const { canonicalArtifactRel } = require("../../dist/util.js");
+  const art = "/runs/run_x/artifacts";
+  const cwd = "/runs/run_x/workspace";
+  const canon = (raw) => canonicalArtifactRel(raw, art, cwd);
+  assert.equal(canon("timeline.md"), "timeline.md");
+  assert.equal(canon("./timeline.md"), "timeline.md");
+  assert.equal(canon("artifacts/timeline.md"), "timeline.md");
+  assert.equal(canon("workspace/timeline.md"), "timeline.md");
+  assert.equal(canon("/runs/run_x/artifacts/timeline.md"), "timeline.md");
+  assert.equal(canon("/runs/run_x/workspace/timeline.md"), "timeline.md");
+  // Subdirs survive; foreign absolute paths pass through untouched.
+  assert.equal(canon("data/results.csv"), "data/results.csv");
+  assert.equal(canon("artifacts/data/results.csv"), "data/results.csv");
+  assert.equal(canon("/etc/passwd"), "/etc/passwd");
+});

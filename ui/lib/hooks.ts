@@ -30,6 +30,8 @@ export interface LiveRun {
   usage: Usage;
   cost: number;
   budgetSeries: { t: number; tokens: number; cost: number }[];
+  /** Distinct web sources touched so far — updates live as agents search/fetch. */
+  sourceCount: number;
   planUpdatedAt: number;
   finalSummary?: string;
   finalReportPath?: string;
@@ -57,6 +59,7 @@ function project(s: ClientState): LiveRun {
     usage: s.usage,
     cost: s.cost,
     budgetSeries: s.budgetSeries.slice(),
+    sourceCount: s.sourceUrls.size,
     planUpdatedAt: s.planUpdatedAt,
     finalSummary: s.finalSummary,
     finalReportPath: s.finalReportPath,

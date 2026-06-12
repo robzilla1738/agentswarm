@@ -283,11 +283,12 @@ export default function SettingsPage() {
           </p>
         </Card>
 
-        <Card title="Web search" sub="Built-in multi-engine search: DuckDuckGo and Bing are scraped in parallel, results are quality-ranked and deduped, and deep mode fetches top pages for quotable passages. A TinyFish key adds a third engine to the mix.">
+        <Card title="Web search" sub="Built-in multi-engine search: DuckDuckGo and Bing are scraped in parallel, results are quality-ranked and deduped, and deep mode fetches top pages for quotable passages. TinyFish and context.dev keys each add an engine to the mix (context.dev: relevance-ranked, 1 credit per result; deep mode uses its server-side query fan-out).">
           <Field label="Search engines">
             <select className="input" value={form.searchBackend ?? "auto"} onChange={(e) => setForm({ ...form, searchBackend: e.target.value })}>
               <option value="auto">Auto — all engines, merged</option>
               <option value="tinyfish">TinyFish only</option>
+              <option value="contextdev">context.dev only{config.contextdevKeySet ? " · key saved" : ""}</option>
               <option value="ddg">Free engines only (DuckDuckGo + Bing)</option>
             </select>
           </Field>

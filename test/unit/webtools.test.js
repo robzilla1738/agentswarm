@@ -212,3 +212,92 @@ test("tinyfish-only backend falls back to scraping engines when tinyfish fails",
   assert.equal(out[0].url, "https://example.com/cats");
   assert.ok(warns.some((w) => /tinyfish failed/.test(w)), "the fallback is surfaced as a warning");
 });
+
+test("harvestUrls extracts, normalizes, dedupes, and caps", () => {
+  const { harvestUrls } = require("../../dist/util.js");
+  const text =
+    "1. A https://example.com/a#frag 2. B (https://example.com/b). " +
+    "dupe https://example.com/a trailing https://example.com/c, " +
+    "quoted 'https://example.com/d' not-a-url ftp://nope";
+  const urls = harvestUrls(text);
+  assert.deepEqual(urls.sort(), [
+    "https://example.com/a",
+    "https://example.com/b",
+    "https://example.com/c",
+    "https://example.com/d",
+  ]);
+  const many = Array.from({ length: 80 }, (_, i) => `https://x.y/p${i}`).join(" ");
+  assert.equal(harvestUrls(many).length, 50, "capped at 50");
+});
+
+test("context.dev joins the auto search fan-out when keyed", async (t) => {
+  _resetEngineCooldowns();
+  t.after(() => _resetEngineCooldowns());
+  const fc = stubFetch((url, init) => {
+    if (url.includes("api.context.dev/v1/web/search")) {
+      assert.equal(init.method, "POST");
+      assert.equal(JSON.parse(init.body).query, "rust async runtimes");
+      assert.match(init.headers.authorization, /^Bearer ck$/);
+      return {
+        body: JSON.stringify({
+          results: [
+            { url: "https://tokio.rs", title: "Tokio", description: "An async runtime", relevance: "high" },
+            { url: "https://low.example.com", title: "Low", description: "meh", relevance: "low" },
+          ],
+        }),
+      };
+    }
+    return { body: "<html></html>" }; // DDG/Bing parse to nothing
+  });
+  try {
+    const hits = await webSearch(cfgWith({ contextdevApiKey: "ck" }), "rust async runtimes", 10);
+    const urls = hits.map((h) => h.url);
+    assert.ok(urls.includes("https://tokio.rs"), urls.join(", "));
+    assert.ok(urls.indexOf("https://tokio.rs") < urls.indexOf("https://low.example.com"), "high relevance ranks first");
+  } finally {
+    fc.restore();
+  }
+});
+
+test("contextdev-only backend falls back to free engines on outage", async (t) => {
+  _resetEngineCooldowns();
+  t.after(() => _resetEngineCooldowns());
+  const fc = stubFetch((url) => {
+    if (url.includes("api.context.dev")) return { status: 500, body: "boom" };
+    if (url.includes("duckduckgo")) {
+      return {
+        body: '<a class="result__a" href="https://fallback.example.com/x">Fallback</a>',
+      };
+    }
+    return { body: "<html></html>" };
+  });
+  try {
+    const warns = [];
+    const hits = await webSearch(
+      cfgWith({ searchBackend: "contextdev", contextdevApiKey: "ck" }),
+      "anything", 5, undefined, false, (m) => warns.push(m)
+    );
+    assert.ok(hits.some((h) => h.url.includes("fallback.example.com")), JSON.stringify(hits));
+    assert.ok(warns.some((w) => /contextdev failed/.test(w)), warns.join(" | "));
+  } finally {
+    fc.restore();
+  }
+});
+
+test("fetchUrl warns when the scrape backend fails and falls back to direct", async () => {
+  const fc = stubFetch((url) => {
+    if (url.includes("api.context.dev")) return { status: 403, body: "nope" };
+    return { body: "<html><body><p>direct content here</p></body></html>", headers: { "content-type": "text/html" } };
+  });
+  try {
+    const warns = [];
+    const text = await fetchUrl(
+      cfgWith({ crawlBackend: "contextdev", contextdevApiKey: "ck" }),
+      "https://site.example.com/page", false, 10_000, undefined, (m) => warns.push(m)
+    );
+    assert.match(text, /direct content here/);
+    assert.ok(warns.some((w) => /scrape backend failed/.test(w)), warns.join(" | "));
+  } finally {
+    fc.restore();
+  }
+});

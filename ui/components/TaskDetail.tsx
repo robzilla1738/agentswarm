@@ -65,13 +65,11 @@ export function TaskDetail({
           <h2 className="text-lg font-semibold leading-snug">{task.title}</h2>
           <div className="flex flex-wrap gap-x-3 gap-y-1 text-2xs mt-1.5 text-ink-faint">
             <span>wave {task.wave}</span>
-            {task.team && <span className="text-ink-dim">⌬ sub-swarm</span>}
-            {task.modelTier && task.modelTier !== "default" && (
-              <span className="mono text-ink-dim">{task.modelTier} tier</span>
-            )}
+            {task.team && <span>⌬ sub-swarm</span>}
+            {task.modelTier && task.modelTier !== "default" && <span>{task.modelTier} tier</span>}
             {task.deps.length > 0 && <span className="mono">⇠ {task.deps.join(", ")}</span>}
-            {task.verify && <span className="text-ink-dim">⊛ adversarially verified</span>}
-            {task.attempt > 1 && <span className="text-ink-dim">attempt {task.attempt}</span>}
+            {task.verify && <span>⊛ adversarially verified</span>}
+            {task.attempt > 1 && <span>attempt {task.attempt}</span>}
             {task.startedAt && <span className="mono">{fmtDur((task.endedAt ?? now) - task.startedAt)}</span>}
           </div>
         </div>
@@ -179,6 +177,29 @@ export function TaskDetail({
                   >
                     <span className="mono text-xs truncate flex-1">{a}</span>
                     <span className="mono text-2xs text-ink-dim">open ↗</span>
+                  </a>
+                ))}
+              </div>
+            </Section>
+          )}
+
+          {task.sources && task.sources.length > 0 && (
+            <Section title={`Sources · ${task.sources.length}`}>
+              <div className="flex flex-col gap-1.5">
+                {task.sources.map((s, i) => (
+                  <a
+                    key={`${s.url}${i}`}
+                    href={s.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="flex items-center gap-2 px-3 py-2 tile tile-hover text-ink"
+                  >
+                    <span className="min-w-0 flex-1">
+                      <span className="mono text-xs truncate block">{s.title || s.url.replace(/^https?:\/\//, "")}</span>
+                      {s.note && <span className="text-2xs text-ink-faint truncate block">{s.note}</span>}
+                    </span>
+                    {s.date && <span className="mono text-2xs text-ink-faint shrink-0">{s.date}</span>}
+                    <span className="mono text-2xs text-ink-dim shrink-0">↗</span>
                   </a>
                 ))}
               </div>

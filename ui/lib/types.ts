@@ -42,6 +42,8 @@ export interface Task {
   openQuestions?: string[];
   filesTouched?: string[];
   sources?: { url: string; title?: string; date?: string; note?: string }[];
+  /** Client-derived: distinct source URLs this task has touched so far (live). */
+  liveSourceCount?: number;
   modelTier?: "cheap" | "default" | "strong";
   team?: boolean;
   createdAt: number;
@@ -129,6 +131,7 @@ export interface RunSummary {
   agentsActive: number;
   usage: Usage;
   cost: number;
+  sourceCount?: number;
   pid: number | null;
   finalSummary?: string;
 }

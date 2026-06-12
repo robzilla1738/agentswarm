@@ -36,7 +36,7 @@ const DEEP_PASSAGES = 3;
 
 /**
  * Web search: fan out across every available engine in parallel (DuckDuckGo +
- * Bing scraping, plus TinyFish when keyed). In `deep` mode it also fans the
+ * Bing scraping, plus TinyFish and context.dev when keyed). In `deep` mode it also fans the
  * query into a few complementary phrasings — so one call sweeps queries ×
  * engines into a much larger pool — then quality-ranks and dedupes by
  * canonical URL, fetches the top pages concurrently for quotable passages,
@@ -61,13 +61,16 @@ export async function webSearch(
   const engineCalls: Promise<Candidate[]>[] = [];
   for (const q of queries) {
     for (const e of engines) {
-      let call = e.search(q, perEngine, signal);
-      // When TinyFish is the sole engine by configuration, an outage must not
-      // blank web research for the whole mission — fall back to the free
+      // `once` engines (context.dev: server-side fanout, billed per result)
+      // run a single call on the original query, not one per phrasing.
+      if (e.once && q !== queries[0]) continue;
+      let call = e.search(q, perEngine, signal, deep);
+      // When a paid engine is the sole engine by configuration, an outage must
+      // not blank web research for the whole mission — fall back to the free
       // scraping engines for this call.
-      if (engines.length === 1 && e.name === "tinyfish") {
+      if (engines.length === 1 && (e.name === "tinyfish" || e.name === "contextdev")) {
         call = call.catch(async (err) => {
-          warn?.(`tinyfish failed (${errMsg(err)}); falling back to duckduckgo/bing`);
+          warn?.(`${e.name} failed (${errMsg(err)}); falling back to duckduckgo/bing`);
           const fallback = await Promise.allSettled([ddgSearch(q, perEngine, signal), bingSearch(q, perEngine, signal)]);
           const hits = fallback.flatMap((s) => (s.status === "fulfilled" ? s.value : []));
           if (!hits.length && fallback.every((s) => s.status === "rejected")) throw err;
@@ -193,7 +196,12 @@ function clip(text: string): string {
 
 export interface SearchEngine {
   name: string;
-  search: (query: string, count: number, signal?: AbortSignal) => Promise<Candidate[]>;
+  search: (query: string, count: number, signal?: AbortSignal, deep?: boolean) => Promise<Candidate[]>;
+  /**
+   * Call once per webSearch, not per expanded phrasing — for engines that
+   * fan out server-side and/or bill per result (context.dev).
+   */
+  once?: boolean;
 }
 
 /**
@@ -205,12 +213,18 @@ export function searchEngines(cfg: SwarmConfig): SearchEngine[] {
   if (cfg.searchBackend === "tinyfish" && cfg.tinyfishApiKey) {
     return [{ name: "tinyfish", search: (q, n, s) => tinyfishSearch(cfg, q, n, s) }];
   }
+  if (cfg.searchBackend === "contextdev" && cfg.contextdevApiKey) {
+    return [{ name: "contextdev", once: true, search: (q, n, s, deep) => contextdevSearch(cfg, q, n, s, deep) }];
+  }
   const engines: SearchEngine[] = [
     { name: "duckduckgo", search: ddgSearch },
     { name: "bing", search: bingSearch },
   ];
   if (cfg.searchBackend === "auto" && cfg.tinyfishApiKey) {
     engines.push({ name: "tinyfish", search: (q, n, s) => tinyfishSearch(cfg, q, n, s) });
+  }
+  if (cfg.searchBackend === "auto" && cfg.contextdevApiKey) {
+    engines.push({ name: "contextdev", once: true, search: (q, n, s, deep) => contextdevSearch(cfg, q, n, s, deep) });
   }
   return engines;
 }
@@ -231,7 +245,7 @@ export function _resetEngineCooldowns(): void {
 async function engineFetch(
   engine: string,
   url: string,
-  init: { headers?: Record<string, string> },
+  init: { headers?: Record<string, string>; method?: string; body?: string },
   signal?: AbortSignal
 ): Promise<Response> {
   const until = engineCooldown.get(engine) ?? 0;
@@ -250,6 +264,47 @@ async function engineFetch(
     engineCooldown.set(engine, Date.now() + ms);
     throw new Error(`${engine} rate-limited (HTTP ${res.status}); cooling down ${Math.round(ms / 1000)}s`);
   }
+}
+
+/**
+ * context.dev Web Search: relevance-ranked results in one POST (1 credit per
+ * result). In deep mode the API's own queryFanout widens recall server-side —
+ * which is why this engine is `once: true` and skips local query expansion.
+ */
+export async function contextdevSearch(
+  cfg: SwarmConfig,
+  query: string,
+  count: number,
+  signal?: AbortSignal,
+  deep = false
+): Promise<Candidate[]> {
+  const res = await engineFetch(
+    "contextdev",
+    "https://api.context.dev/v1/web/search",
+    {
+      method: "POST",
+      headers: { authorization: `Bearer ${cfg.contextdevApiKey}`, "content-type": "application/json" },
+      // The API has no result-count parameter (verified against its OpenAPI
+      // spec) — it returns its own relevance-ranked set; `count` only trims.
+      body: JSON.stringify({ query: query.slice(0, 500), ...(deep ? { queryFanout: true } : {}) }),
+    },
+    signal
+  );
+  if (!res.ok) throw new Error(`context.dev search ${res.status}`);
+  const data: any = await res.json();
+  return (data.results || [])
+    .filter((r: any) => typeof r?.url === "string" && r.url)
+    .slice(0, count)
+    .map((r: any, i: number) => ({
+      title: r.title || r.url,
+      url: r.url,
+      snippet: r.description || "",
+      // The API orders by relevance; push self-declared medium/low hits down
+      // so a "high" from context.dev outranks scraped-engine noise.
+      rank: i + 1 + (r.relevance === "low" ? 20 : r.relevance === "medium" ? 5 : 0),
+      engine: "contextdev",
+      date: detectDate(r.description || ""),
+    }));
 }
 
 export async function tinyfishSearch(
@@ -438,22 +493,25 @@ export async function fetchUrl(
   url: string,
   raw: boolean,
   maxChars: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  warn?: (msg: string) => void
 ): Promise<string> {
   if (!raw && hasScrapeBackend(cfg)) {
     try {
       const text = await scrapeUrl(cfg, url, signal);
       if (text) return truncateMiddle(text, maxChars, "chars");
-    } catch {
-      /* fall through to TinyFish → direct */
+    } catch (e) {
+      // Fall through to TinyFish → direct — but loudly: a misconfigured
+      // backend silently degrading to direct fetch hid a dead endpoint once.
+      warn?.(`scrape backend failed for ${url} (${errMsg(e)}) — falling back to ${cfg.tinyfishApiKey ? "tinyfish" : "direct fetch"}`);
     }
   }
   if (cfg.tinyfishApiKey && !raw) {
     try {
       const text = await tinyfishFetch(cfg, url, signal);
       if (text) return truncateMiddle(text, maxChars, "chars");
-    } catch {
-      /* fall through to direct */
+    } catch (e) {
+      warn?.(`tinyfish fetch failed for ${url} (${errMsg(e)}) — falling back to direct fetch`);
     }
   }
   const res = await fetch(url, {

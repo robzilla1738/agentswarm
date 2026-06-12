@@ -106,35 +106,13 @@ export async function scrapeUrl(cfg: SwarmConfig, url: string, signal?: AbortSig
     return title ? `# ${title}\n\n${md}` : md;
   }
   if (backend === "contextdev") {
-    const data = await callJson(
-      "context.dev",
-      "https://api.context.dev/v1/web/scrape",
-      cfg.contextdevApiKey,
-      { url },
-      30_000,
-      signal
-    );
-    // Handle multiple response shapes from context.dev API
-    let md = "";
-    let title = "";
-
-    // Try flat structure first (new API format)
-    if (data?.markdown) {
-      md = String(data.markdown);
-      title = String(data?.metadata?.title ?? data?.title ?? "");
-    }
-    // Try nested structure (older or alternative format)
-    else if (Array.isArray(data?.results) && data.results[0]) {
-      md = String(data.results[0].markdown ?? "");
-      title = String(data.results[0]?.metadata?.title ?? data.results[0]?.title ?? "");
-    }
-    // Try top-level title fallback
-    else if (data?.data?.markdown) {
-      md = String(data.data.markdown);
-      title = String(data?.data?.metadata?.title ?? data?.data?.title ?? "");
-    }
-
+    // GET /v1/web/scrape/markdown — the only scrape endpoint context.dev exposes.
+    const endpoint = new URL("https://api.context.dev/v1/web/scrape/markdown");
+    endpoint.searchParams.set("url", url);
+    const data = await getJson("context.dev", endpoint.toString(), cfg.contextdevApiKey, signal);
+    const md = String(data?.markdown ?? "");
     if (!md.trim()) throw new Error(`context.dev: empty scrape result for ${url}`);
+    const title = String(data?.title ?? data?.metadata?.title ?? "");
     return title ? `# ${title}\n\n${md}` : md;
   }
   throw new Error("no scrape-capable crawl backend configured");
@@ -226,8 +204,11 @@ async function contextdevCrawl(cfg: SwarmConfig, opts: CrawlOpts): Promise<Crawl
     cfg.contextdevApiKey,
     {
       url: opts.url,
-      max_pages: opts.maxPages,
-      ...(opts.includePaths?.length ? { include_paths: opts.includePaths } : {}),
+      // context.dev caps maxPages at 500 and uses camelCase keys.
+      maxPages: Math.min(opts.maxPages, 500),
+      ...(opts.includePaths?.length
+        ? { urlRegex: `^https?://[^/]+(${opts.includePaths.map(pathGlobToRegex).join("|")})` }
+        : {}),
     },
     CRAWL_DEADLINE_MS,
     opts.signal
@@ -283,6 +264,16 @@ async function deepcrawlCrawl(cfg: SwarmConfig, opts: CrawlOpts): Promise<CrawlP
     }));
   }
   throw new Error("deepcrawl: unrecognized response shape (expected results[] or pages[])");
+}
+
+/**
+ * include_paths entries are path prefixes or globs ("/docs/*", "guides/") —
+ * the crawl_site schema says so. Escape regex metacharacters but translate
+ * `*` into a real wildcard, and guarantee the leading slash a URL path has.
+ */
+function pathGlobToRegex(p: string): string {
+  const withSlash = p.startsWith("/") ? p : `/${p}`;
+  return withSlash.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^?#]*");
 }
 
 // ---------------------------------------------------------------- plumbing

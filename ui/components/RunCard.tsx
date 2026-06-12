@@ -94,7 +94,10 @@ export function RunCard({ run, now, onDeleted }: { run: RunSummary; now: number;
       )}
 
       <div className="flex items-center justify-between text-2xs text-ink-faint">
-        <span className="mono">{fmtTokens(spent)} tok · {fmtMoney(run.cost)}</span>
+        <span className="mono">
+          {fmtTokens(spent)} tok · {fmtMoney(run.cost)}
+          {(run.sourceCount ?? 0) > 0 ? ` · ⌕ ${run.sourceCount}` : ""}
+        </span>
         <span>{fmtAgo(run.updatedAt || run.createdAt, now)}</span>
       </div>
     </div>
