@@ -118,7 +118,7 @@ test("trimmedMean trims floor(n·frac) from each end", () => {
   assert.equal(trimmedMean([1, 2, 3], 0.1), 2); // floor(0.3)=0 → plain mean
 });
 
-test("aggregateQuantiles: trimmed means stay monotonic and spread is relative", () => {
+test("aggregateQuantiles: small panels take the median per quantile, stay monotonic, spread is relative", () => {
   const a = aggregateQuantiles([
     { p10: 10, p50: 20, p90: 30 },
     { p10: 12, p50: 24, p90: 40 },
@@ -127,9 +127,18 @@ test("aggregateQuantiles: trimmed means stay monotonic and spread is relative", 
   assert.equal(a.n, 3);
   near(a.quantiles.p10, 10, 1e-9);
   near(a.quantiles.p50, 20, 1e-9);
-  near(a.quantiles.p90, 32.6667, 1e-3);
+  near(a.quantiles.p90, 30, 1e-9); // median of 30/40/28 — a mean would let 40 drag it
   assert.ok(a.quantiles.p10 <= a.quantiles.p50 && a.quantiles.p50 <= a.quantiles.p90);
   near(a.spread, (24 - 16) / 20, 1e-9);
+});
+
+test("aggregateQuantiles: one wild panelist cannot drag a small panel", () => {
+  const a = aggregateQuantiles([
+    { p10: 10, p50: 20, p90: 30 },
+    { p10: 11, p50: 21, p90: 31 },
+    { p10: 100, p50: 200, p90: 300 },
+  ]);
+  near(a.quantiles.p50, 21, 1e-9, "median holds the center; a mean would say ~80");
 });
 
 test("scoring: brier, log, interval fixtures", () => {
@@ -379,7 +388,7 @@ test("chooseExtremizeK falls back below the minimum history and tunes above it",
   assert.equal(chooseExtremizeK(few, DEFAULT_EXTREMIZE_K), DEFAULT_EXTREMIZE_K);
 
   // Every panel says 60% and the answer is always YES — the more
-  // extremization, the better the Brier, so the grid maxes out.
+  // extremization, the better the Brier, so the search rides the upper bound.
   const many = Array.from({ length: MIN_ADAPTIVE_N + 5 }, (_, i) => ({
     ...resolvedEntry(`m${i}`, 0.6, 1),
     panel: [
@@ -387,9 +396,10 @@ test("chooseExtremizeK falls back below the minimum history and tunes above it",
       { taskId: "T3", method: "b", probability: 0.6 },
     ],
   }));
-  assert.equal(chooseExtremizeK(many, DEFAULT_EXTREMIZE_K), 4);
+  assert.ok(chooseExtremizeK(many, DEFAULT_EXTREMIZE_K) >= 5.99, "monotone improvement rides to K_MAX=6");
 
-  // Perfectly calibrated already (p=0.5 splits 50/50) — k=1 (no extremization) wins.
+  // A 70% panel that only hits 50/50: any extremization hurts, so the
+  // search converges to the lower bound k=1.
   const calibrated = Array.from({ length: MIN_ADAPTIVE_N + 5 }, (_, i) => ({
     ...resolvedEntry(`c${i}`, 0.7, i % 2),
     panel: [
@@ -397,7 +407,23 @@ test("chooseExtremizeK falls back below the minimum history and tunes above it",
       { taskId: "T3", method: "b", probability: 0.7 },
     ],
   }));
-  assert.equal(chooseExtremizeK(calibrated, DEFAULT_EXTREMIZE_K), 1);
+  assert.ok(chooseExtremizeK(calibrated, DEFAULT_EXTREMIZE_K) <= 1.01, "harmful extremization converges to k=1");
+});
+
+test("chooseExtremizeK finds an interior optimum the old 0.25 grid could not", () => {
+  // Panels at 60%, exactly 75% resolve YES. Brier-optimal extremized
+  // probability is 0.75, i.e. odds 1.5^k = 3 → k* = ln3/ln1.5 ≈ 2.7095.
+  const entries = Array.from({ length: 40 }, (_, i) => ({
+    ...resolvedEntry(`i${i}`, 0.6, i % 4 === 0 ? 0 : 1),
+    panel: [
+      { taskId: "T2", method: "a", probability: 0.6 },
+      { taskId: "T3", method: "b", probability: 0.6 },
+    ],
+  }));
+  const k = chooseExtremizeK(entries, DEFAULT_EXTREMIZE_K);
+  const kStar = Math.log(3) / Math.log(1.5);
+  assert.ok(Math.abs(k - kStar) < 0.01, `expected ~${kStar.toFixed(4)}, got ${k}`);
+  assert.equal(chooseExtremizeK(entries, DEFAULT_EXTREMIZE_K), k, "deterministic");
 });
 
 // ---------------------------------------------------------------- config plumbing
@@ -592,6 +618,18 @@ test("fitRecalibration learns to deflate systematic overconfidence", () => {
   // and the fit must actually beat identity on its own training data
   const lossAt = (p) => entries.reduce((s, e, i) => s + -logScore(p, i % 2), 0) / entries.length;
   assert.ok(lossAt(recal) < lossAt(0.75), "fitted mapping reduces mean log loss");
+});
+
+test("fitRecalibration can represent SEVERE overconfidence (a well below 0.5)", () => {
+  // 90% forecasts resolving 50/50: the loss-optimal map sends every 90% to
+  // ~50%, which on identical inputs needs a·logit(0.9)+b ≈ 0 — the
+  // regularizer then prefers small |b|, pushing a far below the old 0.5 floor.
+  const entries = Array.from({ length: 80 }, (_, i) => resolvedEntry(`sv${i}`, 0.9, i % 2));
+  const r = fitRecalibration(entries);
+  assert.ok(r, "enough history to fit");
+  assert.ok(r.a < 0.5, `severe overconfidence needs a<0.5, got a=${r.a}`);
+  const recal = applyRecalibration(0.9, r);
+  assert.ok(recal > 0.4 && recal < 0.6, `90% should map near 50%, got ${recal}`);
 });
 
 test("fitRecalibration stays near identity when the record is already calibrated", () => {
@@ -846,7 +884,7 @@ test("resolveLedgerEntry scores mc, date, and pinball outcomes", () => {
   near(recNever.logScore, Math.log(0.2), 1e-9);
 });
 
-test("calibrationStats folds mc options into the reliability bins (not into binary means)", () => {
+test("calibrationStats keeps mc options in their own reliability bins", () => {
   const mcEntry = {
     id: "mc1",
     runId: "r",
@@ -858,9 +896,10 @@ test("calibrationStats folds mc options into the reliability bins (not into bina
   };
   const stats = calibrationStats([mcEntry]);
   assert.equal(stats.n, 0, "mc entries don't inflate the binary count");
-  const hi = stats.bins.find((b) => b.lo === 0.7);
-  assert.ok(hi && hi.n === 1 && hi.hitRate === 1, "the realized option lands in its bin as a hit");
-  const lo = stats.bins.find((b) => b.lo === 0.2);
+  assert.equal(stats.bins.length, 0, "mc options stay out of the BINARY bins — different base rate");
+  const hi = stats.mcBins.find((b) => b.lo === 0.7);
+  assert.ok(hi && hi.n === 1 && hi.hitRate === 1, "the realized option lands in its mc bin as a hit");
+  const lo = stats.mcBins.find((b) => b.lo === 0.2);
   assert.ok(lo && lo.n === 1 && lo.hitRate === 0, "the losing option lands as a miss");
 });
 

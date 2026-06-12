@@ -100,3 +100,26 @@ test("formatTables lists tables and prints the requested one as TSV", () => {
   assert.ok(/2024\tY/.test(second));
   assert.equal(formatTables([]), "no data tables found on the page");
 });
+
+test("olsProject band is a real prediction interval — wider with longer extrapolation", () => {
+  const { olsProject } = require("../../dist/datatools.js");
+  // Noisy-but-linear series: y = x + alternating ±2 noise, 30 daily points.
+  const points = Array.from({ length: 30 }, (_, i) => ({
+    date: new Date(Date.UTC(2026, 0, 1 + i)).toISOString().slice(0, 10),
+    value: i + (i % 2 ? 2 : -2),
+  }));
+  const near = olsProject(points, "2026-02-15"); // ~2 weeks past the data
+  const far = olsProject(points, "2026-06-01"); // ~4 months past the data
+  assert.ok(near && far);
+  const width = (p) => p.hi - p.lo;
+  assert.ok(width(far) > width(near), "extrapolation term must widen the band quadratically with distance");
+  assert.ok(near.lo < near.projected && near.projected < near.hi);
+  // Perfectly linear data → ~zero residuals → ~zero band, any horizon.
+  const clean = Array.from({ length: 10 }, (_, i) => ({
+    date: new Date(Date.UTC(2026, 0, 1 + i)).toISOString().slice(0, 10),
+    value: 5 * i,
+  }));
+  const proj = olsProject(clean, "2026-03-01");
+  assert.ok(proj && width(proj) < 1e-9);
+  assert.ok(Math.abs(proj.projected - 5 * 59) < 1e-6, "projection follows the line");
+});

@@ -64,6 +64,7 @@ import {
   isoToDays,
   liquidityFactor,
   loadLedger,
+  MANIFOLD_VOLUME_DISCOUNT,
   methodWeights,
   monotoneQuantiles,
   normalizeOptionProbs,
@@ -73,6 +74,7 @@ import {
 } from "./forecast";
 import { MarketHit, marketOdds } from "./datatools";
 import { appendMemory, memoryBlock } from "./memory";
+import { canonicalizeUrl } from "./searchcore";
 import { aggregateSources, renderFinalHtml, sourcesBlock } from "./report";
 import { SandboxRuntime, createSandbox } from "./sandbox";
 import { RunState } from "./state";
@@ -124,6 +126,16 @@ export function synthReserve(cap: number, mode: "root" | "team"): number {
   if (mode === "team") return Math.min(8_000, quarter);
   return Math.min(quarter, Math.min(120_000, Math.max(30_000, Math.floor(cap * 0.03))));
 }
+
+/**
+ * Above this many tasks, synthesis goes map-reduce: parallel cheap-model
+ * digests of ~10-task groups feed the synthesizer instead of the raw report
+ * blob, which at that size would blow the 300K-char window and silently lose
+ * whole tasks to middle-truncation. The synthesizer keeps read_report for
+ * drill-down, so the digests are an index, not a ceiling.
+ */
+export const SYNTH_MAPREDUCE_THRESHOLD = 40;
+const SYNTH_GROUP_SIZE = 10;
 
 export class Executor {
   private cfg: SwarmConfig;
@@ -700,7 +712,7 @@ export class Executor {
     if (!Array.isArray(v)) return [];
     return (v as Record<string, unknown>[])
       .filter((s) => s && typeof s === "object" && /^https?:\/\//.test(String(s.url ?? "")))
-      .slice(0, 40)
+      .slice(0, 80)
       .map((s) => ({
         url: clip(String(s.url), 500),
         title: s.title ? clip(String(s.title), 200) : undefined,
@@ -799,15 +811,20 @@ export class Executor {
       return;
     }
     if (q.kind === "mc") agg.evidenceOverlap = overlap;
-    // Date questions carry a separate never-mass: GMO of the panel's P(never).
+    // Date questions carry a separate never-mass. P(never-by-horizon) is a
+    // binary forecast in disguise, so it gets the same extremized,
+    // overlap-scaled GMO treatment as a binary panel — not the raw GMO.
     if (q.kind === "date") {
       const pNevers = panel
         .map((t) => t.forecast!.pNever)
         .filter((p): p is number => typeof p === "number")
         .map(clampProb);
       if (pNevers.length) {
+        const dateOverlap = evidenceOverlap(panel.map((t) => (t.sources ?? []).map((s) => s.url)));
         const lo = pNevers.reduce((s, p) => s + Math.log(p / (1 - p)), 0) / pNevers.length;
-        agg.pNever = clampProb(Math.exp(lo) / (1 + Math.exp(lo)));
+        const kEff = pNevers.length > 1 ? scaleK(k, dateOverlap) : 1;
+        const odds = Math.pow(Math.exp(lo), kEff);
+        agg.pNever = clampProb(odds / (1 + odds));
       }
     }
     if (q.kind === "binary") {
@@ -914,7 +931,14 @@ export class Executor {
         const hay = h.title.toLowerCase();
         return terms.reduce((s, t) => s + (hay.includes(t) ? 1 : 0), 0) / terms.length;
       };
-      const liquidity = (h: MarketHit) => h.volume ?? (h.forecasters ? h.forecasters * 100 : 0);
+      // Manifold's play-money volumes are discounted to real-money-equivalent
+      // terms BEFORE the floor and the liquidity weight — 25K mana clears the
+      // same bar as $500. The discounted value is also what gets stored, so
+      // chooseMarketWeight and the backtest refit on the weight actually used.
+      const liquidity = (h: MarketHit) => {
+        const raw = h.volume ?? (h.forecasters ? h.forecasters * 100 : 0);
+        return h.platform === "manifold" ? raw / MANIFOLD_VOLUME_DISCOUNT : raw;
+      };
       const candidates = hits
         .filter((h) => typeof h.probability === "number" && relevance(h) >= 0.5 && liquidity(h) >= 500)
         .sort((a, b) => liquidity(b) - liquidity(a));
@@ -953,7 +977,8 @@ Same event, same direction (the market's YES means this question's YES), compati
         url: best.url,
         title: best.title,
         probability: clampProb(best.probability!),
-        volume: best.volume,
+        // Discounted (real-money-equivalent) volume — the number liquidityFactor saw.
+        volume: liquidity(best),
         weight,
       };
     } catch (e) {
@@ -1820,6 +1845,16 @@ PROTOCOL
       addCheckpoint: task ? (summary) => this.recordCheckpoint(task, agentId, summary) : undefined,
       addNote: (text, key, kind, url) => {
         this.notes.push({ taskId: task?.id, teamId: this.teamId, key, kind, text, url });
+        // A note that cites a URL is evidence: stage it on the task so it
+        // reaches the bibliography even if the agent forgets to repeat it in
+        // report(sources:[...]) — report-time intake merges, not overwrites.
+        if (task && url && /^https?:\/\//.test(url)) {
+          const canon = canonicalizeUrl(url);
+          task.sources = task.sources ?? [];
+          if (task.sources.length < 80 && !task.sources.some((s) => canonicalizeUrl(s.url) === canon)) {
+            task.sources.push({ url: clip(url, 500), note: clip(text, 200) });
+          }
+        }
         // Only the recent tail ever feeds digests; without a cap a multi-day
         // run accumulates every note in memory. Decisions and conflicts are
         // kept regardless. In-place splice: teams share this array by reference.
@@ -2120,8 +2155,25 @@ PROTOCOL
     task.filesTouched = strList(a.files_touched, 40);
     // Structured sources: the citation pipeline's entry point. Only real
     // http(s) URLs survive; they flow into dep handoffs and the bibliography.
-    const sources = this.parseSources(a.sources);
-    task.sources = sources.length ? sources : undefined;
+    // Reported sources merge with URLs the task posted via note(url=...)
+    // during the run — reported entries win the dedup (they carry titles).
+    const reported = this.parseSources(a.sources);
+    const merged: SourceRef[] = [];
+    const seen = new Set<string>();
+    for (const s of [...reported, ...(task.sources ?? [])]) {
+      const key = canonicalizeUrl(s.url);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(s);
+      if (merged.length >= 80) break;
+    }
+    task.sources = merged.length ? merged : undefined;
+    if (task.role === "researcher" && !task.sources?.length) {
+      this.journal.append("log", {
+        level: "warn",
+        msg: `${task.id} (researcher) reported with no sources — its findings cannot be cited in the final report`,
+      });
+    }
     this.journal.append("task.report", {
       taskId: task.id,
       status: reportStatus,
@@ -2613,9 +2665,21 @@ PROTOCOL
       this.journal.append("log", { level: "error", msg: `forecast aggregation failed: ${errMsg(e)}` });
     }
     const tasks = this.taskList();
-    const reports = tasks.length
+    let reports = tasks.length
       ? tasks.map(reportBlock).join("\n\n")
       : "(no tasks were completed)";
+    // Map-reduce for large runs: pre-digest task groups in parallel so the
+    // synthesizer integrates ALL findings instead of a middle-truncated blob.
+    if (tasks.length >= SYNTH_MAPREDUCE_THRESHOLD) {
+      try {
+        reports = await this.mapReduceReports(tasks);
+      } catch (e) {
+        this.journal.append("log", {
+          level: "warn",
+          msg: `group pre-digest failed — synthesizing from raw (truncated) reports: ${errMsg(e)}`,
+        });
+      }
+    }
     const artifactList = this.listArtifacts().join("\n") || "(none)";
     // The citation pipeline's last hop: every source any worker reported,
     // deduplicated and numbered, becomes the synthesizer's bibliography.
@@ -2675,9 +2739,13 @@ PROTOCOL
         this.journal.append("log", { level: "warn", msg: `empty-report synthesis retry failed: ${errMsg(e)}` });
       }
     }
-    // Strict mode: check the final report's claims against the task reports
-    // (the ground truth) and re-synthesize once if it misrepresents them.
-    if (this.cfg.verification === "strict" && reportMarkdown.trim() && tasks.length) {
+    // Faithfulness check: compare the final report's claims against the task
+    // reports (the ground truth) and re-synthesize once on discrepancies.
+    // Strict mode always checks; normal mode checks once the run is big
+    // enough that silent misrepresentation has room to hide (≥5 tasks).
+    const checkFaithfulness =
+      this.cfg.verification === "strict" || (this.cfg.verification === "normal" && tasks.length >= 5);
+    if (checkFaithfulness && reportMarkdown.trim() && tasks.length) {
       try {
         const res = await chat(this.cfg, {
           model: this.meta.options.conductorModel,
@@ -2744,6 +2812,59 @@ PROTOCOL
         keyDecisions: this.notes.filter((n) => n.kind === "decision").slice(-10).map((n) => n.text),
       });
     }
+  }
+
+  /**
+   * Pre-digest task reports for a large run: group by role (digests stay
+   * coherent), chunk to SYNTH_GROUP_SIZE, summarize every group with parallel
+   * cheap-model calls, and hand the synthesizer the digests plus a pointer to
+   * read_report for full text. Any group failure falls back to that group's
+   * raw (clipped) report blocks — the synthesizer never sees a hole.
+   */
+  private async mapReduceReports(tasks: Task[]): Promise<string> {
+    const byRole = new Map<string, Task[]>();
+    for (const t of tasks) {
+      const list = byRole.get(t.role) ?? [];
+      list.push(t);
+      byRole.set(t.role, list);
+    }
+    const groups: Task[][] = [];
+    for (const list of byRole.values()) {
+      for (let i = 0; i < list.length; i += SYNTH_GROUP_SIZE) groups.push(list.slice(i, i + SYNTH_GROUP_SIZE));
+    }
+    const model = this.cfg.cheapModel || this.meta.options.conductorModel;
+    const digests = await Promise.all(
+      groups.map(async (group, i) => {
+        const ids = group.map((t) => t.id).join(", ");
+        const raw = group.map(reportBlock).join("\n\n");
+        try {
+          const res = await chat(this.cfg, {
+            model,
+            priority: "high",
+            messages: [
+              {
+                role: "user",
+                content: `You are pre-digesting one group of task reports from a large agent-swarm run so the final synthesizer can integrate ALL of them without truncation.\n\nMISSION: ${this.meta.mission}\n\nCompress these ${group.length} ${group[0].role} task reports (group ${i + 1}/${groups.length}) into a dense digest of at most 500 words. PRESERVE: every distinct finding with its numbers, exact artifact paths, source URLs that anchor key claims, which task said what (cite task ids), and any disagreement between tasks. Drop process narration. Plain text only.\n\n${truncateMiddle(raw, 60_000, "chars")}`,
+              },
+            ],
+            thinking: false,
+            maxTokens: 2000,
+            signal: new AbortController().signal,
+          });
+          this.onUsage(model, res.usage);
+          const text = (res.content || "").trim();
+          if (!text) throw new Error("empty digest");
+          return `── group ${i + 1}/${groups.length} (${group[0].role}: ${ids})\n${text}`;
+        } catch (e) {
+          this.journal.append("log", { level: "warn", msg: `digest of group ${i + 1} failed (${errMsg(e)}) — using raw blocks` });
+          return raw;
+        }
+      })
+    );
+    return (
+      `(${tasks.length} tasks, pre-digested in ${groups.length} groups — full text of ANY task: read_report(task_id))\n\n` +
+      digests.join("\n\n")
+    );
   }
 
   private fallbackReport(tasks: Task[]): string {

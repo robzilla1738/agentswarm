@@ -604,7 +604,9 @@ async function cmdForecasts(sub?: string, flags: Args["flags"] = {}): Promise<vo
             maxTasks: Math.min(cfg.maxTasks, 16),
             maxTokens: Math.min(cfg.maxTokensPerRun, 4_000_000),
             ...(cfg.cheapModel ? { model: cfg.cheapModel } : {}),
-            panelSize: 3,
+            // Updates are cheaper runs than first forecasts, but they should
+            // still respect the configured panel size up to a cap of 5.
+            panelSize: Math.min(Math.max(3, cfg.forecastPanelSize || 3), 5),
             mode: "forecast",
             presetQuestion: entry.question,
             supersedes: entry.id,
@@ -880,6 +882,15 @@ function cmdCalibration(): void {
     const said = `${Math.round(b.meanP * 100)}%`.padStart(4);
     const hit = `${Math.round(b.hitRate * 100)}%`.padStart(6);
     console.log(`  ${`${b.lo * 100}–${b.hi * 100}%`.padEnd(11)} ${said}        ${hit}   ${b.n}`);
+  }
+  if (stats.mcBins.length) {
+    console.log(ansi.bold("\nmc option calibration") + ansi.gray("  (per-option probabilities, separate base rate from binary)"));
+    console.log(ansi.gray("  band        said   realized   n"));
+    for (const b of stats.mcBins) {
+      const said = `${Math.round(b.meanP * 100)}%`.padStart(4);
+      const hit = `${Math.round(b.hitRate * 100)}%`.padStart(6);
+      console.log(`  ${`${b.lo * 100}–${b.hi * 100}%`.padEnd(11)} ${said}    ${hit}   ${b.n}`);
+    }
   }
   const methods = Object.entries(stats.byMethod).sort((a, b) => a[1].brierMean - b[1].brierMean);
   if (methods.length) {

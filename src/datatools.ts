@@ -968,19 +968,41 @@ export interface OlsProjection {
   slopePerDay: number;
   /** Projected value at the target date. */
   projected: number;
-  /** ~80% band from the fit's residuals (±1.28σ). */
+  /** ~80% prediction interval: t(n−2)·σ·√(1 + 1/n + (x−x̄)²/Sxx). */
   lo: number;
   hi: number;
   /** Days from the last observation to the target. */
   daysAhead: number;
 }
 
+/** Student-t 90th percentile (one-tail) by df — the two-sided 80% band multiplier. */
+function tQuantile90(df: number): number {
+  const table: [number, number][] = [
+    [1, 3.078], [2, 1.886], [3, 1.638], [4, 1.533], [5, 1.476],
+    [6, 1.44], [7, 1.415], [8, 1.397], [9, 1.383], [10, 1.372],
+    [12, 1.356], [15, 1.341], [20, 1.325], [25, 1.316], [30, 1.31],
+    [60, 1.296], [120, 1.289],
+  ];
+  if (df <= 1) return table[0][1];
+  if (df >= 120) return 1.282;
+  for (let i = 1; i < table.length; i++) {
+    const [d1, t1] = table[i - 1];
+    const [d2, t2] = table[i];
+    if (df <= d2) return t1 + ((df - d1) / (d2 - d1)) * (t2 - t1);
+  }
+  return 1.282;
+}
+
 /**
  * Ordinary least squares over the full series (x = days since the first
- * point), naively projected to a target date with an ~80% residual band.
- * Deterministic trend math the agent can cite instead of narrating "momentum"
- * — a baseline, not destiny. Returns null when a line can't be fit
- * (fewer than 2 points, or no time variance).
+ * point), projected to a target date with a real ~80% prediction interval:
+ * t(n−2) · σ · √(1 + 1/n + (x−x̄)²/Sxx). Unlike a flat ±1.28σ residual band,
+ * this widens with extrapolation distance — exactly where forecasters lean on
+ * the projection hardest. Deterministic trend math the agent can cite instead
+ * of narrating "momentum" — a baseline, not destiny. Returns null when a line
+ * can't be fit (fewer than 2 points, or no time variance). The band still
+ * ignores autocorrelated residuals (near-universal in time series), so treat
+ * it as optimistic.
  */
 export function olsProject(points: { date: string; value: number }[], targetDate: string): OlsProjection | null {
   if (points.length < 2 || !/^\d{4}-\d{2}-\d{2}/.test(targetDate)) return null;
@@ -1010,7 +1032,9 @@ export function olsProject(points: { date: string; value: number }[], targetDate
   const sigma = n > 2 ? Math.sqrt(ssr / (n - 2)) : 0;
   const xTarget = (target - t0) / DAY;
   const projected = intercept + slope * xTarget;
-  const band = 1.28 * sigma;
+  // Full prediction interval: parameter uncertainty (1/n) plus the
+  // extrapolation term ((x−x̄)²/Sxx) on top of the residual spread.
+  const band = tQuantile90(n - 2) * sigma * Math.sqrt(1 + 1 / n + ((xTarget - mx) * (xTarget - mx)) / sxx);
   return {
     slopePerDay: slope,
     projected,

@@ -112,19 +112,22 @@ export function shouldUseLogSpace(qs: Quantiles[]): boolean {
 }
 
 /**
- * Combine a numeric panel: 10%-trimmed mean per quantile (log-space for
- * heavily skewed positive quantities), values re-sorted across quantile keys
- * for monotonicity. Optional quantiles aggregate only when every panelist
- * provided them — a percentile averaged over half the panel is a different
- * statistic than its neighbors.
+ * Combine a numeric panel: median per quantile below 10 panelists (a 10% trim
+ * removes nothing at those sizes, and the median is the honest outlier guard),
+ * 10%-trimmed mean at 10+ (log-space for heavily skewed positive quantities).
+ * Values are re-sorted across quantile keys for monotonicity. Optional
+ * quantiles aggregate only when every panelist provided them — a percentile
+ * averaged over half the panel is a different statistic than its neighbors.
  */
 export function aggregateQuantiles(qs: Quantiles[], k = DEFAULT_EXTREMIZE_K): AggregateForecast {
   if (!qs.length) throw new Error("aggregateQuantiles: empty panel");
   const logSpace = shouldUseLogSpace(qs);
   const fwd = (v: number) => (logSpace ? Math.log(v) : v);
   const back = (v: number) => (logSpace ? Math.exp(v) : v);
+  const center = (vals: number[]): number =>
+    vals.length < 10 ? median([...vals].sort((a, b) => a - b)) : trimmedMean(vals);
   const keys = QUANTILE_TAUS.map((t) => t.key).filter((key) => qs.every((q) => typeof q[key] === "number"));
-  const values = keys.map((key) => back(trimmedMean(qs.map((q) => fwd(q[key] as number))))).sort((a, b) => a - b);
+  const values = keys.map((key) => back(center(qs.map((q) => fwd(q[key] as number))))).sort((a, b) => a - b);
   const quantiles = {} as Quantiles;
   keys.forEach((key, i) => {
     quantiles[key] = values[i];
@@ -331,6 +334,13 @@ export const DEFAULT_MARKET_WEIGHT = 0.4;
 export const MIN_MARKET_WEIGHT_N = 20;
 
 /**
+ * Manifold runs on play money: mana volumes are nominally ~50× a real-money
+ * market of comparable conviction. Divide before liquidityFactor so a 10K-mana
+ * market doesn't anchor like a $10K Polymarket book.
+ */
+export const MANIFOLD_VOLUME_DISCOUNT = 50;
+
+/**
  * Fit the market blend weight on the resolved track record: the w that would
  * have minimized mean log loss re-blending each stored panel aggregate with
  * its stored market price. Falls back below MIN_MARKET_WEIGHT_N resolutions.
@@ -445,9 +455,12 @@ export function fitRecalibration(entries = loadLedger()): Recalibration | null {
   const gamma = 2 / pts.length;
   let best: Recalibration = { a: 1, b: 0, n: pts.length };
   let bestLoss = Infinity;
-  for (let ai = 0; ai <= 22; ai++) {
-    const a = 0.5 + ai * 0.05;
-    for (let bi = -10; bi <= 10; bi++) {
+  // a down to 0.1: LLM panels can be SEVERELY overconfident, and a slope
+  // floor of 0.5 made that uncorrectable. The identity-regularizer keeps
+  // small samples from actually wandering down there without evidence.
+  for (let ai = 0; ai <= 38; ai++) {
+    const a = 0.1 + ai * 0.05;
+    for (let bi = -20; bi <= 20; bi++) {
       const b = bi / 10;
       let sum = 0;
       for (const pt of pts) {
@@ -814,6 +827,12 @@ export interface CalibrationStats {
   n: number;
   brierMean: number;
   bins: CalibrationBin[];
+  /**
+   * Reliability bins for mc option probabilities, kept separate from the
+   * binary bins: "option B of 4 at 35%" and "binary YES at 35%" are different
+   * calibration properties, and mixing them muddied both diagnoses.
+   */
+  mcBins: CalibrationBin[];
   /** Per-panel-method mean Brier (panelists scored against the outcome). */
   byMethod: Record<string, { n: number; brierMean: number }>;
 }
@@ -834,13 +853,16 @@ function scoreable(entries: LedgerEntry[]): { p: number; outcome: 0 | 1; panel: 
 
 export function calibrationStats(entries: LedgerEntry[]): CalibrationStats {
   const scored = scoreable(entries);
-  const bins: CalibrationBin[] = Array.from({ length: 10 }, (_, i) => ({
-    lo: i / 10,
-    hi: (i + 1) / 10,
-    n: 0,
-    meanP: 0,
-    hitRate: 0,
-  }));
+  const makeBins = (): CalibrationBin[] =>
+    Array.from({ length: 10 }, (_, i) => ({
+      lo: i / 10,
+      hi: (i + 1) / 10,
+      n: 0,
+      meanP: 0,
+      hitRate: 0,
+    }));
+  const bins = makeBins();
+  const mcBins = makeBins();
   let brierSum = 0;
   for (const s of scored) {
     brierSum += brierScore(s.p, s.outcome);
@@ -860,10 +882,11 @@ export function calibrationStats(entries: LedgerEntry[]): CalibrationStats {
       byMethod[key] = cur;
     }
   }
-  // mc questions calibrate the same reliability bins — each option is one
-  // (stated probability, did-it-happen) pair. They stay out of n/brierMean
-  // and byMethod: multiclass Brier lives on a 0–2 scale that would corrupt
-  // the binary means the method weights are fitted on.
+  // mc questions calibrate their own reliability bins — each option is one
+  // (stated probability, did-it-happen) pair. They stay out of bins/n/
+  // brierMean and byMethod: an option's probability lives on a different
+  // base rate than a binary YES, and multiclass Brier's 0–2 scale would
+  // corrupt the binary means the method weights are fitted on.
   for (const e of entries) {
     if (e.question.kind !== "mc" || !e.resolution) continue;
     const realized = e.resolution.outcome;
@@ -873,7 +896,7 @@ export function calibrationStats(entries: LedgerEntry[]): CalibrationStats {
     for (const opt of e.question.options) {
       const p = probs[opt];
       if (typeof p !== "number") continue;
-      const bin = bins[Math.min(9, Math.floor(p * 10))];
+      const bin = mcBins[Math.min(9, Math.floor(p * 10))];
       const hit = opt === realized ? 1 : 0;
       bin.meanP = (bin.meanP * bin.n + p) / (bin.n + 1);
       bin.hitRate = (bin.hitRate * bin.n + hit) / (bin.n + 1);
@@ -884,6 +907,7 @@ export function calibrationStats(entries: LedgerEntry[]): CalibrationStats {
     n: scored.length,
     brierMean: scored.length ? brierSum / scored.length : 0,
     bins: bins.filter((b) => b.n > 0),
+    mcBins: mcBins.filter((b) => b.n > 0),
     byMethod,
   };
 }
@@ -913,6 +937,12 @@ export function calibrationBlock(entries = loadLedger()): string {
     if (b.n < 2) continue;
     lines.push(`- In the ${pct(b.lo)}–${pct(b.hi)} band you averaged ${pct(b.meanP)}; ${pct(b.hitRate)} actually resolved YES (n=${b.n}).`);
   }
+  for (const b of stats.mcBins) {
+    if (b.n < 3) continue;
+    lines.push(
+      `- (mc options) In the ${pct(b.lo)}–${pct(b.hi)} band you averaged ${pct(b.meanP)}; ${pct(b.hitRate)} of those options realized (n=${b.n}).`
+    );
+  }
   const high = stats.bins.filter((b) => b.lo >= 0.7 && b.n >= 3);
   const over = high.filter((b) => b.meanP - b.hitRate > 0.1);
   const low = stats.bins.filter((b) => b.hi <= 0.3 && b.n >= 3);
@@ -936,12 +966,16 @@ export function calibrationBlock(entries = loadLedger()): string {
 
 // ---------------------------------------------------------------- adaptive extremization
 
-const K_GRID = Array.from({ length: 13 }, (_, i) => 1 + i * 0.25); // 1.00 … 4.00
+/** Search bounds for the extremization exponent. */
+const K_MIN = 1;
+const K_MAX = 6;
 
 /**
  * Pick the extremization exponent that would have minimized Brier over the
  * resolved history (each entry re-aggregated from its stored panel at each
- * candidate k). Falls back to the default below MIN_ADAPTIVE_N resolutions —
+ * candidate k). A coarse scan brackets the best region, then golden-section
+ * refines it to ~1e-3 — exact where a fixed grid could only land within 0.125
+ * of the optimum. Falls back to the default below MIN_ADAPTIVE_N resolutions —
  * tuning on a handful of outcomes is just overfitting noise.
  */
 export const MIN_ADAPTIVE_N = 30;
@@ -949,9 +983,7 @@ export const MIN_ADAPTIVE_N = 30;
 export function chooseExtremizeK(entries = loadLedger(), fallback = DEFAULT_EXTREMIZE_K): number {
   const usable = scoreable(entries).filter((s) => s.panel.filter((m) => typeof m.probability === "number").length >= 2);
   if (usable.length < MIN_ADAPTIVE_N) return fallback;
-  let bestK = fallback;
-  let bestBrier = Infinity;
-  for (const k of K_GRID) {
+  const meanBrier = (k: number): number => {
     let sum = 0;
     for (const s of usable) {
       const probs = s.panel.map((m) => m.probability).filter((p): p is number => typeof p === "number");
@@ -962,13 +994,43 @@ export function chooseExtremizeK(entries = loadLedger(), fallback = DEFAULT_EXTR
         void errMsg(e);
       }
     }
-    const mean = sum / usable.length;
-    if (mean < bestBrier - 1e-12) {
-      bestBrier = mean;
-      bestK = k;
+    return sum / usable.length;
+  };
+  // Coarse scan (step 0.5) brackets the global region — Brier vs k is smooth
+  // but only locally unimodal, and golden-section alone could chase a local dip.
+  let coarseBest = K_MIN;
+  let coarseLoss = Infinity;
+  for (let k = K_MIN; k <= K_MAX + 1e-9; k += 0.5) {
+    const loss = meanBrier(k);
+    if (loss < coarseLoss - 1e-12) {
+      coarseLoss = loss;
+      coarseBest = k;
     }
   }
-  return bestK;
+  // Golden-section refinement within the bracketing cell.
+  const phi = (Math.sqrt(5) - 1) / 2;
+  let a = Math.max(K_MIN, coarseBest - 0.5);
+  let b = Math.min(K_MAX, coarseBest + 0.5);
+  let c = b - phi * (b - a);
+  let d = a + phi * (b - a);
+  let fc = meanBrier(c);
+  let fd = meanBrier(d);
+  while (b - a > 1e-3) {
+    if (fc < fd) {
+      b = d;
+      d = c;
+      fd = fc;
+      c = b - phi * (b - a);
+      fc = meanBrier(c);
+    } else {
+      a = c;
+      c = d;
+      fc = fd;
+      d = a + phi * (b - a);
+      fd = meanBrier(d);
+    }
+  }
+  return Number(((a + b) / 2).toFixed(3));
 }
 
 // ---------------------------------------------------------------- backtest
