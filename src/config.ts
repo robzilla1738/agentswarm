@@ -47,12 +47,21 @@ export interface SwarmConfig {
   fredApiKey: string;
   /** Metaculus API token for market_odds — free with an account (their API requires auth). */
   metaculusApiKey: string;
+  /** The Odds API key (the-odds-api.com, free tier) — adds sportsbook consensus to market_odds. */
+  oddsApiKey: string;
   /** Forecast mode: independent forecaster panel size. */
   forecastPanelSize: number;
   /** Forecast mode: extremization exponent for the geometric-mean-of-odds aggregate. */
   forecastExtremizeK: number;
   /** Forecast mode: engine-run inverted-framing probe joins the panel (de-biases affirmative framing). */
   forecastCoherenceProbe: boolean;
+  /**
+   * Forecast mode: base weight of the mechanical market anchor — the engine
+   * blends the panel aggregate toward a verified matching market price in
+   * log-odds space, scaled by the market's liquidity. 0 disables anchoring.
+   * Re-fit from the resolved ledger once it holds 20+ anchored resolutions.
+   */
+  forecastMarketWeight: number;
   /**
    * Where isolated runs execute. Default "host": the run's private workspace
    * directory on this machine — works out of the box, no Docker or cloud
@@ -149,9 +158,11 @@ export const DEFAULTS: SwarmConfig = {
   crawlBackend: "auto",
   fredApiKey: "",
   metaculusApiKey: "",
+  oddsApiKey: "",
   forecastPanelSize: 5,
   forecastExtremizeK: 2.5,
   forecastCoherenceProbe: true,
+  forecastMarketWeight: 0.4,
   sandboxRuntime: "host",
   sandboxImage: "node:22-bookworm",
   e2bApiKey: "",
@@ -199,6 +210,7 @@ export const SECRET_ENV_KEYS: string[] = [
     "DEEPCRAWL_API_KEY",
     "FRED_API_KEY",
     "METACULUS_API_KEY",
+    "ODDS_API_KEY",
     "E2B_API_KEY",
     "MODAL_TOKEN_ID",
     "MODAL_TOKEN_SECRET",
@@ -269,6 +281,7 @@ export function loadConfig(): SwarmConfig {
   if (process.env.DEEPCRAWL_BASE_URL) cfg.deepcrawlBaseUrl = process.env.DEEPCRAWL_BASE_URL;
   if (process.env.FRED_API_KEY) cfg.fredApiKey = process.env.FRED_API_KEY;
   if (process.env.METACULUS_API_KEY) cfg.metaculusApiKey = process.env.METACULUS_API_KEY;
+  if (process.env.ODDS_API_KEY) cfg.oddsApiKey = process.env.ODDS_API_KEY;
   if (process.env.E2B_API_KEY) cfg.e2bApiKey = process.env.E2B_API_KEY;
   if (process.env.MODAL_TOKEN_ID) cfg.modalTokenId = process.env.MODAL_TOKEN_ID;
   if (process.env.MODAL_TOKEN_SECRET) cfg.modalTokenSecret = process.env.MODAL_TOKEN_SECRET;
@@ -354,9 +367,11 @@ export const SETTABLE_KEYS: (keyof SwarmConfig)[] = [
   "crawlBackend",
   "fredApiKey",
   "metaculusApiKey",
+  "oddsApiKey",
   "forecastPanelSize",
   "forecastExtremizeK",
   "forecastCoherenceProbe",
+  "forecastMarketWeight",
   "sandboxRuntime",
   "sandboxImage",
   "e2bApiKey",
@@ -391,6 +406,7 @@ const NUM_RANGES: Partial<Record<keyof SwarmConfig, [number, number]>> = {
 /** Like NUM_RANGES, but the value keeps its fraction (extremization exponents are not integers). */
 const FLOAT_RANGES: Partial<Record<keyof SwarmConfig, [number, number]>> = {
   forecastExtremizeK: [1, 4],
+  forecastMarketWeight: [0, 1],
 };
 
 const ENUMS: Partial<Record<keyof SwarmConfig, string[]>> = {

@@ -953,7 +953,10 @@ async function phaseForecast() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
   const { proc, port } = await startMock({ MOCK_SCENARIO: "forecast" });
   ok(`mock model server on :${port} (forecast script)`);
-  writeConfig(home, port, { forecastPanelSize: 3 });
+  // forecastMarketWeight 0: the engine's market anchor would otherwise hit
+  // live prediction-market APIs mid-test — determinism beats coverage here
+  // (the blend math is unit-tested).
+  writeConfig(home, port, { forecastPanelSize: 3, forecastMarketWeight: 0 });
   const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
 
   const res = spawnSync(process.execPath, [SWARM, "forecast", "Will the test event happen?", "--fg"], {
@@ -1083,6 +1086,74 @@ async function phaseForecast() {
   fs.rmSync(home, { recursive: true, force: true });
 }
 
+async function phaseTournamentPreset() {
+  console.log("\n▶ Phase 23: tournament import — preset question bypass, ledger origin, platform-resolution fallback");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "forecast" });
+  ok(`mock model server on :${port} (forecast script)`);
+  writeConfig(home, port, { forecastPanelSize: 3, forecastMarketWeight: 0 });
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  // A tournament-imported run: the question arrives pre-sharpened with its
+  // market provenance — exactly what `swarm tournament` constructs.
+  const preset = {
+    text: "Will the imported market event occur?",
+    kind: "binary",
+    resolutionCriteria: "Resolves exactly as the source market resolves: https://manifold.markets/market/fake123",
+    resolutionDate: "2020-03-01",
+  };
+  const create = spawnSync(process.execPath, ["-e",
+    `const {createRun, optionsFromConfig}=require(${JSON.stringify(path.join(ROOT, "dist", "run.js"))});` +
+    `const {loadConfig}=require(${JSON.stringify(path.join(ROOT, "dist", "config.js"))});` +
+    `const cfg=loadConfig();` +
+    `const meta=createRun({mission:"Forecast: tournament preset test",cwd:process.cwd(),sandbox:true,options:optionsFromConfig(cfg,{` +
+    `mode:"forecast",panelSize:3,presetQuestion:${JSON.stringify(preset)},` +
+    `forecastOrigin:{kind:"tournament",platform:"manifold",externalId:"fake123-e2e",url:"https://manifold.markets/market/fake123",marketProbAtCreate:0.62}` +
+    `})});console.log("RUN_ID="+meta.id);`,
+  ], { env, encoding: "utf8", timeout: 15000 });
+  if (create.status !== 0) { console.error(create.stdout, create.stderr); proc.kill(); fail("createRun failed"); }
+  const id = /RUN_ID=(\S+)/.exec(create.stdout)[1];
+
+  const res = spawnSync(process.execPath, [SWARM, "_exec", id], { env, encoding: "utf8", timeout: 120000 });
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); proc.kill(); fail(`_exec exited ${res.status}`); }
+  const evs = events(path.join(home, "runs", id));
+  const byType = (t) => evs.filter((e) => e.type === t);
+
+  // The preset bypassed the sharpener: the journaled question is verbatim.
+  const q = byType("forecast.question")[0];
+  if (!q || q.question.text !== preset.text || q.question.resolutionDate !== "2020-03-01") {
+    fail(`preset question should be journaled verbatim, got ${JSON.stringify(q && q.question)}`);
+  }
+  ok("preset question bypassed the sharpener and was journaled verbatim");
+
+  // The ledger record carries the market provenance and price-at-import.
+  const ledgerLines = fs.readFileSync(path.join(home, "forecasts", "ledger.jsonl"), "utf8")
+    .split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  const created = ledgerLines.find((r) => r.rec === "created");
+  if (!created || !created.origin || created.origin.platform !== "manifold" ||
+      created.origin.externalId !== "fake123-e2e" || created.origin.marketProbAtCreate !== 0.62) {
+    fail(`ledger should carry the tournament origin, got ${JSON.stringify(created && created.origin)}`);
+  }
+  ok("ledger created record carries origin (platform, externalId, market price at import)");
+
+  // Resolution: the platform lookup for the fake id fails, so resolveDue
+  // falls back to the scripted mini-agent — the chain must degrade, not die.
+  const resolveOut = spawnSync(process.execPath, ["-e",
+    `const {resolveDue}=require(${JSON.stringify(path.join(ROOT, "dist", "resolve.js"))});` +
+    `const {loadConfig}=require(${JSON.stringify(path.join(ROOT, "dist", "config.js"))});` +
+    `resolveDue(loadConfig()).then(r=>console.log("RESOLVE="+JSON.stringify(r))).catch(e=>{console.error(e);process.exit(1)})`,
+  ], { env, encoding: "utf8", timeout: 90000 });
+  proc.kill();
+  if (resolveOut.status !== 0) { console.error(resolveOut.stdout, resolveOut.stderr); fail("resolveDue failed"); }
+  const resolveRes = JSON.parse(/RESOLVE=(.*)/.exec(resolveOut.stdout)[1]);
+  if (resolveRes.resolved.length !== 1 || resolveRes.resolved[0].outcome !== 1) {
+    fail(`expected the fallback resolver to settle YES, got ${JSON.stringify(resolveRes)}`);
+  }
+  ok("platform resolution fell back to the mini-agent and settled the forecast");
+
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
 async function main() {
   await phaseHappy();
   await phaseAuthFail();
@@ -1106,8 +1177,9 @@ async function main() {
   await phaseStrictVerify();
   await phaseCitations();
   await phaseForecast();
+  await phaseTournamentPreset();
   console.log(
-    "\n✅ E2E passed — pipeline, auth failure, resume (with ledger re-seed), budget cap, verify-retry, steering + cancel, compaction, hub API, checkpoint resume, conductor breaker, blind verification, SIGTERM safety, 429 limiter, model tiers, hierarchical teams, the living plan, cascade root causes, failure diagnostics, and forecast mode (panel → mechanical aggregation → ledger → resolution → calibration) all work."
+    "\n✅ E2E passed — pipeline, auth failure, resume (with ledger re-seed), budget cap, verify-retry, steering + cancel, compaction, hub API, checkpoint resume, conductor breaker, blind verification, SIGTERM safety, 429 limiter, model tiers, hierarchical teams, the living plan, cascade root causes, failure diagnostics, forecast mode (panel → mechanical aggregation → ledger → resolution → calibration), and tournament imports (preset question, ledger origin, platform-resolution fallback) all work."
   );
 }
 

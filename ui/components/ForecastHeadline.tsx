@@ -3,6 +3,42 @@
 import type { AggregateForecast, ForecastQuestion, Task } from "@/lib/types";
 
 const pctOf = (p: number) => `${Math.round(p * 100)}%`;
+const daysToIso = (days: number) => new Date(Math.round(days) * 86_400_000).toISOString().slice(0, 10);
+
+/** Per-option probability bars for mc questions. */
+function OptionBars({ probs }: { probs: Record<string, number> }) {
+  const ranked = Object.entries(probs).sort((a, b) => b[1] - a[1]);
+  return (
+    <div className="flex-1 min-w-0 space-y-1.5">
+      {ranked.map(([opt, p], i) => (
+        <div key={opt} className="flex items-center gap-2">
+          <span className={`mono text-sm w-11 text-right shrink-0 ${i === 0 ? "font-semibold text-ink" : "text-ink-dim"}`}>
+            {pctOf(p)}
+          </span>
+          <div className="flex-1 h-2 rounded-full bg-[rgb(var(--hi)/0.08)] relative">
+            <div
+              className={`absolute top-0 h-full rounded-full ${i === 0 ? "bg-[var(--color-ink)]" : "bg-[rgb(var(--hi)/0.3)]"}`}
+              style={{ width: `${Math.max(1.5, p * 100)}%` }}
+            />
+          </div>
+          <span className={`text-xs truncate max-w-[40%] ${i === 0 ? "text-ink" : "text-ink-dim"}`}>{opt}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** "panel 62% → market 58% → recalibrated 56%" — the engine's derivation. */
+function chainLine(agg: AggregateForecast): string | null {
+  const c = agg.components;
+  if (!c || typeof c.extremized !== "number") return null;
+  const steps = [`panel ${pctOf(c.extremized)} (k=${agg.k})`];
+  if (c.market && typeof c.blended === "number") {
+    steps.push(`⚓ ${c.market.platform} ${pctOf(c.market.probability)} (w=${c.market.weight.toFixed(2)}) → ${pctOf(c.blended)}`);
+  }
+  if (typeof c.recalibrated === "number") steps.push(`recalibrated ${pctOf(c.recalibrated)}`);
+  return steps.length > 1 ? steps.join("  →  ") : null;
+}
 
 /** Semicircular probability gauge, house monochrome. */
 function Gauge({ p, label, dim }: { p: number; label: string; dim?: boolean }) {
@@ -40,22 +76,25 @@ function Gauge({ p, label, dim }: { p: number; label: string; dim?: boolean }) {
   );
 }
 
-/** Numeric forecast: p10–p90 band with the median marked. */
+/** Numeric/date forecast: p10–p90 band with the median marked. */
 function RangeStrip({
   agg,
   panel,
   unit,
+  asDate,
 }: {
   agg: { p10: number; p50: number; p90: number };
   panel: { p10: number; p50: number; p90: number }[];
   unit?: string;
+  asDate?: boolean;
 }) {
   const all = [agg, ...panel];
   const lo = Math.min(...all.map((q) => q.p10));
   const hi = Math.max(...all.map((q) => q.p90));
   const span = Math.max(hi - lo, 1e-9);
   const pos = (v: number) => `${(((v - lo) / span) * 90 + 5).toFixed(1)}%`;
-  const fmt = (v: number) => (Math.abs(v) >= 1000 ? Math.round(v).toLocaleString() : String(Number(v.toPrecision(4))));
+  const fmt = (v: number) =>
+    asDate ? daysToIso(v) : Math.abs(v) >= 1000 ? Math.round(v).toLocaleString() : String(Number(v.toPrecision(4)));
   return (
     <div className="flex-1 min-w-0">
       <div className="mono text-2xl font-semibold text-ink mb-1">
@@ -154,12 +193,22 @@ export function ForecastHeadline({
             }
             dim={typeof headlineP !== "number"}
           />
+        ) : question.kind === "mc" && aggregate?.optionProbs ? (
+          <OptionBars probs={aggregate.optionProbs} />
         ) : aggregate?.quantiles ? (
-          <RangeStrip
-            agg={aggregate.quantiles}
-            panel={submitted.map((t) => t.forecast!.quantiles).filter((q): q is NonNullable<typeof q> => Boolean(q))}
-            unit={question.unit}
-          />
+          <div className="flex-1 min-w-0">
+            <RangeStrip
+              agg={aggregate.quantiles}
+              panel={submitted.map((t) => t.forecast!.quantiles).filter((q): q is NonNullable<typeof q> => Boolean(q))}
+              unit={question.unit}
+              asDate={question.kind === "date"}
+            />
+            {question.kind === "date" && typeof aggregate.pNever === "number" && (
+              <div className="mono text-2xs text-ink-faint mt-2" title="The panel's combined probability the event simply doesn't happen by the horizon">
+                P(never by {question.resolutionDate}) = {pctOf(aggregate.pNever)}
+              </div>
+            )}
+          </div>
         ) : (
           <div className="mono text-2xl font-semibold text-ink-dim shrink-0">…</div>
         )}
@@ -169,6 +218,11 @@ export function ForecastHeadline({
           <p className="text-xs leading-relaxed text-ink-faint mt-1.5" title="Resolution criteria">
             {question.resolutionCriteria}
           </p>
+          {aggregate && chainLine(aggregate) && (
+            <p className="mono text-2xs text-ink-faint mt-1.5" title="The engine's mechanical derivation, layer by layer">
+              {chainLine(aggregate)}
+            </p>
+          )}
 
           {/* Panel strip: one dot per submitted forecaster at its probability. */}
           {binary && (

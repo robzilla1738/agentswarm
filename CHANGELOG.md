@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.12.0
+
+### Tournament mode: ledger velocity
+- `swarm tournament [--count 10] [--close-within 14] [--source all] [--dry-run] [--auto]`: imports open binary questions that close within days from Manifold, Polymarket, and Kalshi (keyless; Metaculus when keyed), and batch-forecasts them with small cheap panels. The point is the calibration flywheel: every learned parameter (adaptive k, market weight, method weights, recalibration) feeds on resolved forecasts, and market questions resolve in days — with the platform publishing the ground truth. Idempotent (already-imported questions are skipped), round-robin balanced across platforms, `--auto` chains `swarm resolve` for cron.
+- Tournament questions arrive pre-sharpened: the run bypasses the sharpener (`presetQuestion`) and the ledger records the provenance — platform, market id, URL, and the market's own price at import (`marketProbAtCreate`), the benchmark the swarm is later scored against. Tournament runs follow a compact doctrine (exactly two research scouts, no verification, no teams — fast, cheap, calibrated beats exhaustive) under a 4M default token budget (~$0.17/question on DeepSeek pricing, validated live).
+- Platform-API resolution: a tournament forecast resolves by asking the source market what happened (Manifold resolution, Kalshi settlement, Polymarket settled prices, Metaculus resolution — annulments map to void) — ground truth for free, with the resolution mini-agent as fallback. Kalshi's API drift to `*_dollars` string fields is handled (this also silently broke `market_odds` Kalshi prices; fixed), and its auto-generated parlay markets are filtered out.
+
+### Mechanical market anchoring
+- The engine now anchors binary aggregates to a verified matching market price: `market_odds` at aggregation time, a term-overlap bar plus a cheap-model same-question check (a wrong anchor is worse than none), then a log-odds blend AFTER extremization — the market is already an aggregate, extremizing it like a panelist would double-count. Weight = `forecastMarketWeight` (default 0.4, 0 disables) × a liquidity factor (full weight at ~$100K volume), re-fit from the resolved ledger once 20+ anchored forecasts have resolved.
+- Tournament runs skip anchoring entirely: anchoring a question imported from a market back to market prices would make the "did the panel beat the market" signal circular.
+- The full aggregation chain is recorded in `aggregate.components` (panel GMO → extremized → market blend → recalibrated) — every layer re-fittable later, shown in the report, the run banner, and the ledger UI.
+
+### Learning from the ledger
+- **Method weights**: each forecasting lens's resolved Brier record tilts the weighted GMO (softmax on Brier vs the cross-method mean, shrunk toward equal weight by sample size; a method needs 5+ resolutions to deviate from weight 1). Weights are persisted per panelist in the ledger.
+- **Two-parameter recalibration**: `logit(p′) = a·logit(p) + b` fitted on the resolved record by grid search minimizing log loss, regularized toward identity (γ = 2/n), applied as the final layer once 40+ binary forecasts have resolved. The intercept b corrects systematic YES-lean (LLM acquiescence) that no symmetric exponent can. Fitting always reads each entry's pre-recalibration components — never circular.
+- **Panel diversity is enforced, not requested**: forecaster spawns carry `METHOD: <label>`; a batch with duplicate labels is rejected before id allocation with corrective feedback (red-team revision tasks may reuse their original label). The canonical menu adds **decomposition** (split the question into the conditional chain, estimate each link, multiply — the analytical gate demands at least two visible sub-probabilities) and **skeptic**. Submitted labels are canonicalized at intake — a revision that comes back as "trend (revised)" lands on "trend", so it replaces its original instead of double-counting the lens (observed live; the engine normalizes instead of hoping).
+
+### New question kinds
+- **Multiple-choice** (`kind: "mc"`, 2–8 options): panelists submit per-option probabilities (normalized at intake with a floor on unmentioned options), aggregated per option by weighted GMO → extremize → renormalize. Scored with multiclass Brier + log score; each option also feeds the reliability bins as a (probability, hit) pair. Resolution accepts `option`; the operator override accepts the option text.
+- **Date** (`kind: "date"`): "when will X happen" — quantiles submitted as ISO dates, aggregated in epoch-days, plus a `p_never` mass (GMO across the panel) for "not by the horizon". Scored with pinball loss on the realized date and log score on the never-mass.
+
+### Numeric upgrade
+- Up to 7 quantiles (p5–p95; the p10/p50/p90 spine still required, crossings repaired by sorting), optional quantiles aggregate only when the whole panel provided them. Heavily right-skewed positive panels (median p90/p10 > 10) aggregate in log space automatically.
+- **Pinball (quantile) loss** joins interval score at resolution — the proper score for quantile forecasts, approaching CRPS as quantiles densify.
+
+### Resolution hardening + live triggers
+- Medium-confidence machine resolutions get a second independent resolver; disagreement (outcomes differ, numeric values >1% apart, dates >1 day apart) surfaces for the operator instead of poisoning the calibration record, with both verdicts in the audit file.
+- `swarm forecasts watch --reforecast`: a fired update trigger re-runs the SAME question with a fresh small panel; the new ledger record `supersedes` the stale one. Both ends of the chain still resolve and score — that history is exactly what shows whether updating helped — but watching follows the newest link.
+
+### Data sources for every domain
+- `time_series` gains **openmeteo** (daily weather for any coordinate; past dates use the ERA5 archive, turning weather base rates into counted frequencies — keyless), **nws** (official US hourly point forecasts — keyless), and **gdelttone** (media sentiment, labeled as sentiment-not-probability).
+- **`options_implied`**: risk-neutral P(ticker > strike at date) from Yahoo's option chain via Black-Scholes N(d2) with the market's own implied vol — the financial gold standard for price-threshold questions (cookie+crumb session handling for Yahoo's gated v7 endpoint).
+- **`wiki_tables`**: zero-dep extraction of Wikipedia data tables as TSV — the durable keyless home of election polling averages and base-rate lists.
+- **The Odds API** (optional `oddsApiKey`, free tier): sportsbook h2h consensus joins `market_odds`, de-vigged (margin stripped, probabilities renormalized) and averaged across bookmakers.
+
+### Backtest: prove it
+- `swarm backtest`: replays every resolved binary forecast under each aggregation strategy — published headline, unextremized GMO, default k, adaptive k, + market anchor, + recalibration — with learned parameters fitted **out-of-fold** (10-fold by time order) so a strategy can't grade its own homework. Mean Brier with seeded-bootstrap 95% CIs, log loss, and the headline external benchmark: swarm vs the market's price at import on tournament entries. Deterministic, no tokens — the regression gate for every aggregation change.
+
+### UI
+- Forecasts page: aggregation-chain line per entry, tournament provenance badges (platform + market price at import, linked), a "vs market" stat card (swarm Brier vs market-at-import Brier), supersede-chain markers, mc option bars, date quantiles with the never-mass, pinball scores, and JSONL/CSV ledger export.
+- Run banner: mc option bars, date ranges rendered as dates, P(never by horizon), and the aggregation chain under the question.
+
+### Tests
+- Unit suite grows to 214 (tournament mappers and platform resolutions, blend/liquidity/learned-weight math, method weights, recalibration fits, mc/date aggregation and scoring, pinball/log-space, de-vig, N(d2), wiki-table extraction, backtest determinism, method-label canonicalization); e2e grows a tournament-import phase (23 total): preset-question bypass, ledger origin, platform-resolution fallback. Validated live end-to-end: a real Polymarket question imported, forecast by a 3-panel + probe, and recorded with full provenance.
+
 ## 0.11.0
 
 ### Forecast mode: calibrated probabilities, end to end

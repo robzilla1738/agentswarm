@@ -11,24 +11,112 @@ import type { CalibrationStats, LedgerEntry } from "@/lib/types";
 const pct = (p: number) => `${Math.round(p * 100)}%`;
 const fmtNum = (v: number) => (Math.abs(v) >= 1000 ? Math.round(v).toLocaleString() : String(Number(v.toPrecision(4))));
 const fmtDate = (t: number) => new Date(t).toISOString().slice(0, 10);
+const daysToIso = (days: number) => new Date(Math.round(days) * 86_400_000).toISOString().slice(0, 10);
 
 function isDue(e: LedgerEntry, now: number): boolean {
   return !e.resolution && Date.parse(`${e.question.resolutionDate}T23:59:59Z`) <= now;
 }
 
+function topOption(probs: Record<string, number>): [string, number] | null {
+  const ranked = Object.entries(probs).sort((a, b) => b[1] - a[1]);
+  return ranked[0] ?? null;
+}
+
 function headline(e: LedgerEntry): string {
   if (typeof e.aggregate.probability === "number") return pct(e.aggregate.probability);
-  if (e.aggregate.quantiles) return `~${fmtNum(e.aggregate.quantiles.p50)}${e.question.unit ? ` ${e.question.unit}` : ""}`;
+  if (e.aggregate.optionProbs) {
+    const top = topOption(e.aggregate.optionProbs);
+    return top ? pct(top[1]) : "—";
+  }
+  if (e.aggregate.quantiles) {
+    if (e.question.kind === "date") return daysToIso(e.aggregate.quantiles.p50);
+    return `~${fmtNum(e.aggregate.quantiles.p50)}${e.question.unit ? ` ${e.question.unit}` : ""}`;
+  }
   return "—";
+}
+
+function headlineSub(e: LedgerEntry): string | null {
+  if (e.aggregate.optionProbs) return topOption(e.aggregate.optionProbs)?.[0] ?? null;
+  return null;
 }
 
 function outcomeLabel(e: LedgerEntry): string {
   const o = e.resolution?.outcome;
   if (o === undefined) return "";
   if (o === "void") return "void";
-  if (o === 1) return "YES";
-  if (o === 0) return "NO";
+  if (o === 1 && e.question.kind === "binary") return "YES";
+  if (o === 0 && e.question.kind === "binary") return "NO";
+  if (typeof o === "string") return o; // mc option or "never"
+  if (e.question.kind === "date") return daysToIso(o as number);
   return `${fmtNum(o as number)}${e.question.unit ? ` ${e.question.unit}` : ""}`;
+}
+
+/** "panel 62% → ⚓ market 58% → 56%" — the engine's full derivation chain. */
+function chainLabel(e: LedgerEntry): string | null {
+  const c = e.aggregate.components;
+  if (!c || typeof c.extremized !== "number") return null;
+  const steps: string[] = [];
+  if (typeof c.panelGmo === "number") steps.push(`GMO ${pct(c.panelGmo)}`);
+  steps.push(`extremized ${pct(c.extremized)}`);
+  if (c.market && typeof c.blended === "number") {
+    steps.push(`market [${c.market.platform} ${pct(c.market.probability)}, w=${c.market.weight.toFixed(2)}] → ${pct(c.blended)}`);
+  }
+  if (typeof c.recalibrated === "number") steps.push(`recalibrated ${pct(c.recalibrated)}`);
+  return steps.length > 1 ? steps.join(" → ") : null;
+}
+
+/** Tournament entries scored against the source market's price at import. */
+function vsMarket(entries: LedgerEntry[]): { n: number; swarm: number; market: number } | null {
+  const scored = entries.filter(
+    (e) =>
+      e.question.kind === "binary" &&
+      typeof e.origin?.marketProbAtCreate === "number" &&
+      typeof e.aggregate.probability === "number" &&
+      e.resolution &&
+      (e.resolution.outcome === 0 || e.resolution.outcome === 1)
+  );
+  if (!scored.length) return null;
+  const brier = (p: number, o: number) => Math.pow(p - o, 2);
+  return {
+    n: scored.length,
+    swarm: scored.reduce((s, e) => s + brier(e.aggregate.probability!, e.resolution!.outcome as number), 0) / scored.length,
+    market: scored.reduce((s, e) => s + brier(e.origin!.marketProbAtCreate!, e.resolution!.outcome as number), 0) / scored.length,
+  };
+}
+
+function downloadText(name: string, mime: string, text: string): void {
+  const blob = new Blob([text], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function exportCsv(entries: LedgerEntry[]): void {
+  const esc = (v: unknown) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const rows = [
+    ["id", "created", "kind", "question", "forecast", "resolutionDate", "outcome", "brier", "logScore", "pinball", "platform", "marketAtImport", "supersedes"].join(","),
+    ...entries.map((e) =>
+      [
+        e.id,
+        fmtDate(e.t),
+        e.question.kind,
+        esc(e.question.text),
+        typeof e.aggregate.probability === "number" ? e.aggregate.probability : e.aggregate.quantiles?.p50 ?? "",
+        e.question.resolutionDate,
+        e.resolution ? esc(e.resolution.outcome) : "",
+        e.resolution?.brier ?? "",
+        e.resolution?.logScore ?? "",
+        e.resolution?.pinball ?? "",
+        e.origin?.platform ?? "",
+        e.origin?.marketProbAtCreate ?? "",
+        e.supersedes ?? "",
+      ].join(",")
+    ),
+  ];
+  downloadText("forecast-ledger.csv", "text/csv", rows.join("\n"));
 }
 
 export default function ForecastsPage() {
@@ -91,6 +179,8 @@ export default function ForecastsPage() {
 
   const openCount = (entries ?? []).filter((e) => !e.resolution).length;
   const resolvedCount = (entries ?? []).filter((e) => e.resolution).length;
+  const market = useMemo(() => vsMarket(entries ?? []), [entries]);
+  const superseded = useMemo(() => new Set((entries ?? []).map((e) => e.supersedes).filter(Boolean) as string[]), [entries]);
 
   return (
     <div className="min-h-screen">
@@ -119,7 +209,7 @@ export default function ForecastsPage() {
 
         {/* Stat cards */}
         {entries && entries.length > 0 && (
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
+          <div className={`grid grid-cols-2 ${market ? "sm:grid-cols-5" : "sm:grid-cols-4"} gap-4 mb-6`}>
             <Stat label="Open" value={String(openCount)} />
             <Stat label="Due for resolution" value={String(due.length)} />
             <Stat label="Resolved" value={String(resolvedCount)} />
@@ -128,6 +218,13 @@ export default function ForecastsPage() {
               value={calibration && calibration.n ? calibration.brierMean.toFixed(3) : "—"}
               hint={calibration && calibration.n ? `${calibration.n} scored` : "resolve forecasts to score"}
             />
+            {market && (
+              <Stat
+                label="vs market"
+                value={`${market.swarm < market.market ? "+" : "−"}${Math.abs(market.market - market.swarm).toFixed(3)}`}
+                hint={`swarm ${market.swarm.toFixed(3)} vs market ${market.market.toFixed(3)} Brier (n=${market.n})${market.swarm < market.market ? " — beating the market" : ""}`}
+              />
+            )}
           </div>
         )}
 
@@ -163,9 +260,9 @@ export default function ForecastsPage() {
           </section>
         )}
 
-        {/* Filters */}
+        {/* Filters + export */}
         {entries && entries.length > 0 && (
-          <div className="flex items-center gap-1.5 mb-4">
+          <div className="flex items-center gap-1.5 mb-4 flex-wrap">
             {(["all", "open", "resolved"] as const).map((f) => (
               <button
                 key={f}
@@ -176,6 +273,17 @@ export default function ForecastsPage() {
                 {f}
               </button>
             ))}
+            <span className="flex-1" />
+            <button
+              className="chip"
+              title="Download the raw ledger (JSONL, one record per line)"
+              onClick={() => downloadText("forecast-ledger.jsonl", "application/jsonl", entries.map((e) => JSON.stringify(e)).join("\n"))}
+            >
+              ⤓ jsonl
+            </button>
+            <button className="chip" title="Download a flat CSV for spreadsheets/analysis" onClick={() => exportCsv(entries)}>
+              ⤓ csv
+            </button>
           </div>
         )}
 
@@ -195,10 +303,23 @@ export default function ForecastsPage() {
             {shown.map((e) => {
               const dueNow = isDue(e, now);
               const busy = resolving?.has(e.id);
+              const chain = chainLabel(e);
+              const sub = headlineSub(e);
+              const stale = superseded.has(e.id);
               return (
-                <div key={e.id} className="panel p-4" style={dueNow ? { borderColor: "rgb(var(--hi) / 0.35)" } : undefined}>
+                <div
+                  key={e.id}
+                  className="panel p-4"
+                  style={{
+                    ...(dueNow ? { borderColor: "rgb(var(--hi) / 0.35)" } : {}),
+                    ...(stale ? { opacity: 0.6 } : {}),
+                  }}
+                >
                   <div className="flex items-start gap-4 flex-wrap">
-                    <span className="mono text-xl font-semibold text-ink shrink-0 min-w-[64px]">{headline(e)}</span>
+                    <span className="mono text-xl font-semibold text-ink shrink-0 min-w-[64px]">
+                      {headline(e)}
+                      {sub && <span className="block text-2xs font-normal text-ink-faint truncate max-w-[110px]">{sub}</span>}
+                    </span>
                     <div className="flex-1 min-w-[240px]">
                       <Link href={`/run?id=${e.runId}`} className="text-sm font-medium leading-snug text-ink hover:underline">
                         {e.question.text}
@@ -208,7 +329,40 @@ export default function ForecastsPage() {
                         <span>· panel {e.aggregate.n}</span>
                         {typeof e.aggregate.probability === "number" && <span>· spread {Math.round(e.aggregate.spread * 100)}pts</span>}
                         <span>· resolves {e.question.resolutionDate}</span>
+                        {e.origin && (
+                          <a href={e.origin.url} target="_blank" rel="noreferrer" className="hover:underline" title="Imported from this market by swarm tournament">
+                            · 🏆 {e.origin.platform}
+                            {typeof e.origin.marketProbAtCreate === "number" ? ` @ ${pct(e.origin.marketProbAtCreate)}` : ""}
+                          </a>
+                        )}
+                        {e.supersedes && <span title="Trigger-driven re-forecast of an earlier entry">· supersedes {e.supersedes}</span>}
+                        {stale && <span title="A newer forecast of this question exists">· superseded</span>}
                       </div>
+                      {chain && (
+                        <div className="mono text-2xs text-ink-faint mt-1" title="The engine's mechanical derivation, layer by layer">
+                          {chain}
+                        </div>
+                      )}
+                      {e.question.kind === "mc" && e.aggregate.optionProbs && (
+                        <div className="mt-1.5 space-y-0.5">
+                          {Object.entries(e.aggregate.optionProbs)
+                            .sort((a, b) => b[1] - a[1])
+                            .slice(0, 5)
+                            .map(([opt, p]) => (
+                              <div key={opt} className="flex items-center gap-2 text-2xs">
+                                <span className="mono text-ink-faint w-9 text-right shrink-0">{pct(p)}</span>
+                                <div className="h-1.5 rounded bg-[rgb(var(--hi)/0.35)]" style={{ width: `${Math.max(2, p * 140)}px` }} />
+                                <span className="text-ink-dim truncate">{opt}</span>
+                              </div>
+                            ))}
+                        </div>
+                      )}
+                      {e.question.kind === "date" && e.aggregate.quantiles && (
+                        <div className="mono text-2xs text-ink-faint mt-1">
+                          p10 {daysToIso(e.aggregate.quantiles.p10)} · p90 {daysToIso(e.aggregate.quantiles.p90)}
+                          {typeof e.aggregate.pNever === "number" && <> · P(never by horizon) {pct(e.aggregate.pNever)}</>}
+                        </div>
+                      )}
                       {e.resolution && (
                         <p className="text-2xs text-ink-faint mt-1.5 leading-relaxed">
                           {e.resolution.evidence}{" "}
@@ -222,6 +376,9 @@ export default function ForecastsPage() {
                           <div className="mono text-sm font-semibold text-ink">{outcomeLabel(e)}</div>
                           {e.resolution.brier !== undefined && (
                             <div className="mono text-2xs text-ink-faint mt-0.5">Brier {e.resolution.brier.toFixed(3)}</div>
+                          )}
+                          {e.resolution.pinball !== undefined && (
+                            <div className="mono text-2xs text-ink-faint mt-0.5">pinball {e.resolution.pinball.toFixed(2)}</div>
                           )}
                           {e.resolution.intervalScore !== undefined && (
                             <div className="mono text-2xs text-ink-faint mt-0.5">interval {e.resolution.intervalScore.toFixed(2)}</div>

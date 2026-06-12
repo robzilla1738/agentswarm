@@ -5,12 +5,16 @@ import { SwarmConfig } from "./config";
 import { ToolSchema } from "./deepseek";
 import {
   LedgerEntry,
+  LedgerOutcome,
   LedgerResolved,
   dueForecasts,
   forecastsDir,
+  isoToDays,
   loadLedger,
   resolveLedgerEntry,
+  supersededIds,
 } from "./forecast";
+import { resolveFromPlatform } from "./datatools";
 import { questionBlock } from "./prompts";
 import { createSandbox } from "./sandbox";
 import { ToolCtx, ToolDef, workerToolset } from "./tools";
@@ -36,11 +40,13 @@ export const SUBMIT_RESOLUTION_TOOL: ToolSchema = {
     properties: {
       outcome: {
         type: "string",
-        enum: ["yes", "no", "value", "void", "unclear"],
+        enum: ["yes", "no", "value", "option", "date", "never", "void", "unclear"],
         description:
-          'binary questions: "yes" or "no". Numeric questions: "value" (and fill value). "void" only if the question stopped being meaningful. "unclear" when evidence conflicts or the answer is genuinely not yet determinable.',
+          'binary questions: "yes" or "no". Numeric questions: "value" (fill value). mc questions: "option" (fill option with the realized one, verbatim from the list). Date questions: "date" (fill date with when it happened) or "never" (did not happen by the horizon). "void" only if the question stopped being meaningful. "unclear" when evidence conflicts or the answer is genuinely not yet determinable.',
       },
       value: { type: "number", description: "Numeric questions: the realized value, measured per the criteria" },
+      option: { type: "string", description: "mc questions: the option that actually occurred, exactly as listed" },
+      date: { type: "string", description: "Date questions: the ISO date (YYYY-MM-DD) the event first occurred" },
       evidence: {
         type: "string",
         description: "2-4 sentences: what actually happened, per which source, checked against the criteria",
@@ -65,7 +71,15 @@ ${questionBlock(q)}
 PROTOCOL
 - Find out what happened: web_search (use freshness for recent events, deep:true for anything contested), fetch_url on authoritative sources, market_odds (resolved markets often state the outcome).
 - Judge STRICTLY by the resolution criteria as written — not by the spirit of the topic. If the criteria name a source, check that source.
-- ${q.kind === "binary" ? 'outcome "yes"/"no"' : 'outcome "value" with the realized value'} only when the evidence is solid (confidence high or medium).
+- ${
+    q.kind === "binary"
+      ? 'outcome "yes"/"no"'
+      : q.kind === "mc"
+        ? 'outcome "option" with the realized option verbatim from the list'
+        : q.kind === "date"
+          ? 'outcome "date" with the ISO date it first happened, or "never" if it did not happen by the horizon'
+          : 'outcome "value" with the realized value'
+  } only when the evidence is solid (confidence high or medium).
 - Sources conflict, the answer is genuinely not yet determinable, or the criteria turn out ambiguous → outcome "unclear" with confidence low; a human operator settles those.
 - "void" ONLY if the question's premise dissolved (e.g. the entity it concerns ceased to exist before the date).
 - Spot-check depth over breadth; you have at most 12 tool steps.
@@ -125,11 +139,50 @@ export interface ResolveResult {
 }
 
 interface ResolutionVerdict {
-  outcome: "yes" | "no" | "value" | "void" | "unclear";
+  outcome: "yes" | "no" | "value" | "option" | "date" | "never" | "void" | "unclear";
   value?: number;
+  option?: string;
+  date?: string;
   evidence: string;
   confidence: "high" | "medium" | "low";
   sources: string[];
+}
+
+const VERDICT_OUTCOMES = ["yes", "no", "value", "option", "date", "never", "void", "unclear"];
+
+/**
+ * Do two independent resolution verdicts establish the same outcome? Numeric
+ * values agree within 1%, dates within a day; everything else must match
+ * exactly. Resolution errors poison every parameter the flywheel learns, so
+ * "roughly the same" is the most generosity allowed.
+ */
+function verdictsAgree(entry: LedgerEntry, a: ResolutionVerdict, b: ResolutionVerdict): boolean {
+  if (a.outcome !== b.outcome) return false;
+  const kind = entry.question.kind;
+  if (kind === "numeric" && a.outcome === "value") {
+    if (typeof a.value !== "number" || typeof b.value !== "number") return false;
+    return Math.abs(a.value - b.value) <= Math.max(Math.abs(a.value), Math.abs(b.value)) * 0.01 + 1e-9;
+  }
+  if (kind === "mc" && a.outcome === "option") {
+    return String(a.option ?? "").trim().toLowerCase() === String(b.option ?? "").trim().toLowerCase();
+  }
+  if (kind === "date" && a.outcome === "date") {
+    const x = a.date ? isoToDays(a.date) : null;
+    const y = b.date ? isoToDays(b.date) : null;
+    return typeof x === "number" && typeof y === "number" && Math.abs(x - y) <= 1;
+  }
+  return true; // yes/no/never/void agree by outcome equality alone
+}
+
+/** Audit trail: every machine resolution is reviewable after the fact. Best-effort. */
+function writeAudit(id: string, payload: Record<string, unknown>): void {
+  try {
+    const auditDir = path.join(forecastsDir(), "audit");
+    ensureDir(auditDir);
+    fs.writeFileSync(path.join(auditDir, `${id}.json`), JSON.stringify({ id, t: Date.now(), ...payload }, null, 2), "utf8");
+  } catch {
+    /* audit is best-effort */
+  }
 }
 
 /** One mini-agent pass over a single due forecast. Returns the parsed verdict (or null). */
@@ -163,10 +216,12 @@ async function resolveOne(
   if (!outcome.terminal) return null;
   const a = outcome.terminal.args as Record<string, unknown>;
   const verdict: ResolutionVerdict = {
-    outcome: ["yes", "no", "value", "void", "unclear"].includes(String(a.outcome))
+    outcome: VERDICT_OUTCOMES.includes(String(a.outcome))
       ? (String(a.outcome) as ResolutionVerdict["outcome"])
       : "unclear",
     value: Number.isFinite(Number(a.value)) ? Number(a.value) : undefined,
+    option: a.option ? clip(String(a.option), 200) : undefined,
+    date: a.date ? clip(String(a.date), 40) : undefined,
     evidence: clip(String(a.evidence ?? ""), 2000),
     confidence: ["high", "medium", "low"].includes(String(a.confidence))
       ? (String(a.confidence) as ResolutionVerdict["confidence"])
@@ -175,18 +230,7 @@ async function resolveOne(
       ? a.sources.map(String).filter((u) => /^https?:\/\//.test(u)).slice(0, 10)
       : [],
   };
-  // Audit trail: every machine resolution is reviewable after the fact.
-  try {
-    const auditDir = path.join(forecastsDir(), "audit");
-    ensureDir(auditDir);
-    fs.writeFileSync(
-      path.join(auditDir, `${entry.id}.json`),
-      JSON.stringify({ id: entry.id, t: Date.now(), question: entry.question, verdict, steps: outcome.steps, toolCalls }, null, 2),
-      "utf8"
-    );
-  } catch {
-    /* audit is best-effort */
-  }
+  writeAudit(entry.id, { question: entry.question, verdict, steps: outcome.steps, toolCalls });
   return verdict;
 }
 
@@ -213,6 +257,26 @@ export async function resolveDue(
       const entry = due[next++];
       const qText = oneLine(entry.question.text, 100);
       opts.log?.("info", `resolving ${entry.id}: ${qText}`);
+      // Tournament questions carry their source market — the platform's own
+      // resolution is ground truth, far more reliable than a research agent.
+      if (entry.origin) {
+        try {
+          const pr = await resolveFromPlatform(cfg, entry.origin, signal);
+          if (pr) {
+            writeAudit(entry.id, { question: entry.question, platform: entry.origin.platform, verdict: pr });
+            const rec = resolveLedgerEntry(entry, pr.outcome, {
+              evidence: pr.evidence,
+              sources: [entry.origin.url],
+              resolvedBy: "swarm",
+            });
+            result.resolved.push({ ...rec, question: qText });
+            continue;
+          }
+          opts.log?.("info", `${entry.id}: ${entry.origin.platform} hasn't settled it yet — trying a resolution agent`);
+        } catch (e) {
+          opts.log?.("warn", `${entry.id}: platform resolution failed (${errMsg(e)}) — trying a resolution agent`);
+        }
+      }
       let verdict: ResolutionVerdict | null = null;
       try {
         verdict = await resolveOne(cfg, entry, signal, opts.log);
@@ -232,16 +296,58 @@ export async function resolveDue(
         });
         continue;
       }
-      const outcome =
-        verdict.outcome === "void"
-          ? ("void" as const)
-          : entry.question.kind === "numeric"
-            ? verdict.value
-            : verdict.outcome === "yes"
-              ? (1 as const)
-              : (0 as const);
+      // Medium confidence buys a second opinion: an independent resolver must
+      // agree before the outcome is scored. Disagreement surfaces for the
+      // operator instead of poisoning the calibration record.
+      if (verdict.confidence === "medium") {
+        let second: ResolutionVerdict | null = null;
+        try {
+          second = await resolveOne(cfg, entry, signal, opts.log);
+        } catch {
+          /* the first verdict stands alone */
+        }
+        if (second && second.outcome !== "unclear") {
+          if (!verdictsAgree(entry, verdict, second)) {
+            writeAudit(entry.id, { question: entry.question, disagreement: { first: verdict, second } });
+            result.skipped.push({
+              id: entry.id,
+              question: qText,
+              reason: `independent resolvers disagreed ("${verdict.outcome}" vs "${second.outcome}") — settle manually with: swarm resolve set ${entry.id} <outcome>`,
+            });
+            continue;
+          }
+          verdict.sources = [...new Set([...verdict.sources, ...second.sources])].slice(0, 10);
+          if (second.confidence === "high") verdict.confidence = "high";
+        }
+      }
+      let outcome: LedgerOutcome | undefined;
+      const kind = entry.question.kind;
+      if (verdict.outcome === "void") {
+        outcome = "void";
+      } else if (kind === "numeric") {
+        outcome = verdict.value;
+      } else if (kind === "mc") {
+        // The realized option must match the list exactly (case-insensitive) —
+        // scoring against an option the panel never priced would be garbage.
+        outcome = (entry.question.options ?? []).find(
+          (o) => o.trim().toLowerCase() === String(verdict.option ?? "").trim().toLowerCase()
+        );
+      } else if (kind === "date") {
+        outcome = verdict.outcome === "never" ? "never" : verdict.date ? (isoToDays(verdict.date) ?? undefined) : undefined;
+      } else {
+        outcome = verdict.outcome === "yes" ? 1 : 0;
+      }
       if (outcome === undefined) {
-        result.skipped.push({ id: entry.id, question: qText, reason: "numeric outcome had no value" });
+        result.skipped.push({
+          id: entry.id,
+          question: qText,
+          reason:
+            kind === "mc"
+              ? `verdict option ${JSON.stringify(verdict.option ?? "")} is not in the question's option list — settle manually with: swarm resolve set ${entry.id} <option>`
+              : kind === "date"
+                ? "date outcome had no parseable date"
+                : "numeric outcome had no value",
+        });
         continue;
       }
       const rec = resolveLedgerEntry(entry, outcome, {
@@ -294,8 +400,16 @@ export async function watchOpenForecasts(
 ): Promise<WatchAlert[]> {
   const signal = opts.signal ?? new AbortController().signal;
   const now = Date.now();
-  const open = loadLedger().filter(
-    (e) => !e.resolution && e.triggers?.length && Date.parse(`${e.question.resolutionDate}T23:59:59Z`) > now
+  const all = loadLedger();
+  // A superseded forecast is no longer the live view of its question — its
+  // newer link carries the watch (and re-watching it would loop re-forecasts).
+  const superseded = supersededIds(all);
+  const open = all.filter(
+    (e) =>
+      !e.resolution &&
+      !superseded.has(e.id) &&
+      e.triggers?.length &&
+      Date.parse(`${e.question.resolutionDate}T23:59:59Z`) > now
   );
   const alerts: WatchAlert[] = [];
   if (!open.length) return alerts;

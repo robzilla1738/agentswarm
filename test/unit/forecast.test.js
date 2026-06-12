@@ -30,9 +30,29 @@ const {
   calibrationStats,
   calibrationBlock,
   chooseExtremizeK,
+  blendWithMarket,
+  liquidityFactor,
+  chooseMarketWeight,
+  methodWeights,
+  fitRecalibration,
+  applyRecalibration,
+  extractMethodLabel,
+  pinballLoss,
+  monotoneQuantiles,
+  shouldUseLogSpace,
+  aggregateMc,
+  mcBrierScore,
+  mcLogScore,
+  normalizeOptionProbs,
+  isoToDays,
+  daysToIso,
   MIN_CALIBRATION_N,
   MIN_ADAPTIVE_N,
+  MIN_MARKET_WEIGHT_N,
+  MIN_METHOD_WEIGHT_N,
+  MIN_RECALIBRATION_N,
   DEFAULT_EXTREMIZE_K,
+  DEFAULT_MARKET_WEIGHT,
 } = require("../../dist/forecast.js");
 const { coerceConfigValue } = require("../../dist/config.js");
 
@@ -438,6 +458,490 @@ test("olsProject interpolates noisy data with a real band", () => {
   const p = olsProject(points, "2026-01-08");
   assert.ok(p && p.slopePerDay > 0);
   assert.ok(p.hi > p.projected && p.lo < p.projected, "noisy fit carries a band");
+});
+
+// ---------------------------------------------------------------- market anchoring
+
+test("blendWithMarket: w=0 keeps the panel, w=1 takes the market, blend is monotone", () => {
+  near(blendWithMarket(0.6, 0.3, 0), 0.6, 1e-9);
+  near(blendWithMarket(0.6, 0.3, 1), 0.3, 1e-9);
+  near(blendWithMarket(0.7, 0.7, 0.5), 0.7, 1e-9); // agreement is a fixed point
+  // 50/50 blend of even odds with 4:1 odds is 2:1 odds = 2/3
+  near(blendWithMarket(0.5, 0.8, 0.5), 2 / 3, 1e-9);
+  // monotone: more weight pulls strictly closer to the market
+  let prev = blendWithMarket(0.8, 0.2, 0);
+  for (let w = 0.1; w <= 1.001; w += 0.1) {
+    const b = blendWithMarket(0.8, 0.2, w);
+    assert.ok(b < prev, `w=${w} should pull toward the market`);
+    prev = b;
+  }
+});
+
+test("liquidityFactor: dead markets earn nothing, $100K earns full weight", () => {
+  assert.equal(liquidityFactor(undefined), 0);
+  assert.equal(liquidityFactor(0), 0);
+  near(liquidityFactor(1000), Math.log10(1001) / 5, 1e-9);
+  assert.equal(liquidityFactor(100_000), 1);
+  assert.equal(liquidityFactor(50_000_000), 1); // capped
+});
+
+const anchoredEntry = (extremized, marketP, outcome, volume = 100_000) => ({
+  v: 1,
+  id: "x",
+  runId: "r",
+  t: 0,
+  question: { ...QUESTION },
+  aggregate: {
+    probability: extremized,
+    k: 2.5,
+    n: 3,
+    spread: 0.1,
+    components: {
+      extremized,
+      market: { platform: "polymarket", url: "u", probability: marketP, volume, weight: 0.4 },
+    },
+  },
+  panel: [],
+  resolution: { v: 1, rec: "resolved", id: "x", t: 1, outcome, evidence: "", sources: [], resolvedBy: "operator" },
+});
+
+test("chooseMarketWeight falls back below the minimum sample", () => {
+  const few = Array.from({ length: MIN_MARKET_WEIGHT_N - 1 }, () => anchoredEntry(0.5, 0.9, 1));
+  assert.equal(chooseMarketWeight(few, DEFAULT_MARKET_WEIGHT), DEFAULT_MARKET_WEIGHT);
+  assert.equal(chooseMarketWeight([], 0.3), 0.3);
+});
+
+test("chooseMarketWeight learns to trust a market that keeps being right", () => {
+  // Panel stuck at 50%, market confidently right every time → max grid weight.
+  const entries = Array.from({ length: 30 }, (_, i) => anchoredEntry(0.5, i % 2 ? 0.9 : 0.1, i % 2 ? 1 : 0));
+  assert.equal(chooseMarketWeight(entries, DEFAULT_MARKET_WEIGHT), 0.9);
+});
+
+test("chooseMarketWeight learns to ignore a market that keeps being wrong", () => {
+  // Panel confidently right, market confidently wrong → weight 0.
+  const entries = Array.from({ length: 30 }, (_, i) =>
+    anchoredEntry(i % 2 ? 0.85 : 0.15, i % 2 ? 0.1 : 0.9, i % 2 ? 1 : 0)
+  );
+  assert.equal(chooseMarketWeight(entries, DEFAULT_MARKET_WEIGHT), 0);
+});
+
+test("chooseMarketWeight ignores entries without anchor components", () => {
+  const noComponents = Array.from({ length: 40 }, () => {
+    const e = anchoredEntry(0.5, 0.9, 1);
+    delete e.aggregate.components;
+    return e;
+  });
+  assert.equal(chooseMarketWeight(noComponents, 0.4), 0.4);
+});
+
+// ---------------------------------------------------------------- weighted GMO + method weights
+
+test("aggregateBinary: weights tilt the mean of log-odds; equal weights match unweighted", () => {
+  const unweighted = aggregateBinary([0.6, 0.8], 1);
+  const equal = aggregateBinary([0.6, 0.8], 1, [2, 2]);
+  near(equal.probability, unweighted.probability, 1e-12);
+  // weights [3,1] over log-odds [ln1.5, ln4] → (3·0.405465+1.386294)/4 = 0.650672 → p = 0.65715
+  const tilted = aggregateBinary([0.6, 0.8], 1, [3, 1]);
+  near(tilted.probability, 0.65715, 1e-4);
+  // invalid weights are ignored, not an error
+  near(aggregateBinary([0.6, 0.8], 1, [1]).probability, unweighted.probability, 1e-12);
+  near(aggregateBinary([0.6, 0.8], 1, [1, 0]).probability, unweighted.probability, 1e-12);
+  near(aggregateBinary([0.6, 0.8], 1, [1, NaN]).probability, unweighted.probability, 1e-12);
+});
+
+test("methodWeights: good methods earn weight, small samples stay at 1", () => {
+  // outside-view nails it (brier ~0.04), trend coin-flips wrong (brier ~0.49)
+  const entries = [];
+  for (let i = 0; i < 12; i++) {
+    entries.push({
+      ...resolvedEntry(`g${i}`, 0.8, 1),
+      panel: [
+        { taskId: "T2", method: "outside-view", probability: 0.8 },
+        { taskId: "T3", method: "trend", probability: 0.3 },
+        { taskId: "T4", method: "fresh", probability: 0.5 }, // only seen here... n=12 ≥ MIN; use a sparse one below
+      ],
+    });
+  }
+  const w = methodWeights(entries);
+  assert.ok(w["outside-view"] > 1, `good method should weigh >1, got ${w["outside-view"]}`);
+  assert.ok(w["trend"] < 1, `bad method should weigh <1, got ${w["trend"]}`);
+  assert.ok(w["outside-view"] < 3, "shrinkage keeps weights bounded");
+  // a method below the per-method floor stays at exactly 1
+  const sparse = entries.slice(0, MIN_METHOD_WEIGHT_N - 1);
+  const w2 = methodWeights(sparse);
+  assert.equal(w2["outside-view"], 1);
+  assert.equal(w2["trend"], 1);
+  assert.deepEqual(methodWeights([]), {});
+});
+
+// ---------------------------------------------------------------- recalibration
+
+test("fitRecalibration is identity (null) below the minimum record", () => {
+  const few = Array.from({ length: MIN_RECALIBRATION_N - 1 }, (_, i) => resolvedEntry(`r${i}`, 0.7, i % 2));
+  assert.equal(fitRecalibration(few), null);
+  assert.equal(applyRecalibration(0.7, null), 0.7);
+});
+
+test("fitRecalibration learns to deflate systematic overconfidence", () => {
+  // The system keeps saying 75% YES but only half resolve YES.
+  const entries = Array.from({ length: 60 }, (_, i) => resolvedEntry(`o${i}`, 0.75, i % 2));
+  const r = fitRecalibration(entries);
+  assert.ok(r, "enough history to fit");
+  const recal = applyRecalibration(0.75, r);
+  assert.ok(recal > 0.4 && recal < 0.6, `75% should map near 50%, got ${recal}`);
+  // and the fit must actually beat identity on its own training data
+  const lossAt = (p) => entries.reduce((s, e, i) => s + -logScore(p, i % 2), 0) / entries.length;
+  assert.ok(lossAt(recal) < lossAt(0.75), "fitted mapping reduces mean log loss");
+});
+
+test("fitRecalibration stays near identity when the record is already calibrated", () => {
+  // 80% forecasts resolving YES 80% of the time: nothing to fix.
+  const entries = Array.from({ length: 50 }, (_, i) => resolvedEntry(`c${i}`, 0.8, i % 5 === 0 ? 0 : 1));
+  const r = fitRecalibration(entries);
+  assert.ok(r);
+  const recal = applyRecalibration(0.8, r);
+  assert.ok(Math.abs(recal - 0.8) < 0.07, `calibrated record should barely move 80%, got ${recal}`);
+});
+
+test("fitRecalibration fits on PRE-recalibration components, not the final number", () => {
+  // components.blended (0.9) is the honest input; probability (0.5) is what a
+  // previous recalibration published. The fit must read 0.9.
+  const entries = Array.from({ length: 50 }, (_, i) => ({
+    ...resolvedEntry(`p${i}`, 0.5, 1),
+    aggregate: {
+      probability: 0.5,
+      k: 2.5,
+      n: 3,
+      spread: 0,
+      components: { extremized: 0.88, blended: 0.9, recalibrated: 0.5 },
+    },
+  }));
+  const r = fitRecalibration(entries);
+  assert.ok(r);
+  // every outcome is YES and the pre-recal input was 0.9 → the fit should
+  // push UP (a>1 or b>0), not correct an imaginary 0.5.
+  assert.ok(applyRecalibration(0.9, r) >= 0.9, "fit read the pre-recalibration value");
+});
+
+// ---------------------------------------------------------------- decomposition gate + method labels
+
+test("validateForecastAnalytics demands visible arithmetic from decomposition forecasts", () => {
+  const decomp = {
+    method: "decomposition",
+    probability: 0.3,
+    prior: 0.35,
+    rationale: "P(committee) ≈ 60%, P(floor|committee) ≈ 50% → 30% overall (base rate 3 of 10).",
+    baseRates: ["3/10 similar bills"],
+    submittedAt: 1,
+  };
+  assert.equal(validateForecastAnalytics(decomp, "binary"), null);
+  const opaque = validateForecastAnalytics(
+    { ...decomp, rationale: "The chain of events makes 30% feel right overall." },
+    "binary"
+  );
+  assert.ok(/sub-event probabilities/.test(opaque));
+});
+
+test("extractMethodLabel parses the spawn-time method assignment", () => {
+  assert.equal(extractMethodLabel("Forecast the question. METHOD: outside-view"), "outside-view");
+  assert.equal(extractMethodLabel("method: Decomposition\nmore text"), "decomposition");
+  assert.equal(extractMethodLabel('Use METHOD = "skeptic" here'), "skeptic");
+  assert.equal(extractMethodLabel("no label anywhere"), null);
+});
+
+test("canonicalMethodLabel strips revision decorations so revisions replace their originals", () => {
+  const { canonicalMethodLabel } = require("../../dist/forecast.js");
+  assert.equal(canonicalMethodLabel("trend (revised)"), "trend");
+  assert.equal(canonicalMethodLabel("Trend (Rev 2)"), "trend");
+  assert.equal(canonicalMethodLabel("outside-view (updated after red-team)"), "outside-view");
+  assert.equal(canonicalMethodLabel("inside-view v2"), "inside-view");
+  assert.equal(canonicalMethodLabel("market-anchored - revised"), "market-anchored");
+  assert.equal(canonicalMethodLabel("decomposition: final"), "decomposition");
+  // untouched labels pass through
+  assert.equal(canonicalMethodLabel("inverted-framing"), "inverted-framing");
+  assert.equal(canonicalMethodLabel("skeptic"), "skeptic");
+  assert.equal(canonicalMethodLabel(""), "unspecified");
+});
+
+// ---------------------------------------------------------------- extended quantiles + pinball
+
+test("monotoneQuantiles requires the p10/p50/p90 spine and repairs crossings", () => {
+  assert.equal(monotoneQuantiles({ p10: 1, p50: 2 }), null);
+  const fixed = monotoneQuantiles({ p10: 5, p50: 2, p90: 9 }); // crossed pair
+  assert.deepEqual(fixed, { p10: 2, p50: 5, p90: 9 });
+  const seven = monotoneQuantiles({ p5: 1, p10: 2, p25: 3, p50: 4, p75: 5, p90: 6, p95: 7 });
+  assert.deepEqual(seven, { p5: 1, p10: 2, p25: 3, p50: 4, p75: 5, p90: 6, p95: 7 });
+});
+
+test("aggregateQuantiles aggregates optional quantiles only when every panelist gave them", () => {
+  const a = aggregateQuantiles([
+    { p10: 10, p25: 15, p50: 20, p75: 25, p90: 30 },
+    { p10: 12, p25: 16, p50: 24, p75: 30, p90: 40 },
+  ]);
+  assert.ok(a.quantiles.p25 !== undefined && a.quantiles.p75 !== undefined);
+  const b = aggregateQuantiles([
+    { p10: 10, p25: 15, p50: 20, p90: 30 },
+    { p10: 12, p50: 24, p90: 40 }, // no p25 here
+  ]);
+  assert.equal(b.quantiles.p25, undefined, "a quantile half the panel skipped is not aggregated");
+  assert.ok(b.quantiles.p10 !== undefined);
+});
+
+test("aggregateQuantiles switches to log space for heavily skewed positive panels", () => {
+  const skewed = [
+    { p10: 1, p50: 100, p90: 10000 },
+    { p10: 2, p50: 50, p90: 8000 },
+    { p10: 1, p50: 200, p90: 20000 },
+  ];
+  assert.ok(shouldUseLogSpace(skewed));
+  const a = aggregateQuantiles(skewed);
+  assert.equal(a.logSpace, true);
+  // log-space mean of p50s = exp(mean(ln 100, ln 50, ln 200)) = 100
+  near(a.quantiles.p50, 100, 1);
+  // tight or negative panels stay linear
+  assert.ok(!shouldUseLogSpace([{ p10: 90, p50: 100, p90: 110 }]));
+  assert.ok(!shouldUseLogSpace([{ p10: -5, p50: 100, p90: 10000 }]));
+  assert.equal(aggregateQuantiles([{ p10: 90, p50: 100, p90: 110 }]).logSpace, undefined);
+});
+
+test("pinballLoss: hand-computed values, zero at a point mass", () => {
+  // value 20 against {p10:10, p50:20, p90:30}:
+  // p10: 20≥10 → 0.1·10 = 1; p50: 0; p90: 20<30 → 0.1·10 = 1 → mean 2/3
+  near(pinballLoss({ p10: 10, p50: 20, p90: 30 }, 20), 2 / 3, 1e-9);
+  near(pinballLoss({ p10: 20, p50: 20, p90: 20 }, 20), 0, 1e-12);
+  // a sharper correct interval scores better than a vague one
+  const sharp = pinballLoss({ p10: 18, p50: 20, p90: 22 }, 20);
+  const vague = pinballLoss({ p10: 0, p50: 20, p90: 40 }, 20);
+  assert.ok(sharp < vague);
+});
+
+// ---------------------------------------------------------------- mc questions
+
+test("normalizeOptionProbs tolerates percentages, fills gaps, renormalizes", () => {
+  const opts = ["Alice", "Bob", "Other"];
+  const p = normalizeOptionProbs({ alice: 60, Bob: 30, Other: 10 }, opts);
+  near(p["Alice"], 0.6, 1e-2);
+  near(p["Alice"] + p["Bob"] + p["Other"], 1, 1e-9);
+  // a missing option gets a floor, never zero
+  const partial = normalizeOptionProbs({ Alice: 0.9 }, opts);
+  assert.ok(partial["Bob"] > 0 && partial["Other"] > 0);
+  near(partial["Alice"] + partial["Bob"] + partial["Other"], 1, 1e-9);
+  assert.equal(normalizeOptionProbs({ Zed: 1 }, opts), null, "nothing matched the option list");
+  assert.equal(normalizeOptionProbs(null, opts), null);
+});
+
+test("aggregateMc: per-option GMO, extremized, renormalized to sum 1", () => {
+  const opts = ["A", "B", "C"];
+  const a = aggregateMc(
+    [
+      { A: 0.6, B: 0.3, C: 0.1 },
+      { A: 0.7, B: 0.2, C: 0.1 },
+      { A: 0.5, B: 0.4, C: 0.1 },
+    ],
+    opts,
+    2.5
+  );
+  const sum = opts.reduce((s, o) => s + a.optionProbs[o], 0);
+  near(sum, 1, 1e-9);
+  assert.ok(a.optionProbs["A"] > 0.6, "extremization sharpens the consensus mode");
+  assert.ok(a.optionProbs["A"] > a.optionProbs["B"] && a.optionProbs["B"] > a.optionProbs["C"]);
+  // permutation symmetry
+  const b = aggregateMc(
+    [
+      { C: 0.1, A: 0.6, B: 0.3 },
+      { B: 0.2, C: 0.1, A: 0.7 },
+      { A: 0.5, C: 0.1, B: 0.4 },
+    ],
+    opts,
+    2.5
+  );
+  near(a.optionProbs["A"], b.optionProbs["A"], 1e-12);
+  // single panelist passes through un-extremized (k=1) and renormalized
+  const single = aggregateMc([{ A: 0.6, B: 0.3, C: 0.1 }], opts, 2.5);
+  assert.equal(single.k, 1);
+  near(single.optionProbs["A"], 0.6, 1e-2);
+});
+
+test("mc scoring: multiclass Brier and log score", () => {
+  const probs = { A: 0.6, B: 0.3, C: 0.1 };
+  // realized A: (0.6−1)² + 0.3² + 0.1² = 0.16+0.09+0.01 = 0.26
+  near(mcBrierScore(probs, "A"), 0.26, 1e-9);
+  near(mcLogScore(probs, "A"), Math.log(0.6), 1e-9);
+  near(mcLogScore(probs, "C"), Math.log(0.1), 1e-9);
+});
+
+test("parseQuestionJson accepts mc with a usable option list and date kinds", () => {
+  const mc = parseQuestionJson(
+    '{"text":"Who wins?","kind":"mc","resolutionCriteria":"per official result","resolutionDate":"2026-11-03","options":["Alice","Bob","Other"]}'
+  );
+  assert.equal(mc.kind, "mc");
+  assert.deepEqual(mc.options, ["Alice", "Bob", "Other"]);
+  // an mc question without 2+ options is unusable
+  assert.equal(
+    parseQuestionJson('{"text":"Who?","kind":"mc","resolutionCriteria":"c","resolutionDate":"2026-01-01","options":["Only"]}'),
+    null
+  );
+  const date = parseQuestionJson(
+    '{"text":"When will X launch?","kind":"date","resolutionCriteria":"first official launch","resolutionDate":"2027-12-31"}'
+  );
+  assert.equal(date.kind, "date");
+});
+
+// ---------------------------------------------------------------- date helpers + scoring
+
+test("isoToDays/daysToIso round-trip and reject garbage", () => {
+  assert.equal(daysToIso(isoToDays("2026-06-15")), "2026-06-15");
+  assert.equal(isoToDays("not a date"), null);
+  assert.ok(isoToDays("2026-06-16") - isoToDays("2026-06-15") === 1);
+});
+
+test("resolveLedgerEntry scores mc, date, and pinball outcomes", () => {
+  clearLedger();
+  appendLedger(
+    createdRec("f_mc", {
+      question: { ...QUESTION, kind: "mc", options: ["A", "B"] },
+      aggregate: { optionProbs: { A: 0.7, B: 0.3 }, k: 2.5, n: 3, spread: 0.1 },
+      panel: [{ taskId: "T2", method: "outside-view", optionProbs: { A: 0.7, B: 0.3 } }],
+    })
+  );
+  const d10 = isoToDays("2026-01-10");
+  appendLedger(
+    createdRec("f_date", {
+      question: { ...QUESTION, kind: "date" },
+      aggregate: { quantiles: { p10: d10, p50: d10 + 10, p90: d10 + 30 }, pNever: 0.2, k: 2.5, n: 3, spread: 0.1 },
+      panel: [{ taskId: "T2", method: "trend", quantiles: { p10: d10, p50: d10 + 10, p90: d10 + 30 } }],
+    })
+  );
+  appendLedger(
+    createdRec("f_num5", {
+      question: { ...QUESTION, kind: "numeric" },
+      aggregate: aggregateQuantiles([{ p10: 10, p25: 15, p50: 20, p75: 25, p90: 30 }]),
+      panel: [{ taskId: "T2", method: "trend", quantiles: { p10: 10, p25: 15, p50: 20, p75: 25, p90: 30 } }],
+    })
+  );
+  const entries = loadLedger();
+
+  const recMc = resolveLedgerEntry(entries.find((e) => e.id === "f_mc"), "A", { evidence: "", sources: [], resolvedBy: "operator" });
+  near(recMc.brier, mcBrierScore({ A: 0.7, B: 0.3 }, "A"), 1e-12);
+  near(recMc.logScore, Math.log(0.7), 1e-9);
+
+  const realized = d10 + 12;
+  const recDate = resolveLedgerEntry(entries.find((e) => e.id === "f_date"), realized, { evidence: "", sources: [], resolvedBy: "operator" });
+  near(recDate.pinball, pinballLoss({ p10: d10, p50: d10 + 10, p90: d10 + 30 }, realized), 1e-12);
+  near(recDate.logScore, Math.log(0.8), 1e-9, "the never-mass is scored when the event happened");
+
+  const recNum = resolveLedgerEntry(entries.find((e) => e.id === "f_num5"), 22, { evidence: "", sources: [], resolvedBy: "operator" });
+  assert.ok(recNum.pinball !== undefined && recNum.intervalScore !== undefined);
+
+  // a date question that never happened scores the never-mass directly
+  clearLedger();
+  appendLedger(
+    createdRec("f_never", {
+      question: { ...QUESTION, kind: "date" },
+      aggregate: { quantiles: { p10: d10, p50: d10 + 10, p90: d10 + 30 }, pNever: 0.2, k: 2.5, n: 3, spread: 0.1 },
+      panel: [],
+    })
+  );
+  const recNever = resolveLedgerEntry(loadLedger()[0], "never", { evidence: "", sources: [], resolvedBy: "operator" });
+  near(recNever.logScore, Math.log(0.2), 1e-9);
+});
+
+test("calibrationStats folds mc options into the reliability bins (not into binary means)", () => {
+  const mcEntry = {
+    id: "mc1",
+    runId: "r",
+    t: 1,
+    question: { ...QUESTION, kind: "mc", options: ["A", "B"] },
+    aggregate: { optionProbs: { A: 0.75, B: 0.25 }, k: 2.5, n: 3, spread: 0.1 },
+    panel: [],
+    resolution: { v: 1, rec: "resolved", id: "mc1", t: 2, outcome: "A", evidence: "", sources: [], resolvedBy: "swarm" },
+  };
+  const stats = calibrationStats([mcEntry]);
+  assert.equal(stats.n, 0, "mc entries don't inflate the binary count");
+  const hi = stats.bins.find((b) => b.lo === 0.7);
+  assert.ok(hi && hi.n === 1 && hi.hitRate === 1, "the realized option lands in its bin as a hit");
+  const lo = stats.bins.find((b) => b.lo === 0.2);
+  assert.ok(lo && lo.n === 1 && lo.hitRate === 0, "the losing option lands as a miss");
+});
+
+// ---------------------------------------------------------------- backtest
+
+test("backtest is deterministic and ranks strategies sanely", () => {
+  const { backtest } = require("../../dist/forecast.js");
+  // 60 resolved binaries: the panel says 60% when YES, 40% when NO — mildly
+  // informative, so extremization should help (the panel underclaims).
+  const entries = Array.from({ length: 60 }, (_, i) => {
+    const yes = i % 2 === 1;
+    const p = yes ? 0.6 : 0.4;
+    return {
+      ...resolvedEntry(`b${i}`, p, yes ? 1 : 0),
+      evidenceOverlap: 0,
+      panel: [
+        { taskId: "T2", method: "a", probability: p },
+        { taskId: "T3", method: "b", probability: p + (yes ? 0.05 : -0.05) },
+      ],
+    };
+  });
+  const r1 = backtest(entries);
+  const r2 = backtest(entries);
+  assert.deepEqual(r1, r2, "same ledger must produce identical numbers (seeded bootstrap)");
+  assert.ok(r1.rows.length >= 5);
+  for (const row of r1.rows) {
+    assert.equal(row.n, 60);
+    assert.ok(row.brierLo <= row.brierMean && row.brierMean <= row.brierHi, "CI brackets the mean");
+  }
+  const byName = Object.fromEntries(r1.rows.map((r) => [r.config, r]));
+  const k1 = byName["panel GMO, no extremization (k=1)"];
+  const adaptive = r1.rows.find((r) => /adaptive-k/.test(r.config));
+  assert.ok(adaptive.brierMean <= k1.brierMean + 1e-9, "an informative panel benefits from (out-of-fold) extremization");
+});
+
+test("backtest reports the vs-market line on tournament entries", () => {
+  const { backtest } = require("../../dist/forecast.js");
+  const entries = Array.from({ length: 20 }, (_, i) => {
+    const yes = i % 2 === 1;
+    return {
+      ...resolvedEntry(`t${i}`, yes ? 0.8 : 0.2, yes ? 1 : 0),
+      panel: [{ taskId: "T2", method: "a", probability: yes ? 0.8 : 0.2 }],
+      origin: {
+        kind: "tournament",
+        platform: "manifold",
+        externalId: `m${i}`,
+        url: "u",
+        marketProbAtCreate: yes ? 0.6 : 0.4, // market less sharp than the swarm here
+      },
+    };
+  });
+  const r = backtest(entries);
+  assert.ok(r.vsMarket && r.vsMarket.n === 20);
+  assert.ok(r.vsMarket.swarmBrier < r.vsMarket.marketBrier, "the sharper-and-right swarm beats the market");
+});
+
+test("backtest degrades to empty on a ledger with nothing replayable", () => {
+  const { backtest } = require("../../dist/forecast.js");
+  assert.deepEqual(backtest([]).rows, []);
+  const numericOnly = [
+    {
+      ...resolvedEntry("n1", 0.5, 1),
+      question: { ...QUESTION, kind: "numeric" },
+    },
+  ];
+  const r = backtest(numericOnly);
+  assert.equal(r.rows.length, 0);
+  assert.equal(r.skipped.nonBinary, 1);
+});
+
+// ---------------------------------------------------------------- supersede chains
+
+test("supersede chains: ids carry through the ledger and mark the stale link", () => {
+  const { supersededIds } = require("../../dist/forecast.js");
+  clearLedger();
+  appendLedger(createdRec("f_old"));
+  appendLedger(createdRec("f_new", { supersedes: "f_old" }));
+  const entries = loadLedger();
+  assert.equal(entries.find((e) => e.id === "f_new").supersedes, "f_old");
+  const superseded = supersededIds(entries);
+  assert.ok(superseded.has("f_old") && !superseded.has("f_new"));
 });
 
 test.after(() => {

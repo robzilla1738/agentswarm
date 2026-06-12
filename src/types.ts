@@ -21,8 +21,23 @@ export type Verification = "off" | "normal" | "strict";
 /** What kind of run this is. Forecast runs follow the superforecasting pipeline. */
 export type RunMode = "research" | "forecast";
 
-/** Binary questions resolve YES/NO; numeric questions resolve to a value. */
-export type ForecastKind = "binary" | "numeric";
+/**
+ * Binary questions resolve YES/NO; numeric to a value; mc to one of a fixed
+ * option list; date to the day an event first occurs (or "never" by the
+ * horizon). Date questions ride the numeric quantile machinery in epoch-days.
+ */
+export type ForecastKind = "binary" | "numeric" | "mc" | "date";
+
+/** Quantile forecast. p10/p50/p90 are the required spine; the rest sharpen the distribution. */
+export interface Quantiles {
+  p5?: number;
+  p10: number;
+  p25?: number;
+  p50: number;
+  p75?: number;
+  p90: number;
+  p95?: number;
+}
 
 /** The sharpened, resolvable form of a forecast mission. */
 export interface ForecastQuestion {
@@ -31,10 +46,26 @@ export interface ForecastQuestion {
   kind: ForecastKind;
   /** Exactly what counts as YES (binary) or how the value is measured (numeric). */
   resolutionCriteria: string;
-  /** ISO date by which the question resolves. */
+  /** ISO date by which the question resolves (the horizon, for date questions). */
   resolutionDate: string;
   /** Unit for numeric questions ("%", "USD", "people"). */
   unit?: string;
+  /** The exhaustive option list for mc questions (2–8 distinct options). */
+  options?: string[];
+}
+
+/**
+ * Provenance of an externally-imported (tournament) question. The source
+ * platform publishes its own resolution — free ground truth — and its price
+ * at import time is the benchmark the swarm is scored against.
+ */
+export interface ForecastOrigin {
+  kind: "tournament";
+  platform: "manifold" | "polymarket" | "kalshi" | "metaculus";
+  externalId: string;
+  url: string;
+  /** The market's own P(YES) when the question was imported. */
+  marketProbAtCreate?: number;
 }
 
 /** One panelist's structured forecast (submit_forecast terminal tool). */
@@ -49,13 +80,45 @@ export interface Forecast {
    * adjustment (prior → final) explicit and attackable.
    */
   prior?: number;
-  /** Quantile forecast — numeric questions. */
-  quantiles?: { p10: number; p50: number; p90: number };
+  /** Quantile forecast — numeric questions (epoch-days for date questions). */
+  quantiles?: Quantiles;
+  /** Per-option probabilities summing to 1 — mc questions. */
+  optionProbs?: Record<string, number>;
+  /** P(the event does NOT occur by the horizon) — date questions. */
+  pNever?: number;
   rationale: string;
   baseRates?: string[];
   keyDrivers?: string[];
   updateTriggers?: string[];
   submittedAt: number;
+}
+
+/** The market price the engine anchored an aggregate to, and how hard. */
+export interface MarketAnchor {
+  platform: string;
+  url: string;
+  title?: string;
+  /** The market's P(YES) at aggregation time. */
+  probability: number;
+  volume?: number;
+  /** Effective blend weight in log-odds space (config weight × liquidity factor). */
+  weight: number;
+}
+
+/**
+ * Every layer of the aggregation chain, stored so each can be re-fit honestly
+ * later (backtests re-blend from these instead of the final number).
+ */
+export interface AggregateComponents {
+  /** Un-extremized geometric mean of odds of the panel. */
+  panelGmo?: number;
+  /** After overlap-scaled extremization — the panel-only headline. */
+  extremized?: number;
+  market?: MarketAnchor;
+  /** After the market blend (pre-recalibration). */
+  blended?: number;
+  /** After ledger-fitted recalibration — when present, this is the headline. */
+  recalibrated?: number;
 }
 
 /** Deterministic combination of the panel (computed in code, never by an LLM). */
@@ -68,8 +131,14 @@ export interface AggregateForecast {
   gmo?: number;
   /** Extremization exponent used. */
   k: number;
-  /** Trimmed-mean quantiles (numeric). */
-  quantiles?: { p10: number; p50: number; p90: number };
+  /** Trimmed-mean quantiles (numeric; epoch-days for date questions). */
+  quantiles?: Quantiles;
+  /** Per-option probabilities, extremized GMO renormalized to sum 1 (mc). */
+  optionProbs?: Record<string, number>;
+  /** GMO of the panel's P(never by horizon) — date questions. */
+  pNever?: number;
+  /** Numeric panels with heavy positive skew aggregate in log space. */
+  logSpace?: boolean;
   /** Panel size that actually submitted. */
   n: number;
   /** Disagreement: max−min of panel probabilities (binary) or relative p50 spread (numeric). */
@@ -79,6 +148,8 @@ export interface AggregateForecast {
    * Extremization assumes independent evidence — k is scaled down by this.
    */
   evidenceOverlap?: number;
+  /** The aggregation chain layer by layer (binary questions). */
+  components?: AggregateComponents;
 }
 
 /** Internal effort scale; mapped per provider at request time. */
@@ -103,6 +174,12 @@ export interface RunOptions {
   resolutionDate?: string;
   /** Forecast mode: independent forecaster panel size (3–11). */
   panelSize?: number;
+  /** Forecast mode: pre-sharpened question — tournament imports arrive sharp, so the sharpener is skipped. */
+  presetQuestion?: ForecastQuestion;
+  /** Forecast mode: provenance of an externally-imported question (recorded in the ledger). */
+  forecastOrigin?: ForecastOrigin;
+  /** Forecast mode: ledger id this run's forecast supersedes (trigger-driven re-forecast). */
+  supersedes?: string;
   verification: Verification;
   thinking: boolean;
   reasoningEffort: ReasoningEffort;

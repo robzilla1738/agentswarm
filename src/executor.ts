@@ -46,23 +46,37 @@ import {
 } from "./prompts";
 import {
   aggregateBinary,
+  aggregateMc,
   aggregateQuantiles,
   appendLedger,
+  applyRecalibration,
+  blendWithMarket,
   calibrationBlock,
+  canonicalMethodLabel,
   chooseExtremizeK,
+  chooseMarketWeight,
   clampProb,
+  daysToIso,
   evidenceOverlap,
+  extractMethodLabel,
+  fitRecalibration,
   ISO_DATE,
+  isoToDays,
+  liquidityFactor,
   loadLedger,
+  methodWeights,
+  monotoneQuantiles,
+  normalizeOptionProbs,
   parseQuestionJson,
   scaleK,
   validateForecastAnalytics,
 } from "./forecast";
+import { MarketHit, marketOdds } from "./datatools";
 import { appendMemory, memoryBlock } from "./memory";
 import { aggregateSources, renderFinalHtml, sourcesBlock } from "./report";
 import { SandboxRuntime, createSandbox } from "./sandbox";
 import { RunState } from "./state";
-import { AggregateForecast, Forecast, ForecastQuestion, RunMeta, RunStatus, SourceRef, Task, TaskSpec, Usage, usageCost } from "./types";
+import { AggregateForecast, Forecast, ForecastQuestion, MarketAnchor, RunMeta, RunStatus, SourceRef, Task, TaskSpec, Usage, usageCost } from "./types";
 import { canonicalArtifactRel, clip, ensureDir, errMsg, oneLine, rid, sleep, truncateMiddle, validateArtifactFormat, withTimeout } from "./util";
 
 
@@ -365,7 +379,7 @@ export class Executor {
     }
     const forecastDoctrine =
       this.forecastMode() && this.question
-        ? `\n\n${forecastConductorAddendum(this.question, this.panelSize(), this.safeCalibrationBlock())}`
+        ? `\n\n${forecastConductorAddendum(this.question, this.panelSize(), this.safeCalibrationBlock(), Boolean(this.meta.options.forecastOrigin))}`
         : "";
 
     // Real-directory runs remember: prior missions in the same workspace feed
@@ -510,6 +524,15 @@ export class Executor {
    * never the run.
    */
   private async sharpenQuestion(): Promise<void> {
+    // Tournament imports arrive already sharp (the platform wrote the precise
+    // question and criteria) — re-sharpening would only drift the wording away
+    // from what the source market actually resolves on.
+    const preset = this.meta.options.presetQuestion;
+    if (preset?.text && preset.resolutionCriteria && ISO_DATE.test(preset.resolutionDate ?? "")) {
+      this.question = preset;
+      this.journal.append("forecast.question", { question: preset });
+      return;
+    }
     const today = new Date(this.meta.createdAt).toISOString().slice(0, 10);
     const operatorDate = this.meta.options.resolutionDate;
     let parsed: ForecastQuestion | null = null;
@@ -570,7 +593,7 @@ export class Executor {
     const strList = (v: unknown, max: number) =>
       Array.isArray(v) && v.length ? v.map((x) => clip(String(x), 300)).slice(0, max) : undefined;
     const f: Forecast = {
-      method: oneLine(String(args.method ?? "unspecified"), 60).toLowerCase(),
+      method: canonicalMethodLabel(oneLine(String(args.method ?? "unspecified"), 60)),
       rationale: String(args.rationale ?? "").trim(),
       baseRates: strList(args.base_rates, 6),
       keyDrivers: strList(args.key_drivers, 8),
@@ -594,17 +617,49 @@ export class Executor {
         else if (pr === 1) pr = 0.01;
         f.prior = clampProb(pr);
       }
+    } else if (q.kind === "mc") {
+      const probs = normalizeOptionProbs(args.option_probs, q.options ?? []);
+      if (!probs) return null;
+      f.optionProbs = probs;
+    } else if (q.kind === "date") {
+      // Quantiles arrive as ISO dates; the engine works in epoch-days.
+      const partial: Partial<Record<"p5" | "p10" | "p25" | "p50" | "p75" | "p90" | "p95", number>> = {};
+      for (const key of ["p5", "p10", "p25", "p50", "p75", "p90", "p95"] as const) {
+        if (args[key] === undefined) continue;
+        const d = isoToDays(String(args[key]));
+        if (d !== null) partial[key] = d;
+      }
+      const quantiles = monotoneQuantiles(partial);
+      if (!quantiles) return null;
+      f.quantiles = quantiles;
+      let pn = Number(args.p_never);
+      if (Number.isFinite(pn)) {
+        if (pn > 1) pn = pn / 100;
+        f.pNever = clampProb(pn);
+      }
     } else {
-      const vals = [args.p10, args.p50, args.p90].map(Number);
-      if (vals.some((v) => !Number.isFinite(v))) return null;
-      vals.sort((a, b) => a - b);
-      f.quantiles = { p10: vals[0], p50: vals[1], p90: vals[2] };
+      const partial: Partial<Record<"p5" | "p10" | "p25" | "p50" | "p75" | "p90" | "p95", number>> = {};
+      for (const key of ["p5", "p10", "p25", "p50", "p75", "p90", "p95"] as const) {
+        const v = Number(args[key]);
+        if (args[key] !== undefined && Number.isFinite(v)) partial[key] = v;
+      }
+      const quantiles = monotoneQuantiles(partial);
+      if (!quantiles) return null;
+      f.quantiles = quantiles;
     }
     return f;
   }
 
   /** Human-readable headline for one panelist's forecast. */
   private forecastHeadline(f: Forecast): string {
+    if (this.question?.kind === "mc" && f.optionProbs) {
+      const ranked = Object.entries(f.optionProbs).sort((a, b) => b[1] - a[1]);
+      return ranked.map(([opt, p]) => `"${oneLine(opt, 40)}" ${Math.round(p * 100)}%`).slice(0, 4).join(" · ");
+    }
+    if (this.question?.kind === "date" && f.quantiles) {
+      const never = typeof f.pNever === "number" ? ` · P(never by horizon) ${Math.round(f.pNever * 100)}%` : "";
+      return `p10 ${daysToIso(f.quantiles.p10)} / p50 ${daysToIso(f.quantiles.p50)} / p90 ${daysToIso(f.quantiles.p90)}${never}`;
+    }
     if (this.question?.kind === "binary" || f.probability !== undefined) {
       return `P(YES) = ${Math.round((f.probability ?? 0.5) * 100)}%`;
     }
@@ -665,7 +720,11 @@ export class Executor {
       if (!prev || prev.forecast!.submittedAt <= t.forecast.submittedAt) byMethod.set(t.forecast.method, t);
     }
     return [...byMethod.values()].filter((t) =>
-      q.kind === "binary" ? typeof t.forecast!.probability === "number" : Boolean(t.forecast!.quantiles)
+      q.kind === "binary"
+        ? typeof t.forecast!.probability === "number"
+        : q.kind === "mc"
+          ? Boolean(t.forecast!.optionProbs)
+          : Boolean(t.forecast!.quantiles)
     );
   }
 
@@ -690,9 +749,10 @@ export class Executor {
    * at the top of synthesis: median + extremized geometric mean of odds for
    * binary panels, trimmed-mean quantiles for numeric ones. The latest
    * forecast per method label wins, so red-team revision rounds replace their
-   * originals instead of double-counting.
+   * originals instead of double-counting. Binary aggregates are then anchored
+   * toward a verified matching market price (best-effort, engine-owned).
    */
-  private aggregateAndLedger(): void {
+  private async aggregateAndLedger(): Promise<void> {
     if (!this.forecastMode() || !this.question || this.aggregate) return;
     const q = this.question;
     const panel = this.panelFromTasks();
@@ -710,28 +770,93 @@ export class Executor {
     }
     // Extremization assumes independent evidence: a panel that cited the same
     // pages holds fewer independent views than it has members, so k shrinks
-    // with the panel's source overlap.
+    // with the panel's source overlap. Probability-shaped kinds only — the
+    // quantile aggregation doesn't extremize.
     const overlap =
-      q.kind === "binary" ? evidenceOverlap(panel.map((t) => (t.sources ?? []).map((s) => s.url))) : 0;
+      q.kind === "binary" || q.kind === "mc"
+        ? evidenceOverlap(panel.map((t) => (t.sources ?? []).map((s) => s.url)))
+        : 0;
+    // Track-record method weights: a lens that has been scoring better than
+    // the others earns more say in the weighted GMO. All 1 until the ledger
+    // holds enough resolutions per method.
+    let mw: Record<string, number> = {};
+    try {
+      mw = q.kind === "binary" || q.kind === "mc" ? methodWeights(loadLedger()) : {};
+    } catch {
+      /* equal weights */
+    }
+    const weights = panel.map((t) => mw[t.forecast!.method] ?? 1);
     let agg: AggregateForecast;
     try {
       agg =
         q.kind === "binary"
-          ? aggregateBinary(panel.map((t) => t.forecast!.probability!), scaleK(k, overlap))
-          : aggregateQuantiles(panel.map((t) => t.forecast!.quantiles!), k);
+          ? aggregateBinary(panel.map((t) => t.forecast!.probability!), scaleK(k, overlap), weights)
+          : q.kind === "mc"
+            ? aggregateMc(panel.map((t) => t.forecast!.optionProbs!), q.options ?? [], scaleK(k, overlap), weights)
+            : aggregateQuantiles(panel.map((t) => t.forecast!.quantiles!), k);
     } catch (e) {
       this.journal.append("log", { level: "error", msg: `forecast aggregation failed: ${errMsg(e)}` });
       return;
     }
-    if (q.kind === "binary") agg.evidenceOverlap = overlap;
+    if (q.kind === "mc") agg.evidenceOverlap = overlap;
+    // Date questions carry a separate never-mass: GMO of the panel's P(never).
+    if (q.kind === "date") {
+      const pNevers = panel
+        .map((t) => t.forecast!.pNever)
+        .filter((p): p is number => typeof p === "number")
+        .map(clampProb);
+      if (pNevers.length) {
+        const lo = pNevers.reduce((s, p) => s + Math.log(p / (1 - p)), 0) / pNevers.length;
+        agg.pNever = clampProb(Math.exp(lo) / (1 + Math.exp(lo)));
+      }
+    }
+    if (q.kind === "binary") {
+      agg.evidenceOverlap = overlap;
+      agg.components = { panelGmo: agg.gmo, extremized: agg.probability };
+      // Market anchor: the strongest single forecast available is a liquid
+      // market's price. Blend toward it in log-odds space AFTER extremization
+      // (the market is already an aggregate; extremizing it would double-count).
+      const anchor = await this.marketAnchor(q);
+      if (anchor) {
+        const blended = blendWithMarket(agg.probability!, anchor.probability, anchor.weight);
+        agg.components.market = anchor;
+        agg.components.blended = blended;
+        agg.probability = blended;
+        this.journal.append("log", {
+          level: "info",
+          msg: `market anchor: [${anchor.platform}] ${Math.round(anchor.probability * 100)}% (weight ${anchor.weight.toFixed(2)}) — panel ${Math.round(agg.components.extremized! * 100)}% → blended ${Math.round(blended * 100)}%`,
+        });
+      }
+      // Recalibration: the last layer, fitted on the ledger's own resolved
+      // record (pre-recalibration values, so refitting is never circular).
+      try {
+        const recal = fitRecalibration(loadLedger());
+        if (recal) {
+          const r = applyRecalibration(agg.probability!, recal);
+          agg.components.recalibrated = r;
+          if (Math.abs(r - agg.probability!) >= 0.005) {
+            this.journal.append("log", {
+              level: "info",
+              msg: `recalibration (a=${recal.a}, b=${recal.b}, n=${recal.n}): ${Math.round(agg.probability! * 100)}% → ${Math.round(r * 100)}%`,
+            });
+          }
+          agg.probability = r;
+        }
+      } catch {
+        /* recalibration is best-effort */
+      }
+    }
     this.aggregate = agg;
     this.panelTasks = panel;
-    const panelRecs = panel.map((t) => ({
+    const panelRecs = panel.map((t, i) => ({
       taskId: t.id,
       method: t.forecast!.method,
       probability: t.forecast!.probability,
       prior: t.forecast!.prior,
       quantiles: t.forecast!.quantiles,
+      ...(t.forecast!.optionProbs ? { optionProbs: t.forecast!.optionProbs } : {}),
+      ...(typeof t.forecast!.pNever === "number" ? { pNever: t.forecast!.pNever } : {}),
+      ...(weights[i] !== 1 ? { weight: Number(weights[i].toFixed(3)) } : {}),
     }));
     const ledgerId = rid("f");
     this.journal.append("forecast.aggregated", { aggregate: agg, panel: panelRecs, ledgerId });
@@ -739,6 +864,8 @@ export class Executor {
     // ledger — a half-run panel is not a forecast the system should be scored on.
     if (this.finishReason.includes("cancel")) return;
     const triggers = [...new Set(panel.flatMap((t) => t.forecast!.updateTriggers ?? []))].slice(0, 12);
+    const origin = this.meta.options.forecastOrigin;
+    const supersedes = this.meta.options.supersedes;
     try {
       appendLedger({
         v: 1,
@@ -750,10 +877,90 @@ export class Executor {
         aggregate: agg,
         panel: panelRecs,
         ...(triggers.length ? { triggers } : {}),
-        ...(q.kind === "binary" ? { evidenceOverlap: overlap } : {}),
+        ...(q.kind === "binary" || q.kind === "mc" ? { evidenceOverlap: overlap } : {}),
+        ...(origin ? { origin } : {}),
+        ...(supersedes ? { supersedes } : {}),
       });
     } catch (e) {
       this.journal.append("log", { level: "warn", msg: `forecast ledger write failed: ${errMsg(e)}` });
+    }
+  }
+
+  /**
+   * Find a liquid market that is verifiably the same question and compute its
+   * blend weight. Best-effort by design: any failure (no match, thin volume,
+   * model hiccup, network) returns null and the panel number stands. A WRONG
+   * anchor is worse than none, so the match must clear a term-overlap bar AND
+   * a cheap-model same-question check.
+   */
+  private async marketAnchor(q: ForecastQuestion): Promise<MarketAnchor | null> {
+    let base = this.cfg.forecastMarketWeight;
+    if (!(base > 0)) return null;
+    // Tournament leakage rule: a question imported FROM a market must not be
+    // anchored back to market prices — the ledger's "did the panel beat the
+    // market" signal (and every weight fitted on it) would become circular.
+    if (this.meta.options.forecastOrigin) return null;
+    try {
+      base = chooseMarketWeight(loadLedger(), this.cfg.forecastMarketWeight);
+    } catch {
+      /* keep the configured weight */
+    }
+    const deadline = withTimeout(this.ac.signal, 45_000);
+    try {
+      const hits = await marketOdds(this.cfg, q.text, 8, deadline.signal);
+      const terms = q.text.toLowerCase().split(/\s+/).filter((t) => t.length > 2);
+      if (!terms.length) return null;
+      const relevance = (h: MarketHit) => {
+        const hay = h.title.toLowerCase();
+        return terms.reduce((s, t) => s + (hay.includes(t) ? 1 : 0), 0) / terms.length;
+      };
+      const liquidity = (h: MarketHit) => h.volume ?? (h.forecasters ? h.forecasters * 100 : 0);
+      const candidates = hits
+        .filter((h) => typeof h.probability === "number" && relevance(h) >= 0.5 && liquidity(h) >= 500)
+        .sort((a, b) => liquidity(b) - liquidity(a));
+      const best = candidates[0];
+      if (!best) return null;
+      const weight = base * liquidityFactor(liquidity(best));
+      if (weight < 0.02) return null;
+      // Same-question check: term overlap can't tell direction or deadline
+      // apart ("Will X happen by June?" vs "Will X be banned by June?").
+      const model = this.cfg.cheapModel || this.meta.options.model;
+      const res = await chat(this.cfg, {
+        model,
+        priority: "high",
+        messages: [
+          {
+            role: "user",
+            content: `A forecasting engine wants to anchor its estimate to a prediction-market price, but only if the market is genuinely the SAME question.
+
+QUESTION: ${q.text}
+Resolution criteria: ${q.resolutionCriteria}
+Resolution date: ${q.resolutionDate}
+
+MARKET: [${best.platform}] ${best.title}${best.closes ? ` (closes ${best.closes})` : ""}
+
+Same event, same direction (the market's YES means this question's YES), compatible deadline? Reply with exactly YES or NO.`,
+          },
+        ],
+        thinking: false,
+        maxTokens: 8,
+        signal: deadline.signal,
+      });
+      this.onUsage(model, res.usage);
+      if (!/^\s*YES\b/i.test(res.content || "")) return null;
+      return {
+        platform: best.platform,
+        url: best.url,
+        title: best.title,
+        probability: clampProb(best.probability!),
+        volume: best.volume,
+        weight,
+      };
+    } catch (e) {
+      this.journal.append("log", { level: "info", msg: `market anchor skipped: ${errMsg(e)}` });
+      return null;
+    } finally {
+      deadline.dispose();
     }
   }
 
@@ -1248,9 +1455,44 @@ PROTOCOL
     this.lastConductorAction = "wait";
   }
 
+  /**
+   * Forecast mode: every panelist must work a DISTINCT method, or the
+   * latest-per-method dedup silently shrinks the panel ("five outside-views"
+   * aggregate as one). Enforced at spawn time so no work is wasted; the whole
+   * batch is rejected BEFORE id allocation, so the conductor's task-id
+   * arithmetic stays intact and it simply re-spawns with corrected labels.
+   * Revision tasks (depending on the red-team) legitimately reuse a label.
+   * Unparseable labels degrade to advisory — never block.
+   */
+  private validatePanelDiversity(specs: TaskSpec[]): string | null {
+    const seen = new Map<string, string>();
+    for (const t of this.taskList()) {
+      if (t.role !== "forecaster" || t.status === "failed" || t.status === "blocked") continue;
+      const label = t.forecast?.method ?? extractMethodLabel(`${t.objective}\n${t.context ?? ""}`);
+      if (label) seen.set(label, t.id);
+    }
+    for (const spec of specs) {
+      if (String(spec.role ?? "").toLowerCase() !== "forecaster") continue;
+      const label = extractMethodLabel(`${spec.objective ?? ""}\n${spec.context ?? ""}`);
+      if (!label) continue;
+      const isRevision = (spec.deps ?? []).some((d) => this.tasks.get(String(d))?.role === "red-team");
+      if (isRevision) continue;
+      const dup = seen.get(label);
+      if (dup) {
+        return `Rejected — no tasks were created: forecaster method label "${label}" duplicates ${dup}. Every panelist needs a DISTINCT method (write "METHOD: <label>" in each forecaster objective; only red-team revision tasks may reuse a label). Re-spawn the batch with corrected labels.`;
+      }
+      seen.set(label, "this batch");
+    }
+    return null;
+  }
+
   private handleSpawn(args: Record<string, unknown>): string {
     const specs = Array.isArray(args.tasks) ? (args.tasks as TaskSpec[]) : [];
     if (!specs.length) return "No tasks provided.";
+    if (this.forecastMode()) {
+      const diversity = this.validatePanelDiversity(specs);
+      if (diversity) return diversity;
+    }
     const remaining = this.meta.options.maxTasks - this.tasks.size;
     if (remaining <= 0) {
       return `Task cap reached (${this.meta.options.maxTasks}). Consolidate or finish — no more tasks can be created.`;
@@ -1761,7 +2003,7 @@ PROTOCOL
         system,
         kickoff: isForecaster ? FORECASTER_KICKOFF : WORKER_KICKOFF,
         tools: workerToolset(this.cfg),
-        terminal: isForecaster ? [submitForecastTool(this.question!.kind)] : [REPORT_TOOL],
+        terminal: isForecaster ? [submitForecastTool(this.question!.kind, this.question!.options)] : [REPORT_TOOL],
         maxSteps: this.meta.options.maxStepsPerTask,
         signal: deadline.signal,
         ctx: workerCtx(deadline.signal),
@@ -2366,7 +2608,7 @@ PROTOCOL
       this.journal.append("log", { level: "warn", msg: `coherence probe failed: ${errMsg(e)}` });
     }
     try {
-      this.aggregateAndLedger();
+      await this.aggregateAndLedger();
     } catch (e) {
       this.journal.append("log", { level: "error", msg: `forecast aggregation failed: ${errMsg(e)}` });
     }

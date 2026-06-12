@@ -5,7 +5,16 @@ import { ToolSchema } from "./deepseek";
 import { SandboxRuntime } from "./sandbox";
 import { ForecastKind, RunMeta } from "./types";
 import { crawlSite, resolveCrawlBackend, slugForUrl } from "./crawltools";
-import { TimeSeriesSource, formatMarketHits, formatTimeSeries, marketOdds, timeSeries } from "./datatools";
+import {
+  TimeSeriesSource,
+  formatMarketHits,
+  formatTables,
+  formatTimeSeries,
+  marketOdds,
+  optionsImplied,
+  timeSeries,
+  wikiTables,
+} from "./datatools";
 import { renderDocHtml } from "./report";
 import { mergeCandidates } from "./searchcore";
 import { ensureDir, errMsg, escapeHtml, pathInside, truncateMiddle } from "./util";
@@ -506,14 +515,15 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
     schema: {
       name: "time_series",
       description:
-        "Fetch a statistical/financial time series: fred (St. Louis Fed economic series, e.g. CPIAUCSL, UNRATE — needs the free fredApiKey), worldbank (INDICATOR:COUNTRY, e.g. NY.GDP.MKTP.CD:US — keyless), yahoo (daily market data: AAPL, ^GSPC, EURUSD=X, BTC-USD — keyless), gdelt (news-coverage volume for a query — keyless). Returns a stats summary, recent observations, and a ready-made ```chart block for reports. Use real data series to ground trend extrapolation instead of guessing.",
+        "Fetch a statistical/financial/weather time series: fred (St. Louis Fed economic series, e.g. CPIAUCSL, UNRATE — needs the free fredApiKey), worldbank (INDICATOR:COUNTRY, e.g. NY.GDP.MKTP.CD:US — keyless), yahoo (daily market data: AAPL, ^GSPC, EURUSD=X, BTC-USD — keyless), gdelt (news-coverage volume for a query — keyless), gdelttone (media sentiment tone for a query — keyless), openmeteo (daily weather, series \"lat,lon[,variable]\" e.g. \"39.74,-104.99,snowfall_sum\" — past dates use the ERA5 archive, which turns weather base rates into counted frequencies; keyless), nws (official US hourly point forecast, series \"lat,lon\" — keyless). Returns a stats summary, recent observations, and a ready-made ```chart block for reports. Use real data series to ground trend extrapolation instead of guessing.",
       parameters: {
         type: "object",
         properties: {
-          source: { type: "string", enum: ["fred", "worldbank", "yahoo", "gdelt"] },
+          source: { type: "string", enum: ["fred", "worldbank", "yahoo", "gdelt", "gdelttone", "openmeteo", "nws"] },
           series: {
             type: "string",
-            description: "FRED series id, World Bank INDICATOR:COUNTRY, Yahoo Finance symbol, or GDELT search query",
+            description:
+              "FRED series id, World Bank INDICATOR:COUNTRY, Yahoo Finance symbol, GDELT search query, or lat,lon[,variable] for weather sources",
           },
           start: { type: "string", description: "Start date YYYY-MM-DD (optional)" },
           end: { type: "string", description: "End date YYYY-MM-DD (optional)" },
@@ -528,8 +538,8 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
     },
     run: async (args, ctx) => {
       const source = String(args.source) as TimeSeriesSource;
-      if (!["fred", "worldbank", "yahoo", "gdelt"].includes(source)) {
-        throw new Error("source must be fred | worldbank | yahoo | gdelt");
+      if (!["fred", "worldbank", "yahoo", "gdelt", "gdelttone", "openmeteo", "nws"].includes(source)) {
+        throw new Error("source must be fred | worldbank | yahoo | gdelt | gdelttone | openmeteo | nws");
       }
       const r = await timeSeries(
         ctx.cfg,
@@ -541,6 +551,54 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
       );
       const projectTo = /^\d{4}-\d{2}-\d{2}$/.test(String(args.project_to ?? "")) ? String(args.project_to) : undefined;
       return formatTimeSeries(r, projectTo);
+    },
+  };
+
+  tools.options_implied = {
+    schema: {
+      name: "options_implied",
+      description:
+        'Options-implied probability that a ticker trades ABOVE a strike price at a target date, computed from Yahoo\'s option chain via Black-Scholes N(d2) using the market\'s own implied volatility (keyless). The financial gold standard for "will PRICE exceed X by DATE" questions — note it is risk-neutral, so cite it as a strong baseline, not gospel. P(below) = 1 − P(above).',
+      parameters: {
+        type: "object",
+        properties: {
+          symbol: { type: "string", description: "Ticker with listed options (AAPL, SPY, ^SPX, TSLA)" },
+          strike: { type: "number", description: "The threshold price the question asks about" },
+          by: { type: "string", description: "Target date YYYY-MM-DD (the nearest listed expiry on/after it is used)" },
+        },
+        required: ["symbol", "strike", "by"],
+      },
+    },
+    run: async (args, ctx) => {
+      const r = await optionsImplied(String(args.symbol), Number(args.strike), String(args.by), ctx.signal);
+      return [
+        `${r.symbol} spot ${r.spot} · strike ${r.strike} · expiry ${r.expiry} (nearest listed to your date) · implied vol ${(r.iv * 100).toFixed(1)}%`,
+        `Risk-neutral P(${r.symbol} > ${r.strike} at expiry) = ${(r.probAbove * 100).toFixed(1)}%  ·  P(below) = ${((1 - r.probAbove) * 100).toFixed(1)}%`,
+        `Contracts used: ${r.contractsUsed}. Caveat: risk-neutral probabilities ≠ real-world for far-dated or high-risk-premium events — treat as a strong anchor, then adjust.`,
+      ].join("\n");
+    },
+  };
+
+  tools.wiki_tables = {
+    schema: {
+      name: "wiki_tables",
+      description:
+        'Extract the data tables from a Wikipedia page (or any URL) as TSV — the durable keyless home of election polling averages ("Opinion polling for the next X election" pages), historical results, and base-rate lists ("List of ..."). Returns a table index plus the largest table; call again with table_index to read another.',
+      parameters: {
+        type: "object",
+        properties: {
+          page: { type: "string", description: 'Wikipedia page title (e.g. "Opinion polling for the 2026 United States Senate elections") or a full URL' },
+          table_index: { type: "number", description: "Which table to print (from the index the first call returns)" },
+          max_rows: { type: "number", description: "Row cap, default 60" },
+        },
+        required: ["page"],
+      },
+    },
+    run: async (args, ctx) => {
+      const tables = await wikiTables(String(args.page), ctx.signal);
+      const idx = Number.isFinite(Number(args.table_index)) ? Number(args.table_index) : undefined;
+      const maxRows = Math.min(Math.max(Number(args.max_rows) || 60, 5), 200);
+      return formatTables(tables, idx, maxRows);
     },
   };
 
@@ -857,8 +915,52 @@ export const REPORT_TOOL: ToolSchema = {
  * a binary panelist must give a probability and a numeric panelist must give
  * quantiles — the engine validates, clamps, and aggregates mechanically.
  */
-export function submitForecastTool(kind: ForecastKind): ToolSchema {
+export function submitForecastTool(kind: ForecastKind, options?: string[]): ToolSchema {
   const binary = kind === "binary";
+  const kindProps =
+    kind === "binary"
+      ? {
+          prior: {
+            type: "number",
+            description:
+              "FIRST COMMITMENT: the probability your reference classes ALONE imply (percentage 1-99), before weighing any current evidence. Compute this from your base_rates before reading the news mattered.",
+          },
+          probability: {
+            type: "number",
+            description:
+              "Your FINAL probability the question resolves YES, as a percentage between 1 and 99, after adjusting the prior with concrete current evidence. Never 0 or 100 — certainty is never earned.",
+          },
+        }
+      : kind === "mc"
+        ? {
+            option_probs: {
+              type: "object",
+              additionalProperties: { type: "number" },
+              description:
+                `Your probability (percentage) for EVERY option, keys exactly as listed${options?.length ? `: ${options.map((o) => JSON.stringify(o)).join(", ")}` : ""}. They should sum to ~100; the engine renormalizes.`,
+            },
+          }
+        : kind === "date"
+          ? {
+              p10: { type: "string", description: "ISO date (YYYY-MM-DD): a 10% chance the event happens before this" },
+              p25: { type: "string", description: "Optional ISO date: 25th percentile" },
+              p50: { type: "string", description: "ISO date: your median estimate of when the event happens" },
+              p75: { type: "string", description: "Optional ISO date: 75th percentile" },
+              p90: { type: "string", description: "ISO date: a 10% chance the event happens after this" },
+              p_never: {
+                type: "number",
+                description: "Percentage chance the event does NOT happen by the question's horizon date at all",
+              },
+            }
+          : {
+              p5: { type: "number", description: "Optional 5th percentile: a 5% chance the true value is below this" },
+              p10: { type: "number", description: "Your 10th percentile: a 10% chance the true value is below this" },
+              p25: { type: "number", description: "Optional 25th percentile — sharpens the distribution" },
+              p50: { type: "number", description: "Your median estimate" },
+              p75: { type: "number", description: "Optional 75th percentile — sharpens the distribution" },
+              p90: { type: "number", description: "Your 90th percentile: a 10% chance the true value is above this" },
+              p95: { type: "number", description: "Optional 95th percentile: a 5% chance the true value is above this" },
+            };
   return {
     name: "submit_forecast",
     description:
@@ -866,24 +968,7 @@ export function submitForecastTool(kind: ForecastKind): ToolSchema {
     parameters: {
       type: "object",
       properties: {
-        ...(binary
-          ? {
-              prior: {
-                type: "number",
-                description:
-                  "FIRST COMMITMENT: the probability your reference classes ALONE imply (percentage 1-99), before weighing any current evidence. Compute this from your base_rates before reading the news mattered.",
-              },
-              probability: {
-                type: "number",
-                description:
-                  "Your FINAL probability the question resolves YES, as a percentage between 1 and 99, after adjusting the prior with concrete current evidence. Never 0 or 100 — certainty is never earned.",
-              },
-            }
-          : {
-              p10: { type: "number", description: "Your 10th percentile: a 10% chance the true value is below this" },
-              p50: { type: "number", description: "Your median estimate" },
-              p90: { type: "number", description: "Your 90th percentile: a 10% chance the true value is above this" },
-            }),
+        ...kindProps,
         method: {
           type: "string",
           description: "Your assigned primary method, e.g. outside-view | inside-view | trend | market-anchored",
@@ -924,7 +1009,11 @@ export function submitForecastTool(kind: ForecastKind): ToolSchema {
           },
         },
       },
-      required: [...(binary ? ["prior", "probability"] : ["p10", "p50", "p90"]), "method", "rationale"],
+      required: [
+        ...(binary ? ["prior", "probability"] : kind === "mc" ? ["option_probs"] : ["p10", "p50", "p90"]),
+        "method",
+        "rationale",
+      ],
     },
   };
 }

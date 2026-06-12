@@ -1,4 +1,5 @@
 import * as os from "os";
+import { daysToIso } from "./forecast";
 import { AggregateForecast, ForecastQuestion, RunMeta, Task } from "./types";
 import { clip, fmtTokens } from "./util";
 
@@ -170,8 +171,10 @@ const ROLE_HINTS: Record<string, string> = {
     "• OUTSIDE VIEW FIRST: before weighing any case-specific evidence, find at least 2 reference classes and their historical base rates (\"how often do situations like this resolve YES?\"). Commit that number as your `prior` BEFORE weighing the news — the engine records prior → final, and a large gap had better be earned.\n" +
     "• The STATUS-QUO outcome usually carries the highest base rate: count how often \"nothing changed\" won in comparable situations before believing this time is different.\n" +
     "• Work your ASSIGNED METHOD as the primary lens, but sanity-check against the others.\n" +
+    "• METHOD decomposition: break the event into the conditional chain that must hold for YES, estimate every link explicitly (P(A), P(B|A), …), multiply for conjunctions and add for independent disjunctions, and SHOW the arithmetic in your rationale — conjunctions are systematically overestimated, and written-out arithmetic is the antidote.\n" +
     "• Check market_odds (several phrasings) — calibrated crowds are a strong baseline. State explicitly whether you deviate from the crowd and exactly why your evidence beats theirs.\n" +
     "• Use time_series with project_to=<resolution date> for any quantitative trend that bears on the question — ground extrapolation in the OLS projection it returns, not in narrative momentum.\n" +
+    "• MATCH THE TOOL TO THE DOMAIN: price-threshold questions → options_implied (the option market's own probability); elections/polling and historical base-rate lists → wiki_tables; weather-dependent questions → time_series openmeteo with past dates (the ERA5 archive turns \"how often does it snow 6 inches in March?\" into a counted frequency).\n" +
     "• NEWS VOLUME MEASURES ATTENTION, NOT PROBABILITY. Heavy coverage of a possibility is not evidence it will happen (use gdelt to see attention for what it is, then ask what the boring base rate says). Commentary and prediction articles are sentiment; primary documents, data series, and counted history are evidence.\n" +
     "• TIME WINDOW: a \"by DATE\" question is about the remaining window. Decompose into per-period hazard rates — the same event with less remaining time deserves a lower probability, whatever the headlines say.\n" +
     "• Consider BOTH directions: write down the strongest case for YES and the strongest case for NO before settling.\n" +
@@ -340,6 +343,7 @@ export function questionBlock(q: ForecastQuestion): string {
   return [
     `THE QUESTION: ${q.text}`,
     `Kind: ${q.kind}${q.unit ? ` (unit: ${q.unit})` : ""}`,
+    ...(q.options?.length ? [`Options (exhaustive — exactly one resolves): ${q.options.map((o) => JSON.stringify(o)).join(", ")}`] : []),
     `Resolution criteria: ${q.resolutionCriteria}`,
     `Resolution date: ${q.resolutionDate}`,
   ].join("\n");
@@ -351,18 +355,29 @@ export function questionBlock(q: ForecastQuestion): string {
  * own are the question structure and the aggregation math; both are the
  * engine's (deterministic code).
  */
-export function forecastConductorAddendum(q: ForecastQuestion, panelSize: number, calibration: string): string {
+export function forecastConductorAddendum(
+  q: ForecastQuestion,
+  panelSize: number,
+  calibration: string,
+  compact = false
+): string {
+  const researchWave = compact
+    ? `1. RESEARCH WAVE — exactly TWO parallel scouts, no more (this is an imported tournament question: fast, cheap, and calibrated beats exhaustive — the token budget is deliberately tight and the panel is the deliverable):
+   • one base-rate + markets scout: market_odds with 2-3 phrasings, ≥1 reference class with a COUNTED frequency, and any single time_series that directly bears on the question (project_to=<resolution date>);
+   • one current-evidence scout: web_search with freshness (deep:false, one or two calls), separating established facts from commentary.
+   Do NOT set verify:true on anything, do NOT spawn team tasks, and do NOT add more research tasks — go straight to the panel when these two settle.`
+    : `1. RESEARCH WAVE — parallel scouts, none of which states a probability:
+   • a base-rate researcher: find ≥2 reference classes and produce COUNTED frequencies ("X of N comparable cases resolved YES — list the N"), including the status-quo rate (how often did nothing change?); a rate without its denominator is an opinion. Point it at the structured sources that bear on the domain: wiki_tables for polling averages and historical result lists, time_series openmeteo (past dates) for weather frequencies, options_implied for price thresholds;
+   • current-evidence scouts: the latest news and primary data (web_search with freshness + deep:true). Instruct them to SEPARATE established facts (dates, numbers, primary documents, official statements) from commentary and predictions, to collect disconfirming evidence explicitly, and to dedupe wire-republished stories — the same story on ten sites is ONE piece of evidence;
+   • a markets/data task: call market_odds with several phrasings of the question, and time_series (with project_to=<resolution date>) for any quantitative series that bears on it — the OLS projection is the trend baseline the panel should argue against.`;
   return `
 THIS IS A FORECAST MISSION. The deliverable is a calibrated ${q.kind === "binary" ? "probability" : "numeric range"}, produced by an independent forecaster panel and aggregated MECHANICALLY by the engine — never by you or any agent.
 
 ${questionBlock(q)}
 
 FORECAST PIPELINE (structure the run exactly like this):
-1. RESEARCH WAVE — parallel scouts, none of which states a probability:
-   • a base-rate researcher: find ≥2 reference classes and produce COUNTED frequencies ("X of N comparable cases resolved YES — list the N"), including the status-quo rate (how often did nothing change?); a rate without its denominator is an opinion;
-   • current-evidence scouts: the latest news and primary data (web_search with freshness + deep:true). Instruct them to SEPARATE established facts (dates, numbers, primary documents, official statements) from commentary and predictions, to collect disconfirming evidence explicitly, and to dedupe wire-republished stories — the same story on ten sites is ONE piece of evidence;
-   • a markets/data task: call market_odds with several phrasings of the question, and time_series (with project_to=<resolution date>) for any quantitative series that bears on it — the OLS projection is the trend baseline the panel should argue against.
-2. PANEL WAVE — spawn ${panelSize} INDEPENDENT tasks with role "forecaster", every one depending only on research tasks, NEVER on another forecaster. Assign each a DISTINCT method label in its objective and context: outside-view (anchor on base rates), inside-view (causal model of this specific case), trend (extrapolate the data), market-anchored (start from crowd odds, adjust for what they miss), plus extra angles if the panel is larger (e.g. skeptic, time-horizon). Spread model tiers across the panel (some model:"cheap", some "default", at least one "strong") — model diversity improves the ensemble. Inline the question, criteria, and date verbatim in each forecaster's context. Forecasters end with submit_forecast.
+${researchWave}
+2. PANEL WAVE — spawn ${panelSize} INDEPENDENT tasks with role "forecaster", every one depending only on research tasks, NEVER on another forecaster. Write "METHOD: <label>" in each forecaster's objective — labels must be DISTINCT (the engine rejects duplicate-label spawns). Take them in order from the canonical menu: outside-view (anchor on base rates), inside-view (causal model of this specific case), trend (extrapolate the data), market-anchored (start from crowd odds, adjust for what they miss), decomposition (split the question into the conditional sub-events that must hold, estimate each, multiply), skeptic (strongest case against the emerging consensus). Spread model tiers across the panel (some model:"cheap", some "default", at least one "strong") — model diversity improves the ensemble. Inline the question, criteria, and date verbatim in each forecaster's context. Forecasters end with submit_forecast.
 3. RED-TEAM WAVE — one task with role "red-team" depending on all panel tasks: attack the rationales (correlated evidence, stale sources, base-rate neglect, criteria misreads) and say which direction each flaw biases the forecast.
 4. REVISION WAVE — only if the red-team found MATERIAL flaws in specific forecasts: for each flawed one, spawn a fresh role "forecaster" task (model:"cheap") depending on the red-team task, with context = that panelist's original rationale + the red-team findings + the SAME method label verbatim. The engine keeps the latest forecast per method label, so a revision replaces its original.
 5. finish — your notes guide the synthesizer's prose. Do NOT state a number of your own and do NOT average the panel; the engine computes the aggregate and hands the exact figures to the synthesizer.
@@ -408,13 +423,13 @@ ${mission}
 ${operatorDate ? `\nThe operator set the resolution date: ${operatorDate}.` : ""}
 
 Rewrite it as a precisely resolvable question. Reply with ONLY a JSON object (no prose, no markdown fence):
-{"text": "...", "kind": "binary" | "numeric", "resolutionCriteria": "...", "resolutionDate": "YYYY-MM-DD", "unit": "..."}
+{"text": "...", "kind": "binary" | "numeric" | "mc" | "date", "resolutionCriteria": "...", "resolutionDate": "YYYY-MM-DD", "unit": "...", "options": ["...", "..."]}
 
 - text: unambiguous, self-contained, includes the date (e.g. "Will X happen before 2026-09-01?"). NEUTRALIZE the framing: strip loaded words, presuppositions, and the asker's lean ("Will the disastrous X finally collapse?" → "Will X fall below Y by DATE?") — the forecasters must inherit a neutral event statement, not an opinion.
-- kind: "binary" for will-it-happen questions; "numeric" for what-will-the-value-be questions (then include unit, else omit it).
-- resolutionCriteria: exactly what counts as YES (or how the value is measured), naming the authoritative public source to check.
+- kind: "binary" for will-it-happen questions; "numeric" for what-will-the-value-be questions (then include unit, else omit it); "mc" for which-of-N questions (then include options: 2-8 mutually exclusive, collectively exhaustive — add a catch-all like "None of the above / other" when the named candidates don't cover every outcome); "date" for when-will-it-happen questions (resolutionDate is then the horizon after which "never" is the answer).
+- resolutionCriteria: exactly what counts as YES (or how the value/winner/date is measured), naming the authoritative public source to check.
 - resolutionDate: ${operatorDate ? `use ${operatorDate}` : "the ISO date when the answer is knowable — infer it from the mission; if the mission names no horizon, pick a sensible near-term one"}.
-- Keep the question's intent; sharpen, don't replace it.`;
+- Keep the question's intent; sharpen, don't replace it. Only use "mc"/"date" when the mission genuinely asks which/when — a will-it-happen mission stays binary.`;
 }
 
 /** The exact-numbers block handed to the synthesizer (and journaled for the UI). */
@@ -422,19 +437,49 @@ export function aggregateBlock(q: ForecastQuestion, agg: AggregateForecast, pane
   const pct = (p: number) => `${Math.round(p * 100)}%`;
   const lines: string[] = [questionBlock(q), ""];
   if (q.kind === "binary" && typeof agg.probability === "number") {
-    lines.push(
-      `ENSEMBLE FORECAST (extremized geometric mean of odds, k=${agg.k}): P(YES) = ${pct(agg.probability)}`,
-      `Panel median: ${pct(agg.median ?? agg.probability)} · unextremized mean of odds: ${pct(agg.gmo ?? agg.probability)} · panel size: ${agg.n} · spread: ${Math.round(agg.spread * 100)} points`
-    );
+    const c = agg.components;
+    if (c?.market && typeof c.blended === "number" && typeof c.extremized === "number") {
+      lines.push(
+        `ENSEMBLE FORECAST: P(YES) = ${pct(agg.probability)}`,
+        `Aggregation chain: panel GMO ${pct(c.panelGmo ?? c.extremized)} → extremized (k=${agg.k}) ${pct(c.extremized)} → market-anchored ${pct(c.blended)}${typeof c.recalibrated === "number" ? ` → recalibrated ${pct(c.recalibrated)}` : ""}`,
+        `Market anchor: [${c.market.platform}] ${c.market.title ?? "matching market"} at ${pct(c.market.probability)}${c.market.volume ? ` (volume ${Math.round(c.market.volume).toLocaleString()})` : ""}, blend weight ${c.market.weight.toFixed(2)} — ${c.market.url}`,
+        `Panel median: ${pct(agg.median ?? agg.probability)} · panel size: ${agg.n} · spread: ${Math.round(agg.spread * 100)} points`
+      );
+    } else {
+      lines.push(
+        `ENSEMBLE FORECAST (extremized geometric mean of odds, k=${agg.k}): P(YES) = ${pct(agg.probability)}`,
+        `Panel median: ${pct(agg.median ?? agg.probability)} · unextremized mean of odds: ${pct(agg.gmo ?? agg.probability)} · panel size: ${agg.n} · spread: ${Math.round(agg.spread * 100)} points`
+      );
+    }
     if (typeof agg.evidenceOverlap === "number") {
       lines.push(
         `Panel evidence overlap: ${Math.round(agg.evidenceOverlap * 100)}% — extremization was scaled to k=${agg.k} accordingly (shared sources mean fewer independent views).`
       );
     }
+  } else if (q.kind === "mc" && agg.optionProbs) {
+    const ranked = Object.entries(agg.optionProbs).sort((a, b) => b[1] - a[1]);
+    lines.push(
+      `ENSEMBLE FORECAST (extremized GMO per option, renormalized to sum 1, k=${agg.k}):`,
+      ...ranked.map(([opt, p]) => `- ${JSON.stringify(opt)}: ${pct(p)}`),
+      `Panel size: ${agg.n} · largest per-option spread: ${Math.round(agg.spread * 100)} points`
+    );
+  } else if (q.kind === "date" && agg.quantiles) {
+    lines.push(
+      `ENSEMBLE FORECAST (trimmed-mean date quantiles): p10 ${daysToIso(agg.quantiles.p10)} · p50 ${daysToIso(agg.quantiles.p50)} · p90 ${daysToIso(agg.quantiles.p90)}`,
+      ...(typeof agg.pNever === "number"
+        ? [`P(the event does NOT happen by ${q.resolutionDate}): ${pct(agg.pNever)}`]
+        : []),
+      `Panel size: ${agg.n}`
+    );
   } else if (agg.quantiles) {
     const u = q.unit ? ` ${q.unit}` : "";
+    const fq = (v: number) => `${Number(v.toPrecision(6))}${u}`;
+    const mid =
+      agg.quantiles.p25 !== undefined && agg.quantiles.p75 !== undefined
+        ? ` · p25 ${fq(agg.quantiles.p25)} · p75 ${fq(agg.quantiles.p75)}`
+        : "";
     lines.push(
-      `ENSEMBLE FORECAST (10%-trimmed mean per quantile): p10 ${agg.quantiles.p10}${u} · p50 ${agg.quantiles.p50}${u} · p90 ${agg.quantiles.p90}${u}`,
+      `ENSEMBLE FORECAST (10%-trimmed mean per quantile${agg.logSpace ? ", aggregated in log space for skew" : ""}): p10 ${fq(agg.quantiles.p10)} · p50 ${fq(agg.quantiles.p50)} · p90 ${fq(agg.quantiles.p90)}${mid}`,
       `Panel size: ${agg.n} · relative p50 spread: ${Math.round(agg.spread * 100)}%`
     );
   }

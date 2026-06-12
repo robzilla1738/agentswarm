@@ -33,9 +33,19 @@ import {
 import { Executor } from "./executor";
 import { SANDBOX_KINDS, SandboxKind, dockerAvailable, resolveSandboxKind, testSandbox } from "./sandbox";
 import { TerminalRenderer, watchRun } from "./terminal";
-import { ISO_DATE, calibrationStats, loadLedger, resolveLedgerEntry } from "./forecast";
+import {
+  ISO_DATE,
+  backtest,
+  calibrationStats,
+  daysToIso,
+  isoToDays,
+  loadLedger,
+  resolveLedgerEntry,
+  supersededIds,
+} from "./forecast";
+import { TOURNAMENT_SOURCES, TournamentSource, listClosingQuestions } from "./datatools";
 import { resolveDue, watchOpenForecasts } from "./resolve";
-import { RunMeta, RunOptions } from "./types";
+import { ForecastQuestion, RunMeta, RunOptions } from "./types";
 import { ansi, errMsg, fmtMoney, fmtTokens } from "./util";
 
 const BIN_PATH = path.join(__dirname, "..", "bin", "swarm.js");
@@ -47,7 +57,7 @@ interface Args {
 
 /** Flags that never take a value — they must not swallow the next positional
  *  (`swarm run --fg "mission"` would otherwise eat the mission). */
-const BOOL_FLAGS = new Set(["fg", "open", "resume"]);
+const BOOL_FLAGS = new Set(["fg", "open", "resume", "auto", "dry-run", "reforecast"]);
 
 function parseArgs(argv: string[]): Args {
   const _: string[] = [];
@@ -111,13 +121,19 @@ export async function main(): Promise<void> {
         cmdList();
         break;
       case "forecasts":
-        await cmdForecasts(_[1]);
+        await cmdForecasts(_[1], flags);
+        break;
+      case "tournament":
+        await cmdTournament(flags);
         break;
       case "resolve":
         await cmdResolve(_.slice(1));
         break;
       case "calibration":
         cmdCalibration();
+        break;
+      case "backtest":
+        cmdBacktest();
         break;
       case "report":
         cmdReport(_[1], flags);
@@ -557,7 +573,7 @@ function cmdCancel(id: string): void {
 
 // ---------------------------------------------------------------- forecasts
 
-async function cmdForecasts(sub?: string): Promise<void> {
+async function cmdForecasts(sub?: string, flags: Args["flags"] = {}): Promise<void> {
   const cfg = loadConfig();
   if (sub === "watch") {
     console.log(ansi.cyan("checking update triggers of open forecasts…"));
@@ -569,7 +585,50 @@ async function cmdForecasts(sub?: string): Promise<void> {
     for (const a of alerts) {
       console.log(`\n${a.fired ? ansi.yellow("▲ trigger fired") : ansi.green("· quiet")}  ${ansi.gray(a.id)}  ${a.question}`);
       console.log(`  ${a.summary}`);
-      if (a.fired) console.log(ansi.gray(`  re-forecast: swarm forecast "${a.question}"`));
+      if (a.fired && !flags.reforecast) console.log(ansi.gray(`  re-forecast: swarm forecasts watch --reforecast`));
+    }
+    const fired = alerts.filter((a) => a.fired);
+    if (flags.reforecast && fired.length) {
+      // A fired trigger means the recorded probability is stale: re-run the
+      // SAME question with a fresh small panel; the new ledger record
+      // supersedes the old one (both still resolve and score).
+      const ledger = loadLedger();
+      for (const a of fired) {
+        const entry = ledger.find((e) => e.id === a.id);
+        if (!entry) continue;
+        const meta = createRun({
+          mission: `Re-forecast (update trigger fired): ${entry.question.text}\nWhat fired: ${a.summary}`,
+          cwd: process.cwd(),
+          sandbox: true,
+          options: optionsFromConfig(cfg, {
+            maxTasks: Math.min(cfg.maxTasks, 16),
+            maxTokens: Math.min(cfg.maxTokensPerRun, 4_000_000),
+            ...(cfg.cheapModel ? { model: cfg.cheapModel } : {}),
+            panelSize: 3,
+            mode: "forecast",
+            presetQuestion: entry.question,
+            supersedes: entry.id,
+            ...(entry.origin ? { forecastOrigin: entry.origin } : {}),
+          }),
+        });
+        console.log(`\n${ansi.cyan("re-forecasting")} ${ansi.gray(entry.id)} ${clipLine(entry.question.text, 80)}`);
+        try {
+          await execForeground(cfg, meta, false);
+        } catch (e) {
+          console.error(ansi.red(`  re-forecast failed: ${errMsg(e)}`));
+          continue;
+        }
+        const updated = loadLedger().find((e) => e.runId === meta.id);
+        if (updated) {
+          const oldP = entry.aggregate.probability;
+          const newP = updated.aggregate.probability;
+          const delta =
+            typeof oldP === "number" && typeof newP === "number"
+              ? ` ${Math.round(oldP * 100)}% → ${Math.round(newP * 100)}%`
+              : "";
+          console.log(`  ${ansi.green("✓")} superseded by ${updated.id}${delta}`);
+        }
+      }
     }
     return;
   }
@@ -579,14 +638,22 @@ async function cmdForecasts(sub?: string): Promise<void> {
     return;
   }
   console.log(ansi.bold("forecasts") + ansi.gray("  (~/.agentswarm/forecasts/ledger.jsonl)"));
+  const superseded = supersededIds(entries);
   for (const e of entries) {
     const agg = e.aggregate;
     const headline =
       typeof agg.probability === "number"
         ? `${Math.round(agg.probability * 100)}%`
-        : agg.quantiles
-          ? `p50 ${agg.quantiles.p50}`
-          : "—";
+        : agg.optionProbs
+          ? (() => {
+              const top = Object.entries(agg.optionProbs!).sort((a, b) => b[1] - a[1])[0];
+              return top ? `${Math.round(top[1] * 100)}% "${top[0].slice(0, 18)}"` : "—";
+            })()
+          : agg.quantiles
+            ? e.question.kind === "date"
+              ? `p50 ${daysToIso(agg.quantiles.p50)}`
+              : `p50 ${agg.quantiles.p50}`
+            : "—";
     const due = !e.resolution && Date.parse(`${e.question.resolutionDate}T23:59:59Z`) <= Date.now();
     const status = e.resolution
       ? e.resolution.outcome === "void"
@@ -597,7 +664,8 @@ async function cmdForecasts(sub?: string): Promise<void> {
       : due
         ? ansi.yellow("DUE — run: swarm resolve")
         : ansi.gray(`open until ${e.question.resolutionDate}`);
-    console.log(`  ${ansi.gray(e.id)}  ${ansi.bold(headline.padEnd(6))} ${status}`);
+    const chain = superseded.has(e.id) ? ansi.gray("  (superseded)") : e.supersedes ? ansi.gray(`  (supersedes ${e.supersedes})`) : "";
+    console.log(`  ${ansi.gray(e.id)}  ${ansi.bold(headline.padEnd(6))} ${status}${chain}`);
     console.log(`     ${clipLine(e.question.text, 90)}`);
   }
   const stats = calibrationStats(entries);
@@ -606,20 +674,172 @@ async function cmdForecasts(sub?: string): Promise<void> {
   }
 }
 
+/**
+ * Batch-forecast open market questions that close soon. The point is ledger
+ * velocity: resolved forecasts activate the calibration flywheel (adaptive k,
+ * calibration block, learned weights), and questions imported from market
+ * platforms resolve in days — with the platform publishing the ground truth.
+ */
+async function cmdTournament(flags: Args["flags"]): Promise<void> {
+  const cfg = loadConfig();
+  if (!cfg.apiKey && PROVIDERS[cfg.provider].keyRequired && !flags["dry-run"]) {
+    console.error(ansi.red(`No ${PROVIDERS[cfg.provider].label} API key set. `) + "Run: swarm config set apiKey <...>");
+    process.exit(1);
+  }
+  const overrides = optionOverrides(flags, cfg);
+  const intFlag = (name: string, def: number, lo: number, hi: number): number => {
+    if (flags[name] === undefined) return def;
+    const n = Number(flags[name]);
+    if (!Number.isFinite(n)) throw new Error(`--${name} must be a number`);
+    return Math.min(hi, Math.max(lo, Math.round(n)));
+  };
+  const count = intFlag("count", 10, 1, 50);
+  const within = intFlag("close-within", 14, 1, 120);
+  const rawSources =
+    typeof flags.source === "string" ? flags.source.split(",").map((s) => s.trim().toLowerCase()) : ["all"];
+  const sources: TournamentSource[] = rawSources.includes("all")
+    ? [...TOURNAMENT_SOURCES]
+    : rawSources.filter((s): s is TournamentSource => (TOURNAMENT_SOURCES as string[]).includes(s));
+  if (!sources.length) throw new Error(`--source must be a comma list of: ${TOURNAMENT_SOURCES.join(" | ")} | all`);
+
+  console.log(
+    ansi.cyan(`🏆 tournament — importing up to ${count} open binary questions closing within ${within}d`) +
+      ansi.gray(`  (${sources.join(", ")})`)
+  );
+  const candidates = await listClosingQuestions(cfg, sources, { withinDays: within, count: count * 3 }, undefined, (m) =>
+    console.error(ansi.yellow(`  ${m}`))
+  );
+  // Idempotent batches: a question already in the ledger is never re-imported.
+  const have = new Set(
+    loadLedger()
+      .map((e) => (e.origin ? `${e.origin.platform}:${e.origin.externalId}` : ""))
+      .filter(Boolean)
+  );
+  const fresh = candidates.filter((q) => !have.has(`${q.platform}:${q.externalId}`)).slice(0, count);
+  if (!fresh.length) {
+    console.log(ansi.gray("no new questions in the window — already forecast, or nothing closing soon"));
+    return;
+  }
+  for (const q of fresh) {
+    console.log(
+      `  ${ansi.gray(q.platform.padEnd(10))} closes ${q.closes} · market ${String(Math.round(q.probability * 100)).padStart(2)}%  ${clipLine(q.title, 78)}`
+    );
+  }
+  if (flags["dry-run"]) {
+    console.log(ansi.gray(`\n--dry-run: ${fresh.length} question(s) would be forecast`));
+    return;
+  }
+
+  process.stdout.write(ansi.gray("validating API key… "));
+  const auth = await validateAuth(cfg);
+  if (auth.status === "invalid") {
+    console.error(ansi.red(`\n✗ ${PROVIDERS[cfg.provider].label} key rejected: `) + (auth.message || "invalid key"));
+    process.exit(1);
+  }
+  process.stdout.write(auth.status === "ok" ? ansi.green("ok\n") : ansi.gray("skipped\n"));
+
+  let stopped = false;
+  const onSig = () => {
+    stopped = true; // execForeground's own handler cancels the in-flight run
+  };
+  process.on("SIGINT", onSig);
+  let recorded = 0;
+  for (const q of fresh) {
+    if (stopped) break;
+    const question: ForecastQuestion = {
+      text: q.title.slice(0, 500),
+      kind: "binary",
+      resolutionCriteria: (
+        `Resolves exactly as the source market resolves: ${q.url}` +
+        (q.criteria ? ` — market rules: ${q.criteria}` : "")
+      ).slice(0, 1000),
+      resolutionDate: q.closes,
+    };
+    const meta = createRun({
+      mission: `Forecast: ${q.title}`,
+      cwd: process.cwd(),
+      sandbox: true,
+      options: optionsFromConfig(cfg, {
+        // Tournament defaults: small cheap panels — volume over polish. Any
+        // explicit flag (--panel/--budget/--model/...) wins over these. The
+        // budget must survive a compact research wave + panel + red team;
+        // 2M starved real runs before the panel ever spawned.
+        maxTasks: Math.min(cfg.maxTasks, 16),
+        maxTokens: Math.min(cfg.maxTokensPerRun, 4_000_000),
+        ...(cfg.cheapModel ? { model: cfg.cheapModel } : {}),
+        panelSize: 3,
+        ...overrides,
+        mode: "forecast",
+        presetQuestion: question,
+        forecastOrigin: {
+          kind: "tournament",
+          platform: q.platform,
+          externalId: q.externalId,
+          url: q.url,
+          marketProbAtCreate: q.probability,
+        },
+      }),
+    });
+    console.log(`\n${ansi.cyan("forecasting")} ${ansi.gray(`[${q.platform}]`)} ${clipLine(q.title, 88)}`);
+    try {
+      await execForeground(cfg, meta, false);
+    } catch (e) {
+      console.error(ansi.red(`  run failed: ${errMsg(e)}`));
+      continue;
+    }
+    const entry = loadLedger().find((e) => e.runId === meta.id);
+    if (entry && typeof entry.aggregate.probability === "number") {
+      const p = Math.round(entry.aggregate.probability * 100);
+      const m = Math.round(q.probability * 100);
+      console.log(
+        `  ${ansi.green("✓")} swarm ${ansi.bold(`${p}%`)} vs market ${m}%  ${ansi.gray(`· ${entry.id} · resolves ${q.closes}`)}`
+      );
+      recorded++;
+    } else {
+      console.log(
+        `  ${ansi.yellow("∅ no aggregate recorded")} ${ansi.gray(`(${meta.id} — usually the budget died before the panel; inspect with: swarm watch ${meta.id}, or raise --budget)`)}`
+      );
+    }
+  }
+  process.off("SIGINT", onSig);
+  console.log(
+    `\n${ansi.bold(String(recorded))} forecast(s) recorded — resolve once due: swarm resolve` +
+      ansi.gray("  (cron-friendly batch: swarm tournament --auto)")
+  );
+  if (flags.auto && !stopped) {
+    console.log(ansi.cyan("\n--auto: resolving past-due forecasts…"));
+    await cmdResolve([]);
+  }
+}
+
 async function cmdResolve(rest: string[]): Promise<void> {
   const cfg = loadConfig();
   if (rest[0] === "set") {
-    const [, id, raw] = rest;
-    if (!id || raw === undefined) throw new Error("usage: swarm resolve set <id> yes|no|void|<value>");
+    const id = rest[1];
+    const raw = rest.slice(2).join(" ");
+    if (!id || !raw) throw new Error("usage: swarm resolve set <id> yes|no|void|never|<value>|<option>|<YYYY-MM-DD>");
     const entry = loadLedger().find((e) => e.id === id);
     if (!entry) throw new Error(`forecast not found: ${id}`);
     if (entry.resolution) throw new Error(`${id} is already resolved`);
-    let outcome: 0 | 1 | number | "void";
-    if (raw === "yes") outcome = 1;
-    else if (raw === "no") outcome = 0;
-    else if (raw === "void") outcome = "void";
-    else if (entry.question.kind === "numeric" && Number.isFinite(Number(raw))) outcome = Number(raw);
-    else throw new Error(`outcome must be yes | no | void${entry.question.kind === "numeric" ? " | <number>" : ""}`);
+    const kind = entry.question.kind;
+    let outcome: 0 | 1 | number | string | "void";
+    if (raw === "void") outcome = "void";
+    else if (kind === "binary" && raw === "yes") outcome = 1;
+    else if (kind === "binary" && raw === "no") outcome = 0;
+    else if (kind === "numeric" && Number.isFinite(Number(raw))) outcome = Number(raw);
+    else if (kind === "date" && raw === "never") outcome = "never";
+    else if (kind === "date" && ISO_DATE.test(raw) && isoToDays(raw) !== null) outcome = isoToDays(raw)!;
+    else if (kind === "mc") {
+      const match = (entry.question.options ?? []).find((o) => o.trim().toLowerCase() === raw.trim().toLowerCase());
+      if (!match) {
+        throw new Error(`outcome must be void or one of the question's options: ${(entry.question.options ?? []).join(" | ")}`);
+      }
+      outcome = match;
+    } else {
+      const hint =
+        kind === "numeric" ? "<number> | void" : kind === "date" ? "<YYYY-MM-DD> | never | void" : "yes | no | void";
+      throw new Error(`outcome must be ${hint}`);
+    }
     const rec = resolveLedgerEntry(entry, outcome, { evidence: "operator override", sources: [], resolvedBy: "operator" });
     console.log(
       ansi.green("✓ resolved ") + id + (rec.brier !== undefined ? ansi.gray(`  brier ${rec.brier.toFixed(3)}`) : "")
@@ -666,6 +886,47 @@ function cmdCalibration(): void {
     console.log(ansi.bold("\nby panel method") + ansi.gray("  (mean Brier per panelist method)"));
     for (const [m, s] of methods) console.log(`  ${m.padEnd(18)} ${s.brierMean.toFixed(3)}  ${ansi.gray(`n=${s.n}`)}`);
   }
+}
+
+/**
+ * Replay the resolved ledger under each aggregation strategy — the proof (or
+ * refutation) that each learned mechanism actually buys Brier. Deterministic,
+ * no tokens: learned parameters are fitted out-of-fold so a strategy can't
+ * grade its own homework.
+ */
+function cmdBacktest(): void {
+  const report = backtest(loadLedger());
+  if (!report.rows.length) {
+    console.log(
+      ansi.gray("no resolved binary forecasts with panels to replay — grow the ledger first: swarm tournament, then swarm resolve")
+    );
+    return;
+  }
+  const n = report.rows[0].n;
+  console.log(ansi.bold("backtest") + ansi.gray(`  (${n} resolved binary forecasts replayed; 95% CI by seeded bootstrap)`));
+  console.log(ansi.gray("  strategy                                          brier   [95% CI]        log loss"));
+  const best = Math.min(...report.rows.map((r) => r.brierMean));
+  for (const r of report.rows) {
+    const mark = r.brierMean === best ? ansi.green(" ◀ best") : "";
+    console.log(
+      `  ${r.config.padEnd(48)} ${r.brierMean.toFixed(4)}  [${r.brierLo.toFixed(4)}–${r.brierHi.toFixed(4)}]  ${r.logLossMean.toFixed(4)}${mark}`
+    );
+  }
+  if (report.vsMarket) {
+    const { n: vn, swarmBrier, marketBrier } = report.vsMarket;
+    const verdict =
+      swarmBrier < marketBrier
+        ? ansi.green(`the swarm BEAT the market by ${(marketBrier - swarmBrier).toFixed(4)} Brier`)
+        : ansi.yellow(`the market leads by ${(swarmBrier - marketBrier).toFixed(4)} Brier`);
+    console.log(
+      `\n  ${ansi.bold("vs market")} (tournament imports, n=${vn}): swarm ${swarmBrier.toFixed(4)} vs market-at-import ${marketBrier.toFixed(4)} — ${verdict}`
+    );
+  }
+  const sk = report.skipped;
+  if (sk.nonBinary || sk.noPanel) {
+    console.log(ansi.gray(`\n  skipped: ${sk.nonBinary} non-binary, ${sk.noPanel} without a usable panel`));
+  }
+  console.log(ansi.gray("  note: 'published headline' is what the engine actually said at the time; the other rows re-derive."));
 }
 
 // ---------------------------------------------------------------- config / models
@@ -834,10 +1095,21 @@ ${b("USAGE")}
   swarm watch <id>                    attach a live dashboard to a run
   swarm resume <id> [--fg]            resume an interrupted run (done tasks keep their results)
   swarm ls                            list runs
-  swarm forecasts [watch]             list the forecast ledger (watch: re-check update triggers)
+  swarm forecasts [watch] [--reforecast]
+                                      list the forecast ledger; watch re-checks update triggers,
+                                      --reforecast re-runs questions whose triggers fired (the new
+                                      forecast supersedes the stale one in the ledger)
+  swarm tournament [--count 10] [--close-within 14] [--source all] [--dry-run] [--auto]
+                                      batch-forecast open market questions (Manifold/Polymarket/
+                                      Kalshi/Metaculus) that close soon — grows the calibration
+                                      ledger fast; the source platform supplies the resolution.
+                                      --auto also resolves past-due forecasts (cron-friendly)
   swarm resolve [set <id> <outcome>]  resolve past-due forecasts & score them (Brier/log);
                                       set = operator override (yes|no|void|<value>)
   swarm calibration                   the system's track record: reliability table + per-method Brier
+  swarm backtest                      replay the resolved ledger under each aggregation strategy
+                                      (adaptive k, market anchor, recalibration — fitted out-of-fold)
+                                      and report Brier deltas + the swarm-vs-market skill line
   swarm report <id> [--open]          print (or open) a run's final report
   swarm note <id> "<text>"            steer a live run (the conductor reads it)
   swarm cancel <id>                   stop a run gracefully (still synthesizes)

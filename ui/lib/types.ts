@@ -22,7 +22,17 @@ export interface Usage {
 }
 
 export type RunMode = "research" | "forecast";
-export type ForecastKind = "binary" | "numeric";
+export type ForecastKind = "binary" | "numeric" | "mc" | "date";
+
+export interface Quantiles {
+  p5?: number;
+  p10: number;
+  p25?: number;
+  p50: number;
+  p75?: number;
+  p90: number;
+  p95?: number;
+}
 
 export interface ForecastQuestion {
   text: string;
@@ -30,6 +40,15 @@ export interface ForecastQuestion {
   resolutionCriteria: string;
   resolutionDate: string;
   unit?: string;
+  options?: string[];
+}
+
+export interface ForecastOrigin {
+  kind: "tournament";
+  platform: string;
+  externalId: string;
+  url: string;
+  marketProbAtCreate?: number;
 }
 
 export interface Forecast {
@@ -37,7 +56,9 @@ export interface Forecast {
   probability?: number;
   /** Base-rate prior committed before current evidence (binary). */
   prior?: number;
-  quantiles?: { p10: number; p50: number; p90: number };
+  quantiles?: Quantiles;
+  optionProbs?: Record<string, number>;
+  pNever?: number;
   rationale: string;
   baseRates?: string[];
   keyDrivers?: string[];
@@ -45,16 +66,38 @@ export interface Forecast {
   submittedAt: number;
 }
 
+export interface MarketAnchor {
+  platform: string;
+  url: string;
+  title?: string;
+  probability: number;
+  volume?: number;
+  weight: number;
+}
+
+/** Every layer of the aggregation chain, recorded so the UI can show the full derivation. */
+export interface AggregateComponents {
+  panelGmo?: number;
+  extremized?: number;
+  market?: MarketAnchor;
+  blended?: number;
+  recalibrated?: number;
+}
+
 export interface AggregateForecast {
   probability?: number;
   median?: number;
   gmo?: number;
   k: number;
-  quantiles?: { p10: number; p50: number; p90: number };
+  quantiles?: Quantiles;
+  optionProbs?: Record<string, number>;
+  pNever?: number;
+  logSpace?: boolean;
   n: number;
   spread: number;
   /** Mean pairwise source overlap of the panel [0,1] — extremization shrinks with it. */
   evidenceOverlap?: number;
+  components?: AggregateComponents;
 }
 
 export interface ForecastPanelist {
@@ -62,7 +105,10 @@ export interface ForecastPanelist {
   method: string;
   probability?: number;
   prior?: number;
-  quantiles?: { p10: number; p50: number; p90: number };
+  quantiles?: Quantiles;
+  optionProbs?: Record<string, number>;
+  pNever?: number;
+  weight?: number;
 }
 
 /** One ledger entry from /api/forecasts (created record + optional resolution). */
@@ -76,16 +122,19 @@ export interface LedgerEntry {
   panel: ForecastPanelist[];
   triggers?: string[];
   evidenceOverlap?: number;
+  origin?: ForecastOrigin;
+  supersedes?: string;
   resolution?: {
     id: string;
     t: number;
-    outcome: 0 | 1 | number | "void";
+    outcome: 0 | 1 | number | string | "void";
     evidence: string;
     sources: string[];
     resolvedBy: "swarm" | "operator";
     brier?: number;
     logScore?: number;
     intervalScore?: number;
+    pinball?: number;
   };
 }
 
