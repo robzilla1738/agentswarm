@@ -121,12 +121,13 @@ function sourcesLine(t: Task, max = 6): string {
 export function reportBlock(t: Task): string {
   const head = `── ${t.id} (${t.role}) "${clip(t.title, 60)}" → ${t.status.toUpperCase()}${t.attempt > 1 ? ` (attempt ${t.attempt})` : ""}`;
   const body = t.report ? clip(t.report, 1600) : t.error ? `error: ${clip(t.error, 400)}` : "(no report)";
+  const full = (t.report ?? "").length > 1600 ? `\n(excerpt — full text: read_report("${t.id}"))` : "";
   const facts = t.keyFacts?.length ? `\nkey facts:\n${t.keyFacts.map((f) => `  • ${clip(f, 200)}`).join("\n")}` : "";
   const open = t.openQuestions?.length ? `\nopen questions: ${t.openQuestions.map((q) => clip(q, 150)).join(" | ")}` : "";
   const files = t.filesTouched?.length ? `\nfiles touched: ${t.filesTouched.join(", ")}` : "";
   const arts = t.artifacts.length ? `\nartifacts: ${t.artifacts.join(", ")}` : "";
   const fb = t.feedback ? `\nverifier: ${clip(t.feedback, 300)}` : "";
-  return `${head}\n${body}${facts}${open}${files}${arts}${sourcesLine(t)}${fb}`;
+  return `${head}\n${body}${full}${facts}${open}${files}${arts}${sourcesLine(t)}${fb}`;
 }
 
 /**
@@ -328,6 +329,7 @@ Working directory: ${opts.meta.cwd}
 
 PROTOCOL
 - You may read files (read_file / list_dir) to confirm specifics before writing — verify key claims you repeat.
+- Task reports above marked '(excerpt — full text: read_report("…"))' were CLIPPED. Before writing any section that leans on such a task, call read_report(task_id) and work from the full text — the cut part is where the detail lives.
 - The mission's PRIMARY deliverable should exist in the format that serves it best, not only as prose. If the task reports produced data, comparisons, or rankings that the artifacts don't already capture in a structured form, save them now with save_artifact (e.g. data/results.csv, data/findings.json) before submitting. Don't duplicate artifacts that already exist — point to them.
 ${opts.sources ? `- CITE YOUR SOURCES: where a claim rests on a numbered source, cite it inline as [n]. End report_markdown with a \`## Sources\` section listing each number you actually cited as a markdown link ([n] [title](url)). Never invent a source or cite a number not in the list. Where sources conflict, present both positions with their citations — do not silently pick one.\n` : ""}- Then call submit_final with:
   • report_markdown — the deliverable document. Structure: # title; **Outcome** first (did the mission succeed, headline results); then What was built/found with evidence and exact paths; How to use/run it (if applicable); Open issues & recommended next steps. Write for the operator: complete, concrete, zero filler. Use real markdown tables for tabular findings, and \`\`\`chart fenced blocks (JSON: {"type":"line|bar|donut|stat",...} — series/labels for line+bar, segments for donut, items for stat cards) wherever a trend, split, or headline metric tells the story better than prose. Keep the formatting clean and minimal: plain ## section headings, no emoji, no decorative dividers or ALL-CAPS shouting, no nested bullet thickets — prose, tables, charts. (A styled HTML rendering is generated automatically — do not hand-write one.)

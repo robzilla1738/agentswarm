@@ -177,7 +177,7 @@ export const DEFAULTS: SwarmConfig = {
   idleTimeoutMs: 180_000,
   taskTimeoutMs: 1_200_000,
   contextTokenLimit: 120_000,
-  maxToolResultChars: 20_000,
+  maxToolResultChars: 50_000,
   hubPort: 7777,
   uiPort: 7780,
   pricing: DEFAULT_PRICING,

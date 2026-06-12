@@ -161,3 +161,11 @@ test("grep_files fails loudly on an invalid regex instead of reporting 'no match
 test("grep_files fails loudly on a nonexistent search path", async () => {
   await assert.rejects(() => tools.grep_files.run({ pattern: "x", path: "src/no-such-dir" }, ctx), /grep failed/);
 });
+
+test("synthToolset can recover full task reports via read_report", () => {
+  const { synthToolset } = require("../../dist/tools.js");
+  const synth = synthToolset();
+  assert.ok(synth.read_report, "synthesizer needs read_report — its prompt excerpts are clipped at 1600 chars");
+  assert.ok(synth.read_file && synth.list_dir && synth.save_artifact);
+  assert.ok(!synth.web_search && !synth.shell, "synthesis stays offline — research happens before it");
+});

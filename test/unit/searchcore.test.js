@@ -173,3 +173,23 @@ test("classifySource knows the scholarly hosts", () => {
   assert.equal(classify2("nature.com"), "academic");
   assert.equal(classify2("pubmed.ncbi.nlm.nih.gov"), "government", ".gov wins — same rank weight");
 });
+
+test("classifySource recognizes primary-source publishers (IGOs, registries, official stats)", () => {
+  assert.equal(classify2("who.int"), "primary");
+  assert.equal(classify2("data.worldbank.org"), "primary");
+  assert.equal(classify2("clinicaltrials.gov"), "primary", "the registry outranks generic .gov");
+  assert.equal(classify2("ec.europa.eu"), "primary");
+  assert.equal(classify2("nasa.gov"), "government", "generic .gov stays government");
+});
+
+test("classifySource catches non-US government TLDs", () => {
+  assert.equal(classify2("ons.gov.uk"), "government");
+  assert.equal(classify2("abs.gov.au"), "government");
+  assert.equal(classify2("statcan.gc.ca"), "government");
+});
+
+test("scorePage up-ranks a primary source over an equivalent secondary one", () => {
+  const { scorePage } = require("../../dist/searchcore.js");
+  const page = (domain) => ({ url: `https://${domain}/x`, domain, title: "t", text: "report data", date: undefined });
+  assert.ok(scorePage(page("who.int"), ["data"]) > scorePage(page("example.io"), ["data"]));
+});

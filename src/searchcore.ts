@@ -102,9 +102,35 @@ const ACADEMIC_HOSTS = [
   "ieee.org",
 ];
 
+/**
+ * Authoritative primary-source publishers that don't fall under .gov/.edu:
+ * IGOs, official statistics agencies, central banks, registries. These are
+ * the sources a research/forecasting engine should up-rank hardest.
+ */
+const PRIMARY_HOSTS = [
+  "who.int",
+  "un.org",
+  "imf.org",
+  "worldbank.org",
+  "oecd.org",
+  "wto.org",
+  "europa.eu", // EC, ECB, Eurostat, ECDC, data.europa.eu
+  "iea.org",
+  "bis.org",
+  "ilo.org",
+  "fao.org",
+  "clinicaltrials.gov", // the registry itself, more specific than generic .gov
+  "sec.gov", // EDGAR filings
+  "federalregister.gov",
+];
+
+/** Non-US government TLD patterns that `.gov`/`.mil` alone miss. */
+const GOV_SUFFIXES = [".gov", ".mil", ".gov.uk", ".gov.au", ".gc.ca", ".go.jp", ".gouv.fr"];
+
 export function classifySource(domain: string): SourceType {
   const d = domain.toLowerCase();
-  if (d.endsWith(".gov") || d.endsWith(".mil")) return "government";
+  if (PRIMARY_HOSTS.some((h) => d === h || d.endsWith("." + h))) return "primary";
+  if (GOV_SUFFIXES.some((s) => d.endsWith(s))) return "government";
   if (d.endsWith(".edu")) return "academic";
   if (ACADEMIC_HOSTS.some((h) => d === h || d.endsWith("." + h))) return "academic";
   if (["twitter.com", "x.com", "reddit.com", "facebook.com"].some((s) => d.includes(s))) return "social";

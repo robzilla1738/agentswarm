@@ -347,7 +347,7 @@ export function chooseMarketWeight(entries = loadLedger(), fallback = DEFAULT_MA
   if (usable.length < MIN_MARKET_WEIGHT_N) return fallback;
   let bestW = fallback;
   let bestLoss = Infinity;
-  for (let i = 0; i <= 9; i++) {
+  for (let i = 0; i <= 10; i++) {
     const w = i / 10;
     let sum = 0;
     for (const e of usable) {
@@ -1003,7 +1003,7 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-function bootstrapCi(values: number[], b = 1000, seed = 1738): { lo: number; hi: number } {
+export function bootstrapCi(values: number[], b = 1000, seed = 1738): { lo: number; hi: number } {
   if (values.length < 2) return { lo: values[0] ?? 0, hi: values[0] ?? 0 };
   const rand = mulberry32(seed);
   const means: number[] = [];
@@ -1013,7 +1013,10 @@ function bootstrapCi(values: number[], b = 1000, seed = 1738): { lo: number; hi:
     means.push(sum / values.length);
   }
   means.sort((a, c) => a - c);
-  return { lo: means[Math.floor(b * 0.025)], hi: means[Math.floor(b * 0.975)] };
+  // 2.5th/97.5th percentile of b sorted samples: indices round(b·α)−1, 0-based.
+  const lo = Math.max(0, Math.round(b * 0.025) - 1);
+  const hi = Math.min(means.length - 1, Math.round(b * 0.975) - 1);
+  return { lo: means[lo], hi: means[hi] };
 }
 
 interface BacktestEntry {

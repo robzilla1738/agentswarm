@@ -619,7 +619,9 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
     run: async (args, ctx) => {
       const url = String(args.url);
       if (!/^https?:\/\//.test(url)) throw new Error("only http(s) URLs are supported");
-      return fetchUrl(ctx.cfg, url, Boolean(args.raw), 60_000, ctx.signal, (m) => ctx.log?.("warn", m));
+      // Truncate once, here, to the agent-loop cap — a larger cap would just be
+      // middle-cut a second time at agent.ts's maxToolResultChars clamp.
+      return fetchUrl(ctx.cfg, url, Boolean(args.raw), ctx.cfg.maxToolResultChars, ctx.signal, (m) => ctx.log?.("warn", m));
     },
   };
 
@@ -852,6 +854,9 @@ export function synthToolset(): Record<string, ToolDef> {
     read_file: all.read_file,
     list_dir: all.list_dir,
     save_artifact: all.save_artifact,
+    // Task report excerpts in the synth prompt are clipped at 1600 chars;
+    // read_report is how the synthesizer recovers the full text.
+    read_report: all.read_report,
   };
 }
 

@@ -512,9 +512,9 @@ test("chooseMarketWeight falls back below the minimum sample", () => {
 });
 
 test("chooseMarketWeight learns to trust a market that keeps being right", () => {
-  // Panel stuck at 50%, market confidently right every time → max grid weight.
+  // Panel stuck at 50%, market confidently right every time → full deference (w=1.0).
   const entries = Array.from({ length: 30 }, (_, i) => anchoredEntry(0.5, i % 2 ? 0.9 : 0.1, i % 2 ? 1 : 0));
-  assert.equal(chooseMarketWeight(entries, DEFAULT_MARKET_WEIGHT), 0.9);
+  assert.equal(chooseMarketWeight(entries, DEFAULT_MARKET_WEIGHT), 1.0);
 });
 
 test("chooseMarketWeight learns to ignore a market that keeps being wrong", () => {
@@ -942,6 +942,22 @@ test("supersede chains: ids carry through the ledger and mark the stale link", (
   assert.equal(entries.find((e) => e.id === "f_new").supersedes, "f_old");
   const superseded = supersededIds(entries);
   assert.ok(superseded.has("f_old") && !superseded.has("f_new"));
+});
+
+// ---------------------------------------------------------------- bootstrap CI
+
+test("bootstrapCi uses the exact percentile indices of the sorted bootstrap means", () => {
+  const { bootstrapCi } = require("../../dist/forecast.js");
+  const values = Array.from({ length: 50 }, (_, i) => i / 49); // mean 0.5, real spread
+  const ci = bootstrapCi(values);
+  const ci2 = bootstrapCi(values);
+  assert.deepEqual(ci, ci2, "seeded → deterministic");
+  assert.ok(ci.lo < 0.5 && 0.5 < ci.hi, "CI brackets the true mean");
+  // The 95% CI of a mean over 50 uniform values is tight — both ends well inside the data range.
+  assert.ok(ci.lo > 0.3 && ci.hi < 0.7);
+  // Degenerate input degrades, never throws.
+  assert.deepEqual(bootstrapCi([0.4]), { lo: 0.4, hi: 0.4 });
+  assert.deepEqual(bootstrapCi([]), { lo: 0, hi: 0 });
 });
 
 test.after(() => {

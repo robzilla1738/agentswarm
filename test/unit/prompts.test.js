@@ -38,6 +38,13 @@ test("reportBlock includes structured handoff fields", () => {
   assert.ok(block.includes("kf") && block.includes("oq") && block.includes("f.ts"));
 });
 
+test("reportBlock marks clipped reports with the read_report hint", () => {
+  const long = { ...baseTask, report: "x".repeat(5000) };
+  assert.ok(reportBlock(long).includes('read_report("T1")'));
+  const short = { ...baseTask, report: "short and sweet" };
+  assert.ok(!reportBlock(short).includes("read_report"));
+});
+
 test("budgetLine escalates urgency near the cap", () => {
   assert.ok(!budgetLine({ total: 10, cost: 0 }, 100).includes("WIND DOWN"));
   assert.ok(budgetLine({ total: 80, cost: 0 }, 100).includes("tightening"));
