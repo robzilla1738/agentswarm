@@ -24,6 +24,7 @@ export function optionsFromConfig(cfg: SwarmConfig, overrides: Partial<RunOption
     maxStepsPerTask: cfg.maxStepsPerTask,
     maxTasks: cfg.maxTasks,
     maxTokens: cfg.maxTokensPerRun,
+    taskTimeoutMs: cfg.taskTimeoutMs,
     verification: cfg.verification,
     thinking: cfg.thinking,
     reasoningEffort: cfg.reasoningEffort,

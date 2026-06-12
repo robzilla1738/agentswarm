@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.10.0
+
+### 256-agent swarms, honestly capped everywhere
+- Parallel-agent ceiling raised to **256** and made consistent across every entry point: the config range, the settings UI, the mission launch form, and the hub's per-run option sanitizer (which was silently clamping UI-launched runs to 32 regardless of config).
+- **Fixed a run-hanging bug**: `--workers abc` (or any non-numeric `--workers/--steps/--tasks/--budget`) coerced to NaN, which made the scheduler's `active < maxWorkers` check permanently false — the run started but no task ever ran. Numeric flags are now validated against the config ranges: garbage errors out immediately, out-of-range values clamp.
+- Team sub-swarms: default size ceiling raised 16→32 (half the parent's cap), and an explicitly requested `team_max_workers` is now clamped to the parent run's `maxWorkers`. Both worker and budget clamps journal a visible warning with requested → granted numbers instead of adjusting silently.
+
+### Orchestration hardening
+- **Per-task wall-clock timeout** (`taskTimeoutMs` config, default 20 min, range 1 min–24 h): a hung shell command or stalled fetch now fails that attempt cleanly — journaled, retryable through the normal retry pipeline — instead of stalling the run until the operator cancels. Timeouts abort only the attempt; run cancellation is tracked separately and never confused with one.
+- **Synthesis budget reserve**: scheduling and retries now stop while ~3% of the token cap (30K–120K) is still unspent, so the final report is composed inside the budget instead of blowing past it. The budget-reached log line states the reserve.
+- **Synthesis retries**: a failed synthesizer call is retried once before falling back to the lossy task-summary report, and an empty report triggers one explicit re-ask.
+- AIMD call gate can now floor at 1 concurrent call (was 2 — providers with a strict limit of 1 caused permanent 429 storms), and 429 `Retry-After` cooldowns are honored up to 5 minutes (was 60 s).
+
+### Claims made true
+- `academic_search` can now actually return 40 results: arXiv and Crossref per-source caps raised 15→20 each (the tool advertised "max 40" but could never exceed 30).
+- SETTINGS_UI_GUIDE numeric limits section corrected (it misstated all four defaults).
+
 ## 0.9.0
 
 ### context.dev: fixed scrape endpoint + new search engine

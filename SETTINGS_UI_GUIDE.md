@@ -145,16 +145,16 @@ Click "Test sandbox" to verify execution works. Shows which runtime is active.
 **Section**: (top of settings)
 
 ### Fields:
-- **Agents in parallel**: 1-32 (default 10)
+- **Agents in parallel**: 1-256 (default 6)
   - How many researchers/workers run at once
   
-- **Task limit**: 1-1000 (default 100)
+- **Task limit**: 1-1000 (default 200)
   - Max tasks per mission before auto-stop
   
-- **Steps per task**: 3-200 (default 50)
+- **Steps per task**: 3-200 (default 30)
   - Tool calls allowed per task before timeout
   
-- **Token budget**: 50K - 2B (default 100K)
+- **Token budget**: 50K - 2B (default 12M)
   - Spend cap per mission, stops early if hit
 
 ---

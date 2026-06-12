@@ -42,7 +42,7 @@ import { aggregateSources, renderFinalHtml, sourcesBlock } from "./report";
 import { SandboxRuntime, createSandbox } from "./sandbox";
 import { RunState } from "./state";
 import { RunMeta, RunStatus, Task, TaskSpec, Usage, usageCost } from "./types";
-import { canonicalArtifactRel, clip, ensureDir, errMsg, oneLine, rid, sleep, truncateMiddle, validateArtifactFormat } from "./util";
+import { canonicalArtifactRel, clip, ensureDir, errMsg, oneLine, rid, sleep, truncateMiddle, validateArtifactFormat, withTimeout } from "./util";
 
 
 export interface ExecutorOptions {
@@ -74,6 +74,20 @@ export interface SwarmNote {
   kind?: string;
   text: string;
   url?: string;
+}
+
+/**
+ * Tokens held back from the schedulable budget so synthesis always has
+ * headroom: 3% of the cap clamped to [30K, 120K] for root runs, a flat 8K for
+ * teams (their finale is a single consolidation call) — but never more than a
+ * quarter of the cap, so a deliberately tiny budget still schedules real work.
+ * Exported for tests.
+ */
+export function synthReserve(cap: number, mode: "root" | "team"): number {
+  if (cap <= 0) return 0;
+  const quarter = Math.floor(cap / 4);
+  if (mode === "team") return Math.min(8_000, quarter);
+  return Math.min(quarter, Math.min(120_000, Math.max(30_000, Math.floor(cap * 0.03))));
 }
 
 export class Executor {
@@ -215,8 +229,17 @@ export class Executor {
     }
   };
 
+  private synthReserveTokens(): number {
+    return synthReserve(this.meta.options.maxTokens, this.mode);
+  }
+
+  /**
+   * "Exhausted" leaves a reserve for synthesis: scheduling and retries stop
+   * while there is still headroom to compose the final report, so a run that
+   * hits its cap ends with a deliverable instead of a budget error mid-synth.
+   */
   private budgetExceeded(): boolean {
-    return this.spentTokens >= this.meta.options.maxTokens;
+    return this.spentTokens >= this.meta.options.maxTokens - this.synthReserveTokens();
   }
 
   private blackboardDigest(max = 1800): string {
@@ -416,20 +439,40 @@ export class Executor {
   /** Run a team:true task as a sub-swarm sharing this run's everything. */
   private async runTeam(task: Task): Promise<void> {
     const remaining = Math.max(0, this.meta.options.maxTokens - this.spentTokens);
+    // A conductor-requested team size is honored but never above the run's own
+    // parallelism cap; the default is half the parent, ceilinged at 32.
+    const defaultWorkers = Math.max(2, Math.min(32, Math.floor(this.meta.options.maxWorkers / 2)));
+    const workers = Math.min(task.teamMaxWorkers || defaultWorkers, this.meta.options.maxWorkers);
     const childMeta: RunMeta = {
       ...this.meta,
       mission: `${task.objective}${task.context ? `\n\nContext from the parent conductor:\n${task.context}` : ""}`,
       options: {
         ...this.meta.options,
-        maxWorkers: task.teamMaxWorkers || Math.max(2, Math.min(16, Math.floor(this.meta.options.maxWorkers / 2))),
+        maxWorkers: workers,
         maxTokens: Math.min(remaining, task.teamBudgetTokens || Math.max(50_000, Math.floor(remaining / 4))),
         maxTasks: Math.min(this.meta.options.maxTasks, 24),
       },
     };
+    // Clamps are visible, not silent: the operator should know when a team got
+    // less than the conductor asked for, and why.
+    if (task.teamMaxWorkers && workers < task.teamMaxWorkers) {
+      this.journal.append("log", {
+        level: "warn",
+        msg: `${task.id}: team workers clamped ${task.teamMaxWorkers} → ${workers} (run maxWorkers)`,
+      });
+    }
+    if (task.teamBudgetTokens && childMeta.options.maxTokens < task.teamBudgetTokens) {
+      this.journal.append("log", {
+        level: "warn",
+        msg: `${task.id}: team budget clamped ${task.teamBudgetTokens} → ${childMeta.options.maxTokens} (remaining run budget)`,
+      });
+    }
     this.journal.append("team.created", {
       taskId: task.id,
       maxWorkers: childMeta.options.maxWorkers,
       budgetTokens: childMeta.options.maxTokens,
+      requestedWorkers: task.teamMaxWorkers,
+      requestedBudget: task.teamBudgetTokens,
     });
     const child = new Executor(this.cfg, childMeta, new TeamJournal(this.journal, task.id), {
       mode: "team",
@@ -473,6 +516,13 @@ export class Executor {
         if (this.budgetExceeded()) {
           this.finishing = true;
           this.finishReason = "token budget reached";
+          const reserve = this.synthReserveTokens();
+          if (reserve > 0) {
+            this.journal.append("log", {
+              level: "info",
+              msg: `token budget reached — winding down with ~${Math.round(reserve / 1000)}K tokens reserved for synthesis`,
+            });
+          }
           break;
         }
         if (this.journal.degraded) {
@@ -1053,7 +1103,7 @@ export class Executor {
       .join("\n\n");
   }
 
-  private makeToolCtx(agentId: string, task: Task | null): ToolCtx {
+  private makeToolCtx(agentId: string, task: Task | null, signal: AbortSignal = this.ac.signal): ToolCtx {
     return {
       cfg: this.cfg,
       meta: this.meta,
@@ -1062,7 +1112,7 @@ export class Executor {
       sandbox: this.sandbox,
       agentId,
       taskId: task?.id,
-      signal: this.ac.signal,
+      signal,
       addCheckpoint: task ? (summary) => this.recordCheckpoint(task, agentId, summary) : undefined,
       addNote: (text, key, kind, url) => {
         this.notes.push({ taskId: task?.id, teamId: this.teamId, key, kind, text, url });
@@ -1211,25 +1261,49 @@ export class Executor {
       purpose: task.title,
     });
 
-    const outcome = await runAgent({
-      cfg: this.cfg,
-      agentId,
-      model,
-      thinking: this.meta.options.thinking,
-      reasoningEffort: this.meta.options.reasoningEffort,
-      system,
-      kickoff: WORKER_KICKOFF,
-      tools: workerToolset(this.cfg),
-      terminal: [REPORT_TOOL],
-      maxSteps: this.meta.options.maxStepsPerTask,
-      signal: this.ac.signal,
-      ctx: this.makeToolCtx(agentId, task),
-      hooks: {
-        ...this.agentHooks(agentId, task.id, task),
-        onCheckpoint: (summary: string) => this.recordCheckpoint(task, agentId, summary),
-      },
-      stop: this.agentStop,
-    });
+    // Per-attempt wall clock: a hung shell or stalled fetch aborts only this
+    // attempt — run cancellation still flows through this.ac and is checked
+    // separately below, so a timeout is never mistaken for a cancelled run.
+    const timeoutMs = this.meta.options.taskTimeoutMs ?? 1_200_000;
+    const deadline = withTimeout(this.ac.signal, timeoutMs);
+    let outcome: Awaited<ReturnType<typeof runAgent>>;
+    try {
+      outcome = await runAgent({
+        cfg: this.cfg,
+        agentId,
+        model,
+        thinking: this.meta.options.thinking,
+        reasoningEffort: this.meta.options.reasoningEffort,
+        system,
+        kickoff: WORKER_KICKOFF,
+        tools: workerToolset(this.cfg),
+        terminal: [REPORT_TOOL],
+        maxSteps: this.meta.options.maxStepsPerTask,
+        signal: deadline.signal,
+        ctx: this.makeToolCtx(agentId, task, deadline.signal),
+        hooks: {
+          ...this.agentHooks(agentId, task.id, task),
+          onCheckpoint: (summary: string) => this.recordCheckpoint(task, agentId, summary),
+        },
+        stop: this.agentStop,
+      });
+    } catch (e) {
+      if (deadline.timedOut() && !this.ac.signal.aborted) {
+        this.flushDeltas(agentId);
+        this.journal.append("agent.done", { agentId, taskId: task.id, steps: 0, timedOut: true });
+        this.journal.append("log", {
+          level: "warn",
+          msg: `${task.id}: attempt ${task.attempt} timed out after ${Math.round(timeoutMs / 60_000)} min of wall-clock time`,
+          agentId,
+          taskId: task.id,
+        });
+        task.error = `task timed out after ${Math.round(timeoutMs / 60_000)} min of wall-clock time`;
+        return "retry";
+      }
+      throw e;
+    } finally {
+      deadline.dispose();
+    }
     this.flushDeltas(agentId);
     this.journal.append("agent.done", { agentId, taskId: task.id, steps: outcome.steps });
 
@@ -1816,41 +1890,56 @@ export class Executor {
     };
     try {
       await synthOnce();
-      // Strict mode: check the final report's claims against the task reports
-      // (the ground truth) and re-synthesize once if it misrepresents them.
-      if (this.cfg.verification === "strict" && reportMarkdown.trim() && tasks.length) {
-        try {
-          const res = await chat(this.cfg, {
-            model: this.meta.options.conductorModel,
-            messages: [
-              {
-                role: "user",
-                content: synthCheckPrompt(
-                  this.meta.mission,
-                  truncateMiddle(reports, 60_000, "chars"),
-                  truncateMiddle(reportMarkdown, 60_000, "chars"),
-                  sourcesText ? truncateMiddle(sourcesText, 20_000, "chars") : undefined
-                ),
-              },
-            ],
-            thinking: false,
-            maxTokens: 2048,
-            signal: new AbortController().signal,
-          });
-          this.onUsage(this.meta.options.conductorModel, res.usage);
-          const check = (res.content || "").trim();
-          if (check && !/^OK\b/i.test(check)) {
-            this.journal.append("log", { level: "warn", msg: `synthesis check found discrepancies:\n${clip(check, 1500)}` });
-            await synthOnce(
-              `A faithfulness review of your previous draft found these discrepancies — fix them, claiming only what the task reports support:\n${clip(check, 2000)}`
-            );
-          }
-        } catch (e) {
-          this.journal.append("log", { level: "warn", msg: `synthesis check failed: ${errMsg(e)}` });
-        }
-      }
     } catch (e) {
-      this.journal.append("log", { level: "error", msg: `synthesis failed: ${errMsg(e)}` });
+      // The whole run's work funnels through this one call — a transient
+      // failure here must not collapse everything into the lossy fallback.
+      this.journal.append("log", { level: "warn", msg: `synthesis failed (will retry once): ${errMsg(e)}` });
+      try {
+        await synthOnce();
+      } catch (e2) {
+        this.journal.append("log", { level: "error", msg: `synthesis retry failed: ${errMsg(e2)}` });
+      }
+    }
+    if (!reportMarkdown.trim() && tasks.length) {
+      // Succeeded-but-empty is the other path into the fallback; ask once more.
+      try {
+        await synthOnce("Your previous attempt returned an empty report. Produce the full final report now.");
+      } catch (e) {
+        this.journal.append("log", { level: "warn", msg: `empty-report synthesis retry failed: ${errMsg(e)}` });
+      }
+    }
+    // Strict mode: check the final report's claims against the task reports
+    // (the ground truth) and re-synthesize once if it misrepresents them.
+    if (this.cfg.verification === "strict" && reportMarkdown.trim() && tasks.length) {
+      try {
+        const res = await chat(this.cfg, {
+          model: this.meta.options.conductorModel,
+          messages: [
+            {
+              role: "user",
+              content: synthCheckPrompt(
+                this.meta.mission,
+                truncateMiddle(reports, 60_000, "chars"),
+                truncateMiddle(reportMarkdown, 60_000, "chars"),
+                sourcesText ? truncateMiddle(sourcesText, 20_000, "chars") : undefined
+              ),
+            },
+          ],
+          thinking: false,
+          maxTokens: 2048,
+          signal: new AbortController().signal,
+        });
+        this.onUsage(this.meta.options.conductorModel, res.usage);
+        const check = (res.content || "").trim();
+        if (check && !/^OK\b/i.test(check)) {
+          this.journal.append("log", { level: "warn", msg: `synthesis check found discrepancies:\n${clip(check, 1500)}` });
+          await synthOnce(
+            `A faithfulness review of your previous draft found these discrepancies — fix them, claiming only what the task reports support:\n${clip(check, 2000)}`
+          );
+        }
+      } catch (e) {
+        this.journal.append("log", { level: "warn", msg: `synthesis check failed: ${errMsg(e)}` });
+      }
     }
 
     if (!reportMarkdown.trim()) {

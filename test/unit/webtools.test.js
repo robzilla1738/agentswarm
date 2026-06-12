@@ -174,6 +174,26 @@ test("crossrefSearch parses works JSON", async () => {
   assert.equal(out[0].snippet, "Journal of AI");
 });
 
+test("academic engines request 20 per source so the tool's max-40 claim holds", async () => {
+  _resetEngineCooldowns();
+  const fa = stubFetch(() => ({ body: `<?xml version="1.0"?><feed></feed>` }));
+  await arxivSearch("swarms", 40);
+  fa.restore();
+  assert.match(fa.calls[0].url, /max_results=20/, "arXiv cap is 20 at count 40");
+
+  _resetEngineCooldowns();
+  const fb = stubFetch(() => ({ body: JSON.stringify({ message: { items: [] } }) }));
+  await crossrefSearch("swarms", 40);
+  fb.restore();
+  assert.match(fb.calls[0].url, /rows=20/, "Crossref cap is 20 at count 40");
+
+  _resetEngineCooldowns();
+  const fc = stubFetch(() => ({ body: `<?xml version="1.0"?><feed></feed>` }));
+  await arxivSearch("swarms", 5);
+  fc.restore();
+  assert.match(fc.calls[0].url, /max_results=5/, "smaller asks pass through unchanged");
+});
+
 test("one engine answering empty while another fails is 'no results', not an error", async () => {
   _resetEngineCooldowns();
   // DDG answers cleanly with zero parseable hits; Bing 500s. A worker must

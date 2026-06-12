@@ -35,6 +35,33 @@ export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+/**
+ * Per-attempt deadline: a child signal that aborts when the parent aborts or
+ * after ms (0 disables the timer). Unlike mergeSignal, the caller can tell a
+ * deadline apart from a parent abort via timedOut(). Always dispose() so the
+ * timer and parent listener don't outlive the attempt.
+ */
+export function withTimeout(
+  parent: AbortSignal,
+  ms: number
+): { signal: AbortSignal; timedOut: () => boolean; dispose: () => void } {
+  const ac = new AbortController();
+  let timedOut = false;
+  const onAbort = () => ac.abort();
+  if (parent.aborted) ac.abort();
+  else parent.addEventListener("abort", onAbort, { once: true });
+  const timer = ms > 0 ? setTimeout(() => { timedOut = true; ac.abort(); }, ms) : null;
+  timer?.unref?.();
+  return {
+    signal: ac.signal,
+    timedOut: () => timedOut,
+    dispose: () => {
+      if (timer) clearTimeout(timer);
+      parent.removeEventListener("abort", onAbort);
+    },
+  };
+}
+
 /** A timeout signal, combined with the caller's signal when one is given. */
 export function mergeSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
   const t = AbortSignal.timeout(timeoutMs);

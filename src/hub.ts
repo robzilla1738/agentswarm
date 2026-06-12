@@ -508,10 +508,11 @@ function sanitizeOptions(raw: unknown): Partial<RunOptions> {
   };
   if (typeof o.model === "string" && o.model.trim()) out.model = o.model.trim();
   if (typeof o.conductorModel === "string" && o.conductorModel.trim()) out.conductorModel = o.conductorModel.trim();
-  num("maxWorkers", 1, 32);
+  num("maxWorkers", 1, 256);
   num("maxStepsPerTask", 3, 200);
   num("maxTasks", 1, 1000);
   num("maxTokens", 50_000, 2_000_000_000);
+  num("taskTimeoutMs", 60_000, 86_400_000);
   if (o.verification === "off" || o.verification === "normal" || o.verification === "strict") {
     out.verification = o.verification;
   }

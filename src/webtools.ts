@@ -405,7 +405,7 @@ export async function bingSearch(query: string, count: number, signal?: AbortSig
 
 /** arXiv's Atom API — preprints with abstracts, no key needed. */
 export async function arxivSearch(query: string, count: number, signal?: AbortSignal): Promise<Candidate[]> {
-  const url = `https://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(query)}&max_results=${Math.min(count, 15)}`;
+  const url = `https://export.arxiv.org/api/query?search_query=all:${encodeURIComponent(query)}&max_results=${Math.min(count, 20)}`;
   const res = await engineFetch("arxiv", url, { headers: { "user-agent": UA } }, signal);
   if (!res.ok) throw new Error(`arxiv search ${res.status}`);
   const xml = await res.text();
@@ -424,7 +424,7 @@ export async function arxivSearch(query: string, count: number, signal?: AbortSi
 
 /** Crossref's works API — journal/conference metadata with DOIs, no key needed. */
 export async function crossrefSearch(query: string, count: number, signal?: AbortSignal): Promise<Candidate[]> {
-  const url = `https://api.crossref.org/works?query=${encodeURIComponent(query)}&rows=${Math.min(count, 15)}&select=title,DOI,abstract,issued,container-title`;
+  const url = `https://api.crossref.org/works?query=${encodeURIComponent(query)}&rows=${Math.min(count, 20)}&select=title,DOI,abstract,issued,container-title`;
   const res = await engineFetch("crossref", url, { headers: { "user-agent": UA } }, signal);
   if (!res.ok) throw new Error(`crossref search ${res.status}`);
   const data: any = await res.json();

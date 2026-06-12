@@ -183,10 +183,10 @@ export class CallGate {
   }
 
   reportRateLimit(retryAfterMs?: number): void {
-    this.ceiling = Math.max(2, Math.floor(this.ceiling / 2));
+    this.ceiling = Math.max(1, Math.floor(this.ceiling / 2));
     this.successes = 0;
     if (retryAfterMs && retryAfterMs > 0) {
-      this.cooldownUntil = Math.max(this.cooldownUntil, Date.now() + Math.min(retryAfterMs, 60_000));
+      this.cooldownUntil = Math.max(this.cooldownUntil, Date.now() + Math.min(retryAfterMs, 300_000));
     }
     this.onState?.(this.state());
   }

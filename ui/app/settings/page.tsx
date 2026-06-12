@@ -8,7 +8,7 @@ import { api, ProviderView } from "@/lib/api";
 import { useConfig } from "@/lib/hooks";
 
 const NUM_FIELDS: { key: string; label: string; min: number; max: number; hint?: string }[] = [
-  { key: "maxWorkers", label: "Agents in parallel", min: 1, max: 32 },
+  { key: "maxWorkers", label: "Agents in parallel", min: 1, max: 256 },
   { key: "maxTasks", label: "Task limit", min: 1, max: 1000 },
   { key: "maxStepsPerTask", label: "Steps per task", min: 3, max: 200 },
   { key: "maxTokensPerRun", label: "Token budget", min: 50_000, max: 2_000_000_000 },

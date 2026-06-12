@@ -169,3 +169,22 @@ test("isSecretConfigKey covers nested provider creds", () => {
     else process.env.AGENTSWARM_HOME = prevHome;
   }
 });
+
+test("maxWorkers range honors the 256 ceiling, taskTimeoutMs is settable", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-cfg-"));
+  const prevHome = process.env.AGENTSWARM_HOME;
+  try {
+    const { coerceConfigValue, SETTABLE_KEYS, DEFAULTS } = freshConfig(home);
+    assert.equal(coerceConfigValue("maxWorkers", 256), 256);
+    assert.equal(coerceConfigValue("maxWorkers", 999), 256, "out-of-range clamps to the ceiling");
+    assert.equal(coerceConfigValue("maxWorkers", 0), 1, "floor stays at 1");
+    assert.throws(() => coerceConfigValue("maxWorkers", "abc"), /must be a number/);
+    assert.ok(SETTABLE_KEYS.includes("taskTimeoutMs"), "taskTimeoutMs is operator-settable");
+    assert.equal(DEFAULTS.taskTimeoutMs, 1_200_000);
+    assert.equal(coerceConfigValue("taskTimeoutMs", 1_000), 60_000, "clamps to the 1-minute floor");
+    assert.equal(coerceConfigValue("taskTimeoutMs", 99_999_999_999), 86_400_000, "clamps to the 24-hour ceiling");
+  } finally {
+    if (prevHome === undefined) delete process.env.AGENTSWARM_HOME;
+    else process.env.AGENTSWARM_HOME = prevHome;
+  }
+});

@@ -64,6 +64,8 @@ export interface SwarmConfig {
   maxConcurrentCalls: number;
   requestTimeoutMs: number;
   idleTimeoutMs: number;
+  /** Wall-clock cap per worker attempt; a hung shell or stalled page fetch fails the attempt cleanly and the task retries. */
+  taskTimeoutMs: number;
   /** Per-agent context size (est. tokens) that triggers compaction. */
   contextTokenLimit: number;
   maxToolResultChars: number;
@@ -147,6 +149,7 @@ export const DEFAULTS: SwarmConfig = {
   maxConcurrentCalls: 16,
   requestTimeoutMs: 900_000,
   idleTimeoutMs: 180_000,
+  taskTimeoutMs: 1_200_000,
   contextTokenLimit: 120_000,
   maxToolResultChars: 20_000,
   hubPort: 7777,
@@ -340,6 +343,7 @@ export const SETTABLE_KEYS: (keyof SwarmConfig)[] = [
   "vercelTeamId",
   "vercelProjectId",
   "maxConcurrentCalls",
+  "taskTimeoutMs",
   "contextTokenLimit",
   "hubPort",
   "uiPort",
@@ -347,12 +351,13 @@ export const SETTABLE_KEYS: (keyof SwarmConfig)[] = [
 
 /** Allowed ranges for numeric settings (values are clamped, not rejected). */
 const NUM_RANGES: Partial<Record<keyof SwarmConfig, [number, number]>> = {
-  maxWorkers: [1, 128],
+  maxWorkers: [1, 256],
   maxConcurrentCalls: [1, 256],
   maxStepsPerTask: [3, 200],
   maxTasks: [1, 1000],
   verifyMaxAttempts: [1, 5],
   maxTokensPerRun: [50_000, 2_000_000_000],
+  taskTimeoutMs: [60_000, 86_400_000],
   contextTokenLimit: [8_000, 900_000],
   hubPort: [0, 65535],
   uiPort: [0, 65535],

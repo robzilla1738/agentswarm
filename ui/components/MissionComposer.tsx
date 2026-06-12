@@ -105,7 +105,7 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
         sandbox: workspace === "sandbox",
         ...(workspace === "dir" ? { cwd: cwd.trim() } : {}),
         options: {
-          maxWorkers: clamp(workers, 1, 32, 6),
+          maxWorkers: clamp(workers, 1, 256, 6),
           maxTasks: clamp(tasks, 1, 1000, 48),
           maxStepsPerTask: clamp(steps, 3, 200, 30),
           maxTokens: clamp(budgetM * 1e6, 50_000, 2_000_000_000, 12_000_000),
@@ -191,7 +191,7 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
 
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-3" onInput={markTouched}>
             <Field label="Agents in parallel" hint="working at once">
-              <input type="number" className="input" min={1} max={32} value={workers} onChange={(e) => setWorkers(+e.target.value)} />
+              <input type="number" className="input" min={1} max={256} value={workers} onChange={(e) => setWorkers(+e.target.value)} />
             </Field>
             <Field label="Task limit" hint="whole run">
               <input type="number" className="input" min={1} max={1000} value={tasks} onChange={(e) => setTasks(+e.target.value)} />

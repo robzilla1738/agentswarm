@@ -49,7 +49,9 @@ test("CallGate enforces ceiling and AIMD on 429", async () => {
   assert.equal(third, true);
 
   gate.reportRateLimit(0);
-  assert.equal(gate.state().ceiling, 2, "429 halves toward the floor of 2");
+  assert.equal(gate.state().ceiling, 1, "429 halves toward the floor of 1");
+  for (let i = 0; i < 10; i++) gate.reportSuccess();
+  assert.equal(gate.state().ceiling, 2, "gate recovers from a ceiling of 1");
   const big = new CallGate(16);
   big.reportRateLimit(0);
   assert.equal(big.state().ceiling, 8);

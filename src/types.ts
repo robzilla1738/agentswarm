@@ -32,6 +32,8 @@ export interface RunOptions {
   maxTasks: number;
   /** Run-wide token budget (prompt + completion across every agent). */
   maxTokens: number;
+  /** Wall-clock cap per worker attempt (ms); 0 disables. Missing on pre-0.10 runs — readers default it. */
+  taskTimeoutMs?: number;
   verification: Verification;
   thinking: boolean;
   reasoningEffort: ReasoningEffort;

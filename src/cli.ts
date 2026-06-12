@@ -136,12 +136,28 @@ export async function main(): Promise<void> {
 
 // ---------------------------------------------------------------- run
 
-function optionOverrides(flags: Args["flags"], cfg: SwarmConfig): Partial<RunOptions> {
+export function optionOverrides(flags: Args["flags"], cfg: SwarmConfig): Partial<RunOptions> {
   const o: Partial<RunOptions> = {};
-  if (flags.workers) o.maxWorkers = Number(flags.workers);
-  if (flags.steps) o.maxStepsPerTask = Number(flags.steps);
-  if (flags.tasks) o.maxTasks = Number(flags.tasks);
-  if (flags.budget) o.maxTokens = Number(flags.budget);
+  // Validate numeric flags through the config ranges: non-numeric input throws
+  // here (red error, exit 1) instead of leaking NaN into the scheduler, where
+  // `activeWorkerCount() < NaN` would hang the run with zero tasks started.
+  const numFlag = (flag: string, key: keyof SwarmConfig): number => {
+    try {
+      return Number(coerceConfigValue(key, flags[flag]));
+    } catch {
+      throw new Error(`--${flag} must be a number`);
+    }
+  };
+  if (flags.workers) o.maxWorkers = numFlag("workers", "maxWorkers");
+  if (flags.steps) o.maxStepsPerTask = numFlag("steps", "maxStepsPerTask");
+  if (flags.tasks) o.maxTasks = numFlag("tasks", "maxTasks");
+  if (flags.budget) {
+    // Not coerced through the config range: its 50K floor protects the
+    // persisted default, but a one-off run may want a deliberately tiny cap.
+    const n = Number(flags.budget);
+    if (!Number.isFinite(n)) throw new Error("--budget must be a number");
+    o.maxTokens = Math.min(2_000_000_000, Math.max(1_000, Math.round(n)));
+  }
   if (typeof flags.model === "string") o.model = flags.model;
   if (typeof flags.conductor === "string") o.conductorModel = flags.conductor;
   if (typeof flags.verify === "string" && ["off", "normal", "strict"].includes(flags.verify)) {
