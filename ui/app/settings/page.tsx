@@ -23,6 +23,8 @@ export default function SettingsPage() {
 
   // local editable fields
   const [tinyfishApiKey, setTinyfishApiKey] = useState("");
+  const [fredApiKey, setFredApiKey] = useState("");
+  const [metaculusApiKey, setMetaculusApiKey] = useState("");
   const [form, setForm] = useState<Record<string, any>>({});
   // Per-provider drafts: key inputs start blank ("leave blank to keep").
   const [provKeys, setProvKeys] = useState<Record<string, string>>({});
@@ -82,6 +84,9 @@ export default function SettingsPage() {
         searchBackend: config.searchBackend,
         crawlBackend: config.crawlBackend,
         deepcrawlBaseUrl: config.deepcrawlBaseUrl,
+        forecastPanelSize: config.forecastPanelSize,
+        forecastExtremizeK: config.forecastExtremizeK,
+        forecastCoherenceProbe: config.forecastCoherenceProbe,
         sandboxRuntime: config.sandboxRuntime,
         sandboxImage: config.sandboxImage,
         e2bTemplate: config.e2bTemplate,
@@ -116,6 +121,8 @@ export default function SettingsPage() {
     try {
       const patch: Record<string, any> = { ...form };
       if (tinyfishApiKey.trim()) patch.tinyfishApiKey = tinyfishApiKey.trim();
+      if (fredApiKey.trim()) patch.fredApiKey = fredApiKey.trim();
+      if (metaculusApiKey.trim()) patch.metaculusApiKey = metaculusApiKey.trim();
       for (const k of ["e2bApiKey", "modalTokenId", "modalTokenSecret", "vercelToken"]) {
         if (sbxSecrets[k]?.trim()) patch[k] = sbxSecrets[k].trim();
       }
@@ -136,6 +143,8 @@ export default function SettingsPage() {
       setSbxSecrets({});
       setCrawlSecrets({});
       setTinyfishApiKey("");
+      setFredApiKey("");
+      setMetaculusApiKey("");
       await reload();
       api.models().then((r) => setModels(r.models)).catch(() => {});
       setSaved(true);
@@ -444,6 +453,65 @@ export default function SettingsPage() {
         </Card>
 
         <Card
+          title="Forecasting"
+          sub="Forecast runs put an independent forecaster panel behind every question and combine it mechanically (extremized geometric mean of odds). Manifold, Polymarket, and Kalshi odds are keyless; a free Metaculus token adds its forecaster crowd, and a free FRED key adds economic series to the time_series tool."
+        >
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Field label="Panel size" hint="independent forecasters per question (3–11)">
+              <input
+                type="number" className="input" min={3} max={11}
+                value={form.forecastPanelSize ?? 5}
+                onChange={(e) => setForm({ ...form, forecastPanelSize: e.target.value })}
+              />
+            </Field>
+            <Field label="Extremization k" hint="aggregation exponent (auto-tunes once ≥30 forecasts resolve)">
+              <input
+                type="number" className="input" min={1} max={4} step={0.25}
+                value={form.forecastExtremizeK ?? 2.5}
+                onChange={(e) => setForm({ ...form, forecastExtremizeK: e.target.value })}
+              />
+            </Field>
+            <Field label="Coherence probe" hint="engine re-asks the question inverted and folds the flipped answer into the panel — counters affirmative-framing bias">
+              <Toggle
+                on={!!form.forecastCoherenceProbe}
+                onChange={(v) => setForm({ ...form, forecastCoherenceProbe: v })}
+                label={form.forecastCoherenceProbe ? "on" : "off"}
+              />
+            </Field>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Field label="FRED API key" hint={config.fredKeySet ? `current: ${config.fredKeyMasked}` : "free — fred.stlouisfed.org"}>
+              <input
+                className="input mono" type="password" autoComplete="off"
+                placeholder={config.fredKeySet ? "•••••• (leave blank to keep)" : "optional — FRED economic series"}
+                value={fredApiKey}
+                onChange={(e) => setFredApiKey(e.target.value)}
+              />
+            </Field>
+            <Field label="Metaculus API token" hint={config.metaculusKeySet ? `current: ${config.metaculusKeyMasked}` : "free — metaculus.com"}>
+              <input
+                className="input mono" type="password" autoComplete="off"
+                placeholder={config.metaculusKeySet ? "•••••• (leave blank to keep)" : "optional — Metaculus crowd odds"}
+                value={metaculusApiKey}
+                onChange={(e) => setMetaculusApiKey(e.target.value)}
+              />
+            </Field>
+          </div>
+          <p className="text-2xs text-ink-faint">
+            Keys:{" "}
+            <a href="https://fred.stlouisfed.org/docs/api/api_key.html" target="_blank" rel="noreferrer" className="text-ink underline underline-offset-2">
+              fred.stlouisfed.org
+            </a>{" "}
+            ·{" "}
+            <a href="https://www.metaculus.com/aib/" target="_blank" rel="noreferrer" className="text-ink underline underline-offset-2">
+              metaculus.com
+            </a>
+            {config.fredKeySet && <ClearKey label="FRED" onClear={() => clearKey({ fredApiKey: "" })} />}
+            {config.metaculusKeySet && <ClearKey label="Metaculus" onClear={() => clearKey({ metaculusApiKey: "" })} />}
+          </p>
+        </Card>
+
+        <Card
           title="Sandbox"
           sub="Where agents execute shell commands for isolated runs. The default is a private per-run workspace on this machine, with nothing to install. Pick a container or cloud runtime for stronger isolation, or Auto to use the strongest one you've configured (E2B → Modal → Vercel → Docker → host)."
         >
@@ -635,14 +703,10 @@ function ClearKey({ label, onClear }: { label?: string; onClear: () => void }) {
 
 function Card({ title, sub, children }: { title: string; sub?: string; children: React.ReactNode }) {
   return (
-    <div className="panel p-5 mb-4">
-      <h2 className="font-semibold text-base">{title}</h2>
-      {sub ? (
-        <p className="text-xs mt-0.5 mb-4 leading-relaxed text-ink-faint">{sub}</p>
-      ) : (
-        <div className="mb-4" />
-      )}
-      <div className="space-y-3">{children}</div>
+    <div className="panel p-5 mb-5">
+      <h2 className={`font-semibold text-base${sub ? "" : " mb-4"}`}>{title}</h2>
+      {sub && <p className="text-xs mt-0.5 mb-4 leading-relaxed text-ink-faint">{sub}</p>}
+      <div className="space-y-4">{children}</div>
     </div>
   );
 }
@@ -685,7 +749,7 @@ function Toggle({ on, onChange, label }: { on: boolean; onChange: (v: boolean) =
       <span className={on ? "text-ink" : "text-ink-faint"}>{label}</span>
       <span
         className="relative rounded-full transition-colors shrink-0"
-        style={{ width: 38, height: 22, background: on ? "#f2f2f2" : "#2a2a2a" }}
+        style={{ width: 38, height: 22, background: on ? "var(--color-ink)" : "rgb(var(--hi) / 0.15)" }}
       >
         <span
           className="absolute rounded-full transition-all"

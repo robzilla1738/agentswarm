@@ -43,6 +43,16 @@ export interface SwarmConfig {
   deepcrawlBaseUrl: string;
   /** Crawl/scrape backend for crawl_site + fetch_url upgrades: auto = first configured (Firecrawl → context.dev → deepcrawl). */
   crawlBackend: "auto" | "firecrawl" | "contextdev" | "deepcrawl" | "off";
+  /** FRED (St. Louis Fed) key for the time_series tool — free at fred.stlouisfed.org. */
+  fredApiKey: string;
+  /** Metaculus API token for market_odds — free with an account (their API requires auth). */
+  metaculusApiKey: string;
+  /** Forecast mode: independent forecaster panel size. */
+  forecastPanelSize: number;
+  /** Forecast mode: extremization exponent for the geometric-mean-of-odds aggregate. */
+  forecastExtremizeK: number;
+  /** Forecast mode: engine-run inverted-framing probe joins the panel (de-biases affirmative framing). */
+  forecastCoherenceProbe: boolean;
   /**
    * Where isolated runs execute. Default "host": the run's private workspace
    * directory on this machine — works out of the box, no Docker or cloud
@@ -137,6 +147,11 @@ export const DEFAULTS: SwarmConfig = {
   deepcrawlApiKey: "",
   deepcrawlBaseUrl: "",
   crawlBackend: "auto",
+  fredApiKey: "",
+  metaculusApiKey: "",
+  forecastPanelSize: 5,
+  forecastExtremizeK: 2.5,
+  forecastCoherenceProbe: true,
   sandboxRuntime: "host",
   sandboxImage: "node:22-bookworm",
   e2bApiKey: "",
@@ -182,6 +197,8 @@ export const SECRET_ENV_KEYS: string[] = [
     "FIRECRAWL_API_KEY",
     "CONTEXT_DEV_API_KEY",
     "DEEPCRAWL_API_KEY",
+    "FRED_API_KEY",
+    "METACULUS_API_KEY",
     "E2B_API_KEY",
     "MODAL_TOKEN_ID",
     "MODAL_TOKEN_SECRET",
@@ -250,6 +267,8 @@ export function loadConfig(): SwarmConfig {
   if (process.env.CONTEXT_DEV_API_KEY) cfg.contextdevApiKey = process.env.CONTEXT_DEV_API_KEY;
   if (process.env.DEEPCRAWL_API_KEY) cfg.deepcrawlApiKey = process.env.DEEPCRAWL_API_KEY;
   if (process.env.DEEPCRAWL_BASE_URL) cfg.deepcrawlBaseUrl = process.env.DEEPCRAWL_BASE_URL;
+  if (process.env.FRED_API_KEY) cfg.fredApiKey = process.env.FRED_API_KEY;
+  if (process.env.METACULUS_API_KEY) cfg.metaculusApiKey = process.env.METACULUS_API_KEY;
   if (process.env.E2B_API_KEY) cfg.e2bApiKey = process.env.E2B_API_KEY;
   if (process.env.MODAL_TOKEN_ID) cfg.modalTokenId = process.env.MODAL_TOKEN_ID;
   if (process.env.MODAL_TOKEN_SECRET) cfg.modalTokenSecret = process.env.MODAL_TOKEN_SECRET;
@@ -333,6 +352,11 @@ export const SETTABLE_KEYS: (keyof SwarmConfig)[] = [
   "deepcrawlApiKey",
   "deepcrawlBaseUrl",
   "crawlBackend",
+  "fredApiKey",
+  "metaculusApiKey",
+  "forecastPanelSize",
+  "forecastExtremizeK",
+  "forecastCoherenceProbe",
   "sandboxRuntime",
   "sandboxImage",
   "e2bApiKey",
@@ -359,8 +383,14 @@ const NUM_RANGES: Partial<Record<keyof SwarmConfig, [number, number]>> = {
   maxTokensPerRun: [50_000, 2_000_000_000],
   taskTimeoutMs: [60_000, 86_400_000],
   contextTokenLimit: [8_000, 900_000],
+  forecastPanelSize: [3, 11],
   hubPort: [0, 65535],
   uiPort: [0, 65535],
+};
+
+/** Like NUM_RANGES, but the value keeps its fraction (extremization exponents are not integers). */
+const FLOAT_RANGES: Partial<Record<keyof SwarmConfig, [number, number]>> = {
+  forecastExtremizeK: [1, 4],
 };
 
 const ENUMS: Partial<Record<keyof SwarmConfig, string[]>> = {
@@ -384,7 +414,13 @@ export function coerceConfigValue(key: keyof SwarmConfig, raw: unknown): unknown
     if (!Number.isFinite(n)) throw new Error(`${key} must be a number`);
     return Math.min(range[1], Math.max(range[0], Math.round(n)));
   }
-  if (key === "thinking" || key === "safeMode") {
+  const floatRange = FLOAT_RANGES[key];
+  if (floatRange) {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) throw new Error(`${key} must be a number`);
+    return Math.min(floatRange[1], Math.max(floatRange[0], n));
+  }
+  if (key === "thinking" || key === "safeMode" || key === "forecastCoherenceProbe") {
     if (typeof raw === "boolean") return raw;
     return raw === "true" || raw === "1" || raw === "on";
   }

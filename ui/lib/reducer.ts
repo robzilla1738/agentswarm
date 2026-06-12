@@ -1,8 +1,12 @@
 import type {
   ActivityItem,
   AgentView,
+  AggregateForecast,
   BlackboardNote,
   ConductorSay,
+  Forecast,
+  ForecastPanelist,
+  ForecastQuestion,
   OperatorNote,
   RunMeta,
   RunStatus,
@@ -33,6 +37,10 @@ export interface ClientState {
   sourcesByTask: Map<string, Set<string>>;
   /** Bumped on every plan.updated — the Plan tab refetches on change. */
   planUpdatedAt: number;
+  /** Forecast runs: the sharpened question and (once computed) the mechanical aggregate. */
+  question: ForecastQuestion | null;
+  aggregate: AggregateForecast | null;
+  forecastPanel: ForecastPanelist[];
   finalSummary?: string;
   finalReportPath?: string;
   lastSeq: number;
@@ -64,6 +72,9 @@ export function emptyState(): ClientState {
     sourceUrls: new Set(),
     sourcesByTask: new Map(),
     planUpdatedAt: 0,
+    question: null,
+    aggregate: null,
+    forecastPanel: [],
     lastSeq: 0,
     lastT: 0,
   };
@@ -320,6 +331,21 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
     case "plan.updated":
       s.planUpdatedAt = ev.t;
       break;
+    case "forecast.question":
+      s.question = ev.question as ForecastQuestion;
+      break;
+    case "forecast.submitted": {
+      const t = s.tasks.get(ev.taskId as string);
+      if (t) {
+        t.forecast = ev.forecast as Forecast;
+        s.tasks.set(t.id, { ...t });
+      }
+      break;
+    }
+    case "forecast.aggregated":
+      s.aggregate = ev.aggregate as AggregateForecast;
+      if (Array.isArray(ev.panel)) s.forecastPanel = ev.panel as ForecastPanelist[];
+      break;
     case "run.final":
       s.finalSummary = ev.summary as string;
       s.finalReportPath = ev.reportPath as string | undefined;
@@ -424,7 +450,10 @@ function summarizeArgs(name: string, args: unknown, cwd?: string): string {
     case "save_artifact":
       return shortPath(String(a.path ?? a.name ?? ""), cwd);
     case "web_search":
+    case "market_odds":
       return String(a.query ?? "");
+    case "time_series":
+      return `${a.source ?? ""} ${a.series ?? ""}`.trim();
     case "fetch_url":
       return String(a.url ?? "");
     case "list_dir":

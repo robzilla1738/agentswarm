@@ -13,10 +13,13 @@ import {
   saveConfig,
 } from "./config";
 import { appendControl } from "./control";
+import { ISO_DATE, calibrationStats, loadLedger, resolveLedgerEntry } from "./forecast";
+import { resolveDue } from "./resolve";
 import { crawlSite, hasScrapeBackend, resolveCrawlBackend, scrapeUrl } from "./crawltools";
 import { searchEngines } from "./webtools";
 import { listModels, validateAuth } from "./deepseek";
 import { PROVIDERS, PROVIDER_IDS, isProviderId } from "./providers";
+import { renderFinalHtml } from "./report";
 import { eventsFile, readEvents, readNewEvents, TailState } from "./journal";
 import {
   createRun,
@@ -233,6 +236,43 @@ async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL
     }
   }
 
+  // ---- forecast ledger ----
+
+  if (p === "/api/forecasts" && method === "GET") {
+    const entries = loadLedger();
+    return sendJson(res, 200, { forecasts: entries, calibration: calibrationStats(entries) });
+  }
+
+  // Kick the resolution engine over every past-due forecast (or given ids).
+  // Awaited: each resolution is one bounded 12-step mini-agent.
+  if (p === "/api/forecasts/resolve" && method === "POST") {
+    const body = await readBody(req);
+    const ids = Array.isArray(body.ids) ? body.ids.map(String) : undefined;
+    const result = await resolveDue(cfg, { ids });
+    return sendJson(res, 200, result);
+  }
+
+  const fm = p.match(/^\/api\/forecasts\/([^/]+)\/resolve$/);
+  if (fm && method === "POST") {
+    const body = await readBody(req);
+    const entry = loadLedger().find((e) => e.id === fm[1]);
+    if (!entry) return sendJson(res, 404, { error: "forecast not found" });
+    if (entry.resolution) return sendJson(res, 409, { error: "already resolved" });
+    const raw = body.outcome;
+    let outcome: 0 | 1 | number | "void";
+    if (raw === "yes") outcome = 1;
+    else if (raw === "no") outcome = 0;
+    else if (raw === "void") outcome = "void";
+    else if (entry.question.kind === "numeric" && Number.isFinite(Number(raw))) outcome = Number(raw);
+    else return sendJson(res, 400, { error: 'outcome must be "yes", "no", "void"' + (entry.question.kind === "numeric" ? ", or a number" : "") });
+    const rec = resolveLedgerEntry(entry, outcome, {
+      evidence: String(body.evidence || "operator override"),
+      sources: [],
+      resolvedBy: "operator",
+    });
+    return sendJson(res, 200, { ok: true, resolution: rec });
+  }
+
   if (p === "/api/runs" && method === "GET") {
     return sendJson(res, 200, { runs: listRuns(cfg.pricing) });
   }
@@ -340,6 +380,31 @@ async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL
       if (!fs.existsSync(file)) return sendJson(res, 404, { error: "no report yet" });
       res.writeHead(200, { "content-type": "text/markdown; charset=utf-8" });
       res.end(fs.readFileSync(file));
+      return;
+    }
+
+    // Styled HTML view of the report, rendered fresh from the markdown so
+    // ?theme=light|dark and ?print=1 (auto-open the print dialog → save as
+    // PDF) work for every run, including ones finished before this route.
+    if (sub === "/report.html" && method === "GET") {
+      const file = path.join(runDir(id), "artifacts", "final-report.md");
+      if (!fs.existsSync(file)) return sendJson(res, 404, { error: "no report yet" });
+      const themeParam = url.searchParams.get("theme");
+      const state = loadRunState(id, cfg.pricing);
+      const status = state && ["done", "failed", "cancelled"].includes(state.status)
+        ? (state.status as "done" | "failed" | "cancelled")
+        : "done";
+      const html = renderFinalHtml({
+        markdown: fs.readFileSync(file, "utf8"),
+        mission: state?.meta?.mission ?? "",
+        runId: id,
+        status,
+        finishedAt: state?.updatedAt || Date.now(),
+        theme: themeParam === "light" ? "light" : themeParam === "dark" ? "dark" : undefined,
+        autoPrint: url.searchParams.get("print") === "1",
+      });
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end(html);
       return;
     }
 
@@ -493,6 +558,13 @@ export function publicConfig(cfg: SwarmConfig) {
     contextWindows: cfg.contextWindows,
     cheapModel: cfg.cheapModel,
     strongModel: cfg.strongModel,
+    fredKeySet: Boolean(cfg.fredApiKey),
+    fredKeyMasked: maskKey(cfg.fredApiKey),
+    metaculusKeySet: Boolean(cfg.metaculusApiKey),
+    metaculusKeyMasked: maskKey(cfg.metaculusApiKey),
+    forecastPanelSize: cfg.forecastPanelSize,
+    forecastExtremizeK: cfg.forecastExtremizeK,
+    forecastCoherenceProbe: cfg.forecastCoherenceProbe,
     knownModels,
     pricing: cfg.pricing,
   };
@@ -524,6 +596,11 @@ function sanitizeOptions(raw: unknown): Partial<RunOptions> {
   if (SANDBOX_KINDS.includes(o.sandboxRuntime as SandboxKind)) {
     out.sandboxRuntime = o.sandboxRuntime as SandboxKind;
   }
+  if (o.mode === "research" || o.mode === "forecast") out.mode = o.mode;
+  if (typeof o.resolutionDate === "string" && ISO_DATE.test(o.resolutionDate) && Number.isFinite(Date.parse(o.resolutionDate))) {
+    out.resolutionDate = o.resolutionDate;
+  }
+  num("panelSize", 3, 11);
   return out;
 }
 
@@ -546,6 +623,10 @@ function snapshot(state: ReturnType<typeof loadRunState>, id: string) {
     planExcerpt: state.planExcerpt,
     finalSummary: state.finalSummary,
     finalReportPath: state.finalReportPath,
+    question: state.question,
+    aggregate: state.aggregate,
+    forecastPanel: state.forecastPanel,
+    ledgerId: state.ledgerId,
     live: isRunLive(id),
     lastSeq: state.lastSeq,
   };

@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.11.0
+
+### Forecast mode: calibrated probabilities, end to end
+- New run mode: `swarm forecast "<question>" [--by YYYY-MM-DD] [--panel N]` (or the mode toggle in the UI composer). The question is sharpened into a resolvable claim — neutral wording, explicit criteria, resolution date; an operator `--by` always wins — then research waves gather counted base rates and live data before an independent panel of 3–11 forecasters (default 5) works distinct methods: outside view, inside view, trend, market-anchored.
+- Panel independence is mechanical, not requested: blanked blackboard, peer forecasts withheld from dependency digests, `read_report` blocked between panelists.
+- Aggregation is deterministic TypeScript, never an LLM: median + extremized geometric-mean-of-odds headline (k=2.5 default; single-panelist runs pass through unextremized), 10%-trimmed-mean quantiles for numeric questions. Probabilities clamp to [1%, 99%].
+- A red-team task attacks the panel's reasoning and panelists get a revision pass before synthesis. The final report and the run UI lead with the ensemble headline, the full panel spread, and each panelist's method.
+
+### Anti-headline-bias mechanics (engine-owned, not prompt hopes)
+- **Base-rate prior commitment**: every binary forecaster must state the probability its reference classes alone imply before weighing current evidence. Reports, the UI, and the ledger record "prior X% → final Y%", and the red team attacks deltas justified only by headlines.
+- **Mechanical analytical gate**: forecasts with no prior, no named reference class, or no numbers in the rationale are rejected and retried with specific feedback. Wind-down-safe — at the attempt cap or budget exhaustion the forecast is accepted with a journaled warning instead of discarded.
+- **Inverted-framing coherence probe** (`forecastCoherenceProbe`, default on): after the panel, the engine itself runs one cheap agent on the inverted question ("estimate P(NO), argue NO first"), flips the answer, and folds it into the panel as method `inverted-framing`. Atomically journaled — crash-safe and idempotent across resume.
+- **Evidence-overlap-scaled extremization**: pairwise source overlap across the panel (canonical URLs) shrinks k toward 1, so a panel that read the same wire story isn't amplified as if it were five independent minds. Overlap is journaled, persisted to the ledger, shown in the report, and flagged in the UI above 50%.
+- **Deterministic OLS trend projection**: `time_series` gains `project_to` — slope per day, projection at the resolution date, and an 80% residual band, computed by the engine. GDELT output now states that news volume measures attention, not probability.
+- **Engine-injected time window**: every forecaster prompt includes "today is X; N days remain" with hazard-rate discipline, computed at spawn time.
+- Doctrine: research scouts separate established facts from commentary, dedupe wire-republished stories, and produce counted base rates ("X of N — list the N"); the sharpener strips loaded framing from the question.
+
+### Calibration flywheel
+- Persistent ledger at `~/.agentswarm/forecasts/ledger.jsonl`: question, panel (with priors and methods), ensemble, evidence overlap, update triggers.
+- `swarm resolve` runs bounded-parallel mini-agents against each due forecast's resolution criteria, writes an audit JSON per resolution, and scores Brier + log for binary, interval coverage for numeric. Unclear or low-confidence resolutions skip with an operator hint; `swarm resolve set <id> <outcome>` overrides manually.
+- `swarm calibration` and a new **Forecasts** page in the web UI: ledger table with resolve buttons, stat cards, a reliability diagram, and per-method track records.
+- The calibration block (overconfidence diagnosis, best/worst method) is injected into every future panel once 10 forecasts have resolved; with 30, the extremization constant is re-fit from your own history.
+- `swarm forecasts watch` re-checks each open forecast's update triggers.
+
+### Data sources
+- `market_odds`: Manifold, Polymarket, Kalshi keyless — closed and resolved markets filtered out; Metaculus joins when a free API token is configured (`metaculusApiKey` — their API now requires one).
+- `time_series`: FRED (free `fredApiKey`), World Bank, Yahoo Finance (replaces Stooq, which is behind a proof-of-work bot wall; query1→query2 host fallback with an honest throttle error), GDELT attention counts.
+- Web search gains a freshness filter (DuckDuckGo `df=`, Bing `filters=`).
+
+### Fixes
+- Resuming a run that crashed between aggregation and the final report no longer appends a duplicate ledger record (the aggregate is restored from the journal).
+- Research mode is byte-identical to 0.10.0 — every forecast behavior is gated on the run mode.
+
+### Tests
+- e2e grows a forecast phase (22 total): gate rejection and retry, the probe flip, overlap-scaled aggregation with every expected number re-derived from the shipped math, ledger persistence, resolution scoring. Unit suite grows to 168 tests (aggregation, scoring, ledger, calibration, OLS, overlap, gate).
+
 ## 0.10.0
 
 ### 256-agent swarms, honestly capped everywhere

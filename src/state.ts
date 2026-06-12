@@ -1,4 +1,7 @@
 import {
+  AggregateForecast,
+  Forecast,
+  ForecastQuestion,
   RunMeta,
   RunStatus,
   RunSummary,
@@ -72,6 +75,11 @@ export class RunState {
   budgetSeries: { t: number; tokens: number; cost: number }[] = [];
   /** Distinct web sources touched (fetches, search hits, cited sources) — canonical URLs. */
   sourceUrls = new Set<string>();
+  /** Forecast mode: the sharpened question, the panel's aggregate, and its ledger id. */
+  question: ForecastQuestion | null = null;
+  aggregate: AggregateForecast | null = null;
+  forecastPanel: { taskId: string; method: string; probability?: number; quantiles?: { p10: number; p50: number; p90: number } }[] = [];
+  ledgerId?: string;
   finalSummary?: string;
   finalReportPath?: string;
   lastSeq = 0;
@@ -278,6 +286,19 @@ export class RunState {
         this.pushBudgetPoint(ev.t);
         break;
       }
+      case "forecast.question":
+        this.question = ev.question as ForecastQuestion;
+        break;
+      case "forecast.submitted": {
+        const t = this.tasks.get(ev.taskId as string);
+        if (t) t.forecast = ev.forecast as Forecast;
+        break;
+      }
+      case "forecast.aggregated":
+        this.aggregate = ev.aggregate as AggregateForecast;
+        if (Array.isArray(ev.panel)) this.forecastPanel = ev.panel as RunState["forecastPanel"];
+        if (typeof ev.ledgerId === "string") this.ledgerId = ev.ledgerId;
+        break;
       case "run.final":
         this.finalSummary = ev.summary as string;
         this.finalReportPath = ev.reportPath as string | undefined;
@@ -393,6 +414,17 @@ export class RunState {
       cost: this.cost,
       sourceCount: this.sourceUrls.size,
       finalSummary: this.finalSummary,
+      ...(this.question
+        ? {
+            forecast: {
+              p: this.aggregate?.probability,
+              p50: this.aggregate?.quantiles?.p50,
+              unit: this.question.unit,
+              n: this.aggregate?.n ?? 0,
+              resolutionDate: this.question.resolutionDate,
+            },
+          }
+        : {}),
     };
   }
 }

@@ -56,10 +56,8 @@ export function RunCard({ run, now, onDeleted }: { run: RunSummary; now: number;
           <button
             onClick={remove}
             title={confirming ? "Click again to delete" : "Delete run"}
-            className="btn btn-sm"
+            className="btn btn-sm px-2 py-[3px] text-2xs"
             style={{
-              padding: "3px 8px",
-              fontSize: 11,
               color: confirming ? "var(--color-ink)" : "var(--color-ink-faint)",
               borderColor: confirming ? "rgb(var(--hi) / 0.5)" : "var(--color-border-soft)",
             }}
@@ -69,7 +67,20 @@ export function RunCard({ run, now, onDeleted }: { run: RunSummary; now: number;
         ) : null}
       </div>
 
-      <p className="text-base leading-snug mb-3 line-clamp-2 text-ink" style={{ minHeight: 40 }}>
+      <p className="text-base leading-snug mb-3 line-clamp-2 text-ink min-h-10">
+        {run.forecast && (
+          <span
+            className="mono text-sm font-semibold mr-2 px-1.5 py-0.5 rounded-md align-middle"
+            style={{ border: "1px solid rgb(var(--hi) / 0.35)", background: "rgb(var(--hi) / 0.05)" }}
+            title={`Forecast · resolves ${run.forecast.resolutionDate} · panel of ${run.forecast.n}`}
+          >
+            {typeof run.forecast.p === "number"
+              ? `${Math.round(run.forecast.p * 100)}%`
+              : typeof run.forecast.p50 === "number"
+                ? `~${run.forecast.p50}${run.forecast.unit ? ` ${run.forecast.unit}` : ""}`
+                : "forecast"}
+          </span>
+        )}
         {run.mission}
       </p>
 
@@ -81,7 +92,7 @@ export function RunCard({ run, now, onDeleted }: { run: RunSummary; now: number;
           </span>
           <span className="mono">{pct}%</span>
         </div>
-        <div className="w-full rounded-full overflow-hidden" style={{ height: 4, background: "rgb(var(--hi) / 0.07)" }}>
+        <div className="w-full rounded-full overflow-hidden h-1 bg-[rgb(var(--hi)/0.07)]">
           <div
             className="h-full rounded-full transition-all duration-500"
             style={{ width: `${pct}%`, background: failed ? "rgb(var(--hi) / 0.45)" : "var(--color-ink)" }}

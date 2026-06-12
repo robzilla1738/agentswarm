@@ -16,18 +16,25 @@ import {
   REPORT_TOOL,
   VERDICT_TOOL,
   ToolCtx,
+  submitForecastTool,
   synthToolset,
   verifierToolset,
   workerToolset,
 } from "./tools";
 import {
+  aggregateBlock,
   budgetLine,
   completenessPrompt,
   conductorInitialUpdate,
   conductorSystem,
   conductorUpdate,
   depReportBlock,
+  FORECASTER_KICKOFF,
+  forecastConductorAddendum,
+  forecastSynthAddendum,
+  questionBlock,
   reportBlock,
+  sharpenQuestionPrompt,
   synthCheckPrompt,
   synthSystem,
   SYNTH_KICKOFF,
@@ -37,11 +44,25 @@ import {
   workerSystem,
   WORKER_KICKOFF,
 } from "./prompts";
+import {
+  aggregateBinary,
+  aggregateQuantiles,
+  appendLedger,
+  calibrationBlock,
+  chooseExtremizeK,
+  clampProb,
+  evidenceOverlap,
+  ISO_DATE,
+  loadLedger,
+  parseQuestionJson,
+  scaleK,
+  validateForecastAnalytics,
+} from "./forecast";
 import { appendMemory, memoryBlock } from "./memory";
 import { aggregateSources, renderFinalHtml, sourcesBlock } from "./report";
 import { SandboxRuntime, createSandbox } from "./sandbox";
 import { RunState } from "./state";
-import { RunMeta, RunStatus, Task, TaskSpec, Usage, usageCost } from "./types";
+import { AggregateForecast, Forecast, ForecastQuestion, RunMeta, RunStatus, SourceRef, Task, TaskSpec, Usage, usageCost } from "./types";
 import { canonicalArtifactRel, clip, ensureDir, errMsg, oneLine, rid, sleep, truncateMiddle, validateArtifactFormat, withTimeout } from "./util";
 
 
@@ -118,6 +139,13 @@ export class Executor {
   private conductorFailures = 0;
   private resumed = false;
 
+  /** Forecast mode: the sharpened question (set before the conductor seeds). */
+  private question: ForecastQuestion | null = null;
+  /** Forecast mode: the mechanical panel aggregate (computed at synthesis). */
+  private aggregate: AggregateForecast | null = null;
+  /** Forecast mode: panel tasks behind the aggregate (latest per method). */
+  private panelTasks: Task[] = [];
+
   private sandbox: SandboxRuntime;
   private mode: "root" | "team";
   private teamId?: string;
@@ -189,6 +217,13 @@ export class Executor {
       .filter((n) => !(n.kind === "claim" && (n.teamId || (n.taskId && settled.has(n.taskId)))));
     const lastPhase = state.phases[state.phases.length - 1];
     if (lastPhase) this.phase = { name: lastPhase.name, goal: lastPhase.goal, exitCriteria: lastPhase.exitCriteria };
+    // A sharpened question survives restarts via the journal — never re-sharpen.
+    this.question = state.question;
+    // Likewise a computed aggregate: a crash between forecast.aggregated and
+    // run.final must not re-aggregate and append a duplicate ledger record
+    // (aggregateAndLedger early-returns when this.aggregate is set).
+    this.aggregate = state.aggregate;
+    if (this.aggregate) this.panelTasks = this.panelFromTasks();
     this.spentTokens = state.totalUsage.promptTokens + state.totalUsage.completionTokens;
     this.cost = state.cost;
     try {
@@ -322,11 +357,22 @@ export class Executor {
       }
     }, 750);
 
+    // Forecast missions pin a precisely resolvable question before any
+    // orchestration — the question's structure is engine-owned, not LLM-owned.
+    // (Resumed runs already re-read it from the journal in seedFromState.)
+    if (this.forecastMode() && !this.question) {
+      await this.sharpenQuestion();
+    }
+    const forecastDoctrine =
+      this.forecastMode() && this.question
+        ? `\n\n${forecastConductorAddendum(this.question, this.panelSize(), this.safeCalibrationBlock())}`
+        : "";
+
     // Real-directory runs remember: prior missions in the same workspace feed
     // the conductor so it builds on settled decisions instead of starting cold.
     const memory = this.mode === "root" && !this.meta.sandbox ? memoryBlock(this.meta.cwd) : "";
     this.conductorMessages = [
-      { role: "system", content: conductorSystem(this.meta) + (memory ? `\n\n${memory}` : "") },
+      { role: "system", content: conductorSystem(this.meta) + forecastDoctrine + (memory ? `\n\n${memory}` : "") },
       {
         role: "user",
         content: this.resumed
@@ -433,6 +479,417 @@ export class Executor {
       this.teamReport = tasks
         .map((t) => `${t.id} [${t.status}] ${t.title}: ${oneLine(t.report ?? t.error ?? "(no output)", 200)}`)
         .join("\n");
+    }
+  }
+
+  // ---------------------------------------------------------------- forecasting
+
+  /** Forecast behavior is root-only: team sub-swarms inherit meta.options but never run the pipeline. */
+  private forecastMode(): boolean {
+    return this.mode === "root" && (this.meta.options.mode ?? "research") === "forecast";
+  }
+
+  private panelSize(): number {
+    const n = Number(this.meta.options.panelSize) || this.cfg.forecastPanelSize || 5;
+    return Math.min(11, Math.max(3, Math.round(n)));
+  }
+
+  /** calibrationBlock reads the ledger from disk — a corrupt file must never kill a run. */
+  private safeCalibrationBlock(): string {
+    try {
+      return calibrationBlock();
+    } catch {
+      return "";
+    }
+  }
+
+  /**
+   * Pre-step for forecast runs: one model call turns the mission into a
+   * precisely resolvable question (text, kind, criteria, date). Falls back to
+   * a mechanically-built binary question — a flaky model may cost sharpness,
+   * never the run.
+   */
+  private async sharpenQuestion(): Promise<void> {
+    const today = new Date(this.meta.createdAt).toISOString().slice(0, 10);
+    const operatorDate = this.meta.options.resolutionDate;
+    let parsed: ForecastQuestion | null = null;
+    let lastErr = "";
+    for (let attempt = 0; attempt < 2 && !parsed; attempt++) {
+      try {
+        const res = await chat(this.cfg, {
+          model: this.meta.options.conductorModel,
+          priority: "high",
+          messages: [
+            {
+              role: "user",
+              content:
+                sharpenQuestionPrompt(this.meta.mission, today, operatorDate) +
+                (lastErr ? `\n\nYour previous reply was unusable (${lastErr}). Reply with ONLY the JSON object.` : ""),
+            },
+          ],
+          thinking: false,
+          maxTokens: 1024,
+          signal: this.ac.signal,
+        });
+        this.onUsage(this.meta.options.conductorModel, res.usage);
+        parsed = parseQuestionJson(res.content || "", operatorDate);
+        if (!parsed) lastErr = "not valid JSON with the required fields";
+      } catch (e) {
+        if (this.ac.signal.aborted) return;
+        lastErr = errMsg(e);
+      }
+    }
+    if (!parsed) {
+      const fallbackDate =
+        operatorDate && ISO_DATE.test(operatorDate)
+          ? operatorDate
+          : new Date(this.meta.createdAt + 90 * 86_400_000).toISOString().slice(0, 10);
+      parsed = {
+        text: oneLine(this.meta.mission, 300),
+        kind: "binary",
+        resolutionCriteria:
+          "Resolves YES if the event described in the question has occurred by the resolution date, per authoritative public reporting.",
+        resolutionDate: fallbackDate,
+      };
+      this.journal.append("log", {
+        level: "warn",
+        msg: "question sharpening failed — using the mission verbatim as a binary question",
+      });
+    }
+    this.question = parsed;
+    this.journal.append("forecast.question", { question: parsed });
+  }
+
+  /**
+   * Validate and clamp a submit_forecast payload into a Forecast, or null
+   * when the numbers are unusable (the task retries with a fresh agent).
+   */
+  private intakeForecast(args: Record<string, unknown>): Forecast | null {
+    const q = this.question;
+    if (!q) return null;
+    const strList = (v: unknown, max: number) =>
+      Array.isArray(v) && v.length ? v.map((x) => clip(String(x), 300)).slice(0, max) : undefined;
+    const f: Forecast = {
+      method: oneLine(String(args.method ?? "unspecified"), 60).toLowerCase(),
+      rationale: String(args.rationale ?? "").trim(),
+      baseRates: strList(args.base_rates, 6),
+      keyDrivers: strList(args.key_drivers, 8),
+      updateTriggers: strList(args.update_triggers, 8),
+      submittedAt: Date.now(),
+    };
+    if (q.kind === "binary") {
+      let p = Number(args.probability);
+      if (!Number.isFinite(p)) return null;
+      // The schema asks for a 1-99 percentage; tolerate a 0-1 fraction. A bare
+      // "1" is read as 1% (the schema's scale), not as certainty.
+      if (p > 1) p = p / 100;
+      else if (p === 1) p = 0.01;
+      f.probability = clampProb(p);
+      // Lenient: a missing prior never voids the intake — the analytical gate
+      // enforces it with feedback the panelist can actually act on.
+      const rawPrior = Number(args.prior);
+      if (Number.isFinite(rawPrior)) {
+        let pr = rawPrior;
+        if (pr > 1) pr = pr / 100;
+        else if (pr === 1) pr = 0.01;
+        f.prior = clampProb(pr);
+      }
+    } else {
+      const vals = [args.p10, args.p50, args.p90].map(Number);
+      if (vals.some((v) => !Number.isFinite(v))) return null;
+      vals.sort((a, b) => a - b);
+      f.quantiles = { p10: vals[0], p50: vals[1], p90: vals[2] };
+    }
+    return f;
+  }
+
+  /** Human-readable headline for one panelist's forecast. */
+  private forecastHeadline(f: Forecast): string {
+    if (this.question?.kind === "binary" || f.probability !== undefined) {
+      return `P(YES) = ${Math.round((f.probability ?? 0.5) * 100)}%`;
+    }
+    const u = this.question?.unit ? ` ${this.question.unit}` : "";
+    return `p10 ${f.quantiles!.p10}${u} / p50 ${f.quantiles!.p50}${u} / p90 ${f.quantiles!.p90}${u}`;
+  }
+
+  /** "prior 55% → final 62%" when the panelist committed a base-rate prior. */
+  private priorNote(f: Forecast): string {
+    return typeof f.prior === "number" && typeof f.probability === "number"
+      ? ` (base-rate prior ${Math.round(f.prior * 100)}% → final ${Math.round(f.probability * 100)}%)`
+      : "";
+  }
+
+  /**
+   * Classic report derived from a structured forecast — shared by panelist
+   * intake (runWorker) and the engine's coherence probe so every downstream
+   * consumer (conductor digests, red-team, verifier, synthesizer, UI) sees
+   * the same shape.
+   */
+  private forecastReportFields(f: Forecast): { report: string; keyFacts: string[] } {
+    const headline = `${this.forecastHeadline(f)}${this.priorNote(f)}`;
+    const report = [
+      `FORECAST [${f.method}]: ${headline}`,
+      "",
+      f.rationale,
+      f.baseRates?.length ? `\nBase rates:\n${f.baseRates.map((b) => `- ${b}`).join("\n")}` : "",
+      f.keyDrivers?.length ? `\nKey drivers:\n${f.keyDrivers.map((d) => `- ${d}`).join("\n")}` : "",
+      f.updateTriggers?.length ? `\nUpdate triggers:\n${f.updateTriggers.map((u) => `- ${u}`).join("\n")}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    return { report, keyFacts: [`${f.method} forecast: ${headline}`, ...(f.keyDrivers ?? []).slice(0, 4)] };
+  }
+
+  /** Structured sources from a terminal tool's args — only real http(s) URLs survive. */
+  private parseSources(v: unknown): SourceRef[] {
+    if (!Array.isArray(v)) return [];
+    return (v as Record<string, unknown>[])
+      .filter((s) => s && typeof s === "object" && /^https?:\/\//.test(String(s.url ?? "")))
+      .slice(0, 40)
+      .map((s) => ({
+        url: clip(String(s.url), 500),
+        title: s.title ? clip(String(s.title), 200) : undefined,
+        date: s.date ? clip(String(s.date), 40) : undefined,
+        note: s.note ? clip(String(s.note), 300) : undefined,
+      }));
+  }
+
+  /** Latest usable forecast per method label — revisions and the probe replace/extend originals. */
+  private panelFromTasks(): Task[] {
+    const q = this.question;
+    if (!q) return [];
+    const byMethod = new Map<string, Task>();
+    for (const t of this.taskList()) {
+      if (t.status !== "done" || !t.forecast) continue;
+      const prev = byMethod.get(t.forecast.method);
+      if (!prev || prev.forecast!.submittedAt <= t.forecast.submittedAt) byMethod.set(t.forecast.method, t);
+    }
+    return [...byMethod.values()].filter((t) =>
+      q.kind === "binary" ? typeof t.forecast!.probability === "number" : Boolean(t.forecast!.quantiles)
+    );
+  }
+
+  /**
+   * Engine-injected time-window discipline: a "by DATE" probability is about
+   * the remaining window, not the topic in general. Computed at worker-spawn
+   * time so multi-day runs don't drift.
+   */
+  private hazardLine(): string {
+    if (!this.question) return "";
+    const today = new Date().toISOString().slice(0, 10);
+    const deadline = Date.parse(`${this.question.resolutionDate}T23:59:59Z`);
+    if (!Number.isFinite(deadline)) return "";
+    const days = Math.ceil((deadline - Date.now()) / 86_400_000);
+    return days >= 0
+      ? `TIME WINDOW: today is ${today}; the question resolves ${this.question.resolutionDate} — ${days} day(s) remain. A "by date" probability is about THIS window: think in per-period hazard rates, and remember that less remaining time means less probability, whatever the headlines say.`
+      : `TIME WINDOW: today is ${today}; the stated resolution date (${this.question.resolutionDate}) has already passed — forecast whether the event had occurred by that date, on the evidence available now.`;
+  }
+
+  /**
+   * Mechanical panel aggregation + the persistent ledger record. Runs once,
+   * at the top of synthesis: median + extremized geometric mean of odds for
+   * binary panels, trimmed-mean quantiles for numeric ones. The latest
+   * forecast per method label wins, so red-team revision rounds replace their
+   * originals instead of double-counting.
+   */
+  private aggregateAndLedger(): void {
+    if (!this.forecastMode() || !this.question || this.aggregate) return;
+    const q = this.question;
+    const panel = this.panelFromTasks();
+    if (!panel.length) {
+      this.journal.append("log", { level: "warn", msg: "forecast: no panel forecasts were submitted — no aggregate" });
+      return;
+    }
+    // k adapts to the resolved track record once there is enough of one;
+    // until then it is the configured default. Ledger reads are best-effort.
+    let k = this.cfg.forecastExtremizeK;
+    try {
+      k = chooseExtremizeK(loadLedger(), this.cfg.forecastExtremizeK);
+    } catch {
+      /* keep the configured k */
+    }
+    // Extremization assumes independent evidence: a panel that cited the same
+    // pages holds fewer independent views than it has members, so k shrinks
+    // with the panel's source overlap.
+    const overlap =
+      q.kind === "binary" ? evidenceOverlap(panel.map((t) => (t.sources ?? []).map((s) => s.url))) : 0;
+    let agg: AggregateForecast;
+    try {
+      agg =
+        q.kind === "binary"
+          ? aggregateBinary(panel.map((t) => t.forecast!.probability!), scaleK(k, overlap))
+          : aggregateQuantiles(panel.map((t) => t.forecast!.quantiles!), k);
+    } catch (e) {
+      this.journal.append("log", { level: "error", msg: `forecast aggregation failed: ${errMsg(e)}` });
+      return;
+    }
+    if (q.kind === "binary") agg.evidenceOverlap = overlap;
+    this.aggregate = agg;
+    this.panelTasks = panel;
+    const panelRecs = panel.map((t) => ({
+      taskId: t.id,
+      method: t.forecast!.method,
+      probability: t.forecast!.probability,
+      prior: t.forecast!.prior,
+      quantiles: t.forecast!.quantiles,
+    }));
+    const ledgerId = rid("f");
+    this.journal.append("forecast.aggregated", { aggregate: agg, panel: panelRecs, ledgerId });
+    // Cancelled runs keep the aggregate for the report but stay out of the
+    // ledger — a half-run panel is not a forecast the system should be scored on.
+    if (this.finishReason.includes("cancel")) return;
+    const triggers = [...new Set(panel.flatMap((t) => t.forecast!.updateTriggers ?? []))].slice(0, 12);
+    try {
+      appendLedger({
+        v: 1,
+        rec: "created",
+        id: ledgerId,
+        runId: this.meta.id,
+        t: Date.now(),
+        question: q,
+        aggregate: agg,
+        panel: panelRecs,
+        ...(triggers.length ? { triggers } : {}),
+        ...(q.kind === "binary" ? { evidenceOverlap: overlap } : {}),
+      });
+    } catch (e) {
+      this.journal.append("log", { level: "warn", msg: `forecast ledger write failed: ${errMsg(e)}` });
+    }
+  }
+
+  /** The exact-numbers block the synthesizer must echo. */
+  private forecastBlock(): string {
+    if (!this.question || !this.aggregate) return "";
+    const panelLines = this.panelTasks.map(
+      (t) =>
+        `- ${t.id} [${t.forecast!.method}] → ${this.forecastHeadline(t.forecast!)}${this.priorNote(t.forecast!)} — ${oneLine(t.forecast!.rationale, 160)}`
+    );
+    return aggregateBlock(this.question, this.aggregate, panelLines);
+  }
+
+  /**
+   * Engine-owned de-biasing probe: LLMs systematically inflate "Will X
+   * happen?" because affirmative text dominates retrieval (P(X)+P(¬X) ≠ 1
+   * when asked separately). The engine re-asks the question INVERTED with one
+   * cheap agent, flips the answer, and folds it into the panel as method
+   * "inverted-framing" — conductor-independent and deterministic.
+   *
+   * Atomic journaling: nothing is journaled until the probe completes, so it
+   * never exists in a resumable "running" state — a crash mid-probe simply
+   * loses it and the idempotence gate re-probes on resume.
+   */
+  private async coherenceProbe(): Promise<void> {
+    if (!this.cfg.forecastCoherenceProbe || !this.forecastMode() || this.question?.kind !== "binary") return;
+    if (this.ac.signal.aborted || this.finishReason.includes("cancel")) return;
+    if (this.budgetExceeded()) {
+      this.journal.append("log", { level: "info", msg: "coherence probe skipped — budget is in the synthesis reserve" });
+      return;
+    }
+    if (!this.panelFromTasks().length) return;
+    // Idempotent across resume: the method label is the marker.
+    if (this.taskList().some((t) => t.forecast?.method === "inverted-framing")) return;
+
+    const q = this.question;
+    const research = this.taskList().filter((t) => t.status === "done" && !t.forecast);
+    const digest = research.length ? truncateMiddle(research.map(reportBlock).join("\n\n"), 30_000, "chars") : "";
+    const agentId = rid("p");
+    const model = this.cfg.cheapModel || this.meta.options.model;
+    const system = `You are an independent forecaster answering the INVERTED form of a question — a deliberate check against affirmative-framing bias. Argue the NO case first.
+
+${questionBlock(q)}
+
+YOUR TASK: estimate the probability this question resolves NO — that the event does NOT occur per the criteria by the date.
+${digest ? `\nRESEARCH GATHERED BY THE SWARM\n${digest}\n` : ""}
+PROTOCOL
+- Argue the strongest case for NO first (the status quo usually wins — count how often "nothing happens" won in comparable situations), then the strongest case for YES, then weigh them.
+- Use web_search / fetch_url / market_odds only for load-bearing facts the research above doesn't cover; you have at most 8 tool steps.
+- In submit_forecast, "probability" and "prior" mean P(NO) here. The engine flips them mechanically — just answer the question as asked, never 0 or 100.
+- End with submit_forecast(...).`;
+
+    // No stop hook (the run is finishing by design) and a tight wall clock —
+    // operator control is no longer polled during synthesis, so a wedged
+    // probe must kill itself.
+    const all = workerToolset(this.cfg);
+    const deadline = withTimeout(new AbortController().signal, 240_000);
+    try {
+      const outcome = await runAgent({
+        cfg: this.cfg,
+        agentId,
+        model,
+        thinking: this.meta.options.thinking,
+        reasoningEffort: this.meta.options.reasoningEffort,
+        system,
+        kickoff: "Work the inverted question now, then call submit_forecast(...).",
+        tools: { web_search: all.web_search, fetch_url: all.fetch_url, market_odds: all.market_odds },
+        terminal: [submitForecastTool("binary")],
+        maxSteps: 8,
+        signal: deadline.signal,
+        ctx: { ...this.makeToolCtx(agentId, null, deadline.signal), readBlackboard: () => "", searchNotes: undefined },
+        // Quiet hooks: only usage counts; events are journaled atomically below.
+        hooks: { onUsage: this.onUsage },
+      });
+      if (outcome.terminal?.name !== "submit_forecast") {
+        this.journal.append("log", { level: "warn", msg: "coherence probe produced no forecast — panel unchanged" });
+        return;
+      }
+      const args = outcome.terminal.args as Record<string, unknown>;
+      const f = this.intakeForecast(args);
+      if (!f || typeof f.probability !== "number") {
+        this.journal.append("log", { level: "warn", msg: "coherence probe forecast was unusable — panel unchanged" });
+        return;
+      }
+      // Flip into P(YES) space. The prior was committed in P(NO) space too —
+      // drop it rather than risk a half-flipped pair (exempt from the gate).
+      f.probability = clampProb(1 - f.probability);
+      f.prior = undefined;
+      f.method = "inverted-framing"; // engine-owned: dedup, ledger, and idempotence key on this label
+      f.rationale = `(Inverted-framing probe: the agent estimated P(NO); the engine flipped it to P(YES).) ${f.rationale}`;
+      const derived = this.forecastReportFields(f);
+      const sources = this.parseSources(args.sources);
+      const now = Date.now();
+      const task: Task = {
+        id: this.allocId(), // deliberately exempt from maxTasks: exactly one engine task per run
+        title: "Coherence probe — inverted framing",
+        objective:
+          "Engine-run de-biasing probe: forecast the inverted question (probability of NO), flipped back to P(YES) before aggregation.",
+        role: "forecaster",
+        deps: [],
+        verify: false,
+        status: "done",
+        attempt: 1,
+        wave: this.currentWave(),
+        artifacts: [],
+        createdAt: now,
+        startedAt: now,
+        endedAt: Date.now(),
+        agentIds: [agentId],
+        forecast: f,
+        report: derived.report,
+        reportStatus: "done",
+        keyFacts: derived.keyFacts,
+        sources: sources.length ? sources : undefined,
+      };
+      this.tasks.set(task.id, task);
+      this.taskOrder.push(task.id);
+      this.journal.append("task.created", { task });
+      this.journal.append("agent.spawned", { agentId, taskId: task.id, role: "forecaster", model, purpose: task.title });
+      this.journal.append("agent.done", { agentId, taskId: task.id, steps: outcome.steps });
+      this.journal.append("forecast.submitted", { taskId: task.id, agentId, forecast: f });
+      this.journal.append("task.report", {
+        taskId: task.id,
+        status: "done",
+        report: task.report,
+        artifacts: [],
+        keyFacts: task.keyFacts,
+        sources: task.sources,
+      });
+      this.journal.append("task.status", { taskId: task.id, status: "done", attempt: 1 });
+      this.journal.append("log", {
+        level: "info",
+        msg: `coherence probe: P(NO) estimate flipped to P(YES)=${Math.round(f.probability * 100)}% and joined the panel as "inverted-framing"`,
+      });
+    } finally {
+      deadline.dispose();
     }
   }
 
@@ -1090,7 +1547,7 @@ export class Executor {
 
   // ---------------------------------------------------------------- task pipeline
 
-  private depReportsFor(task: Task): string {
+  private depReportsFor(task: Task, withholdForecasts = false): string {
     if (!task.deps.length) return "";
     // Excerpts, not full reports: a fan-in task with many deps must not blow
     // its context window on day one. Workers fetch full text with read_report.
@@ -1098,6 +1555,11 @@ export class Executor {
       .map((d) => {
         const dep = this.tasks.get(d);
         if (!dep) return `(${d}: missing)`;
+        // Panel independence: even when the conductor mis-wires a forecaster
+        // onto another forecaster, the number never reaches it.
+        if (withholdForecasts && dep.forecast) {
+          return `── dep ${dep.id} (${dep.role}) — WITHHELD: another panelist's forecast. Panel members stay independent; forecast from the research evidence alone.`;
+        }
         return depReportBlock(dep);
       })
       .join("\n\n");
@@ -1242,17 +1704,39 @@ export class Executor {
     task.agentIds.push(agentId);
     task.lastToolError = undefined; // diagnostics are per-attempt
     const dirListing = this.topListing();
+    // Forecaster panelists run isolated (verifier-style): dep research reports
+    // only, no blackboard, no note search — another panelist's number reaching
+    // them would anchor the panel and undo the ensemble.
+    const isForecaster = this.forecastMode() && this.question !== null && task.role === "forecaster";
     const system = workerSystem({
       agentId,
       role: task.role,
       meta: this.meta,
       task,
       maxSteps: this.meta.options.maxStepsPerTask,
-      depReports: this.depReportsFor(task),
-      blackboard: this.blackboardDigest(),
+      depReports: this.depReportsFor(task, isForecaster),
+      blackboard: isForecaster ? "" : this.blackboardDigest(),
       operatorNotes: this.peekOperatorNotes(),
       dirListing,
+      extraCraft: isForecaster
+        ? [this.hazardLine(), this.safeCalibrationBlock()].filter(Boolean).join("\n\n") || undefined
+        : undefined,
+      terminalName: isForecaster ? "submit_forecast" : "report",
     });
+    const workerCtx = (signal: AbortSignal): ToolCtx =>
+      isForecaster
+        ? {
+            ...this.makeToolCtx(agentId, task, signal),
+            readBlackboard: () => "",
+            searchNotes: undefined,
+            // Another panelist's report is off-limits even via the tool.
+            readReport: (taskId) => {
+              const t = this.tasks.get(taskId.trim().toUpperCase());
+              if (t?.forecast) return `${t.id} is another panelist — forecasts stay independent; you may not read it.`;
+              return this.readReportText(taskId);
+            },
+          }
+        : this.makeToolCtx(agentId, task, signal);
     this.journal.append("agent.spawned", {
       agentId,
       taskId: task.id,
@@ -1275,12 +1759,12 @@ export class Executor {
         thinking: this.meta.options.thinking,
         reasoningEffort: this.meta.options.reasoningEffort,
         system,
-        kickoff: WORKER_KICKOFF,
+        kickoff: isForecaster ? FORECASTER_KICKOFF : WORKER_KICKOFF,
         tools: workerToolset(this.cfg),
-        terminal: [REPORT_TOOL],
+        terminal: isForecaster ? [submitForecastTool(this.question!.kind)] : [REPORT_TOOL],
         maxSteps: this.meta.options.maxStepsPerTask,
         signal: deadline.signal,
-        ctx: this.makeToolCtx(agentId, task, deadline.signal),
+        ctx: workerCtx(deadline.signal),
         hooks: {
           ...this.agentHooks(agentId, task.id, task),
           onCheckpoint: (summary: string) => this.recordCheckpoint(task, agentId, summary),
@@ -1316,6 +1800,41 @@ export class Executor {
         (task.lastToolError ? ` — last tool failure: ${task.lastToolError}` : "") +
         (lastWords ? `; last words: ${lastWords}` : "");
       return "retry";
+    }
+    if (outcome.terminal.name === "submit_forecast") {
+      const args = outcome.terminal.args as Record<string, unknown>;
+      const f = this.intakeForecast(args);
+      if (!f || !f.rationale) {
+        task.error = "submit_forecast was missing a usable probability/quantiles or rationale";
+        return "retry";
+      }
+      // Mechanical analytical gate: a forecast must be grounded (explicit
+      // base-rate prior, named reference classes, real numbers) — prompts ask,
+      // this enforces. Retry only while the run can afford it: at wind-down
+      // or the attempt cap, a usable-but-ungrounded number still beats
+      // shrinking the panel.
+      const gate = this.question ? validateForecastAnalytics(f, this.question.kind) : null;
+      if (gate) {
+        if (task.attempt < this.cfg.verifyMaxAttempts && !this.finishing && !this.budgetExceeded()) {
+          task.feedback = gate;
+          this.journal.append("verify.result", { taskId: task.id, pass: false, feedback: gate, mechanical: true });
+          return "retry";
+        }
+        this.journal.append("log", {
+          level: "warn",
+          msg: `${task.id}: forecast accepted without full analytical grounding (${task.attempt >= this.cfg.verifyMaxAttempts ? "attempt limit reached" : "run is winding down"})`,
+        });
+      }
+      task.forecast = f;
+      this.journal.append("forecast.submitted", { taskId: task.id, agentId, forecast: f });
+      // Derive a classic report from the structured forecast so every
+      // downstream consumer — conductor digests, dep handoffs, the red-team,
+      // the verifier, the synthesizer, the UI — works unchanged. The
+      // structured payload rides in task.forecast + the journal event.
+      const derived = this.forecastReportFields(f);
+      args.status = "done";
+      args.report = derived.report;
+      args.key_facts = derived.keyFacts;
     }
     const a = outcome.terminal.args as {
       status?: string;
@@ -1359,17 +1878,7 @@ export class Executor {
     task.filesTouched = strList(a.files_touched, 40);
     // Structured sources: the citation pipeline's entry point. Only real
     // http(s) URLs survive; they flow into dep handoffs and the bibliography.
-    const sources = Array.isArray(a.sources)
-      ? (a.sources as Record<string, unknown>[])
-          .filter((s) => s && typeof s === "object" && /^https?:\/\//.test(String(s.url ?? "")))
-          .slice(0, 40)
-          .map((s) => ({
-            url: clip(String(s.url), 500),
-            title: s.title ? clip(String(s.title), 200) : undefined,
-            date: s.date ? clip(String(s.date), 40) : undefined,
-            note: s.note ? clip(String(s.note), 300) : undefined,
-          }))
-      : [];
+    const sources = this.parseSources(a.sources);
     task.sources = sources.length ? sources : undefined;
     this.journal.append("task.report", {
       taskId: task.id,
@@ -1846,6 +2355,21 @@ export class Executor {
     }
 
     this.setStatus("synthesizing", this.finishReason);
+    // Forecast runs: first the engine's inverted-framing probe joins the
+    // panel (de-biases affirmative framing), then the panel is combined
+    // mechanically before any synthesis prose exists, and the exact numbers
+    // are pinned into the synth prompt. Both are best-effort: a probe or
+    // aggregation failure must never block the final report.
+    try {
+      await this.coherenceProbe();
+    } catch (e) {
+      this.journal.append("log", { level: "warn", msg: `coherence probe failed: ${errMsg(e)}` });
+    }
+    try {
+      this.aggregateAndLedger();
+    } catch (e) {
+      this.journal.append("log", { level: "error", msg: `forecast aggregation failed: ${errMsg(e)}` });
+    }
     const tasks = this.taskList();
     const reports = tasks.length
       ? tasks.map(reportBlock).join("\n\n")
@@ -1866,15 +2390,16 @@ export class Executor {
         model: this.meta.options.conductorModel,
         thinking: this.meta.options.thinking,
         reasoningEffort: this.meta.options.reasoningEffort,
-        system: synthSystem({
-          meta: this.meta,
-          finishNotes: [this.finishNotes, extraNote].filter(Boolean).join("\n\n"),
-          reports: truncateMiddle(reports, 300_000, "chars"),
-          blackboard: this.blackboardDigest(6000),
-          artifactList,
-          reason: this.finishReason || "completed",
-          sources: sourcesText,
-        }),
+        system:
+          synthSystem({
+            meta: this.meta,
+            finishNotes: [this.finishNotes, extraNote].filter(Boolean).join("\n\n"),
+            reports: truncateMiddle(reports, 300_000, "chars"),
+            blackboard: this.blackboardDigest(6000),
+            artifactList,
+            reason: this.finishReason || "completed",
+            sources: sourcesText,
+          }) + (this.aggregate ? `\n${forecastSynthAddendum(this.forecastBlock())}` : ""),
         kickoff: SYNTH_KICKOFF,
         tools: synthToolset(),
         terminal: [SUBMIT_FINAL_TOOL],
@@ -1981,6 +2506,9 @@ export class Executor {
 
   private fallbackReport(tasks: Task[]): string {
     const lines = [`# ${this.meta.mission}`, ``, `_Run ${this.meta.id} — ${this.finishReason}_`, ``];
+    // A forecast run's aggregate is the deliverable — it survives even when
+    // the synthesizer doesn't.
+    if (this.aggregate) lines.push("## Forecast", "", this.forecastBlock(), "");
     // Even without a synthesizer, surface the cross-task essentials first.
     const facts = tasks.flatMap((t) => (t.keyFacts ?? []).map((f) => `- ${f} _(${t.id})_`));
     if (facts.length) lines.push(`## Key facts`, ...facts.slice(0, 60), "");

@@ -6,8 +6,11 @@ import { ClientState, applyEvent, emptyState } from "./reducer";
 import type {
   ActivityItem,
   AgentView,
+  AggregateForecast,
   BlackboardNote,
   ConductorSay,
+  ForecastPanelist,
+  ForecastQuestion,
   OperatorNote,
   RunMeta,
   RunStatus,
@@ -33,6 +36,10 @@ export interface LiveRun {
   /** Distinct web sources touched so far — updates live as agents search/fetch. */
   sourceCount: number;
   planUpdatedAt: number;
+  /** Forecast runs: the sharpened question and (once computed) the panel aggregate. */
+  question: ForecastQuestion | null;
+  aggregate: AggregateForecast | null;
+  forecastPanel: ForecastPanelist[];
   finalSummary?: string;
   finalReportPath?: string;
   lastSeq: number;
@@ -61,6 +68,9 @@ function project(s: ClientState): LiveRun {
     budgetSeries: s.budgetSeries.slice(),
     sourceCount: s.sourceUrls.size,
     planUpdatedAt: s.planUpdatedAt,
+    question: s.question,
+    aggregate: s.aggregate,
+    forecastPanel: s.forecastPanel.slice(),
     finalSummary: s.finalSummary,
     finalReportPath: s.finalReportPath,
     lastSeq: s.lastSeq,

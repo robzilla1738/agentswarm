@@ -56,7 +56,7 @@ export function TopBar({ right, hideLogo }: { right?: React.ReactNode; hideLogo?
 
   return (
     <header
-      className="sticky top-0 z-40 flex items-center justify-between px-5 sm:px-8 h-14"
+      className="sticky top-0 z-40 flex items-center justify-between px-5 sm:px-8 h-14 border-b border-border-soft"
       style={{
         background: "color-mix(in oklab, var(--color-bg) 82%, transparent)",
         backdropFilter: "blur(14px)",
@@ -71,6 +71,9 @@ export function TopBar({ right, hideLogo }: { right?: React.ReactNode; hideLogo?
           </Link>
         )}
         {right}
+        <Link href="/forecasts" className="btn btn-ghost btn-sm">
+          Forecasts
+        </Link>
         <ThemeToggle />
         <Link href="/settings" className="btn btn-ghost btn-sm">
           Settings

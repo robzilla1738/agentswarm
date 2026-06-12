@@ -68,7 +68,7 @@ export function SwarmBoard({
   const topMsg = (firstWave !== undefined ? preWave.get(firstWave)?.text : undefined) ?? (planning ? tail?.text : undefined);
 
   return (
-    <div className="spine flex flex-col gap-6">
+    <div className="spine flex flex-col gap-7">
       <ConductorTopNode status={status} latest={topMsg} taskCount={tasks.length} />
 
       {planning ? (
@@ -166,7 +166,7 @@ function WaveSection({
   return (
     <div className="spine-item" style={{ animation: "var(--animate-rise)" }}>
       <span className="spine-node" style={{ fontSize: 10 }}>{wave}</span>
-      <div className="flex items-center gap-3 mb-2.5" style={{ minHeight: 21 }}>
+      <div className="flex items-center gap-3 mb-3" style={{ minHeight: 21 }}>
         <span className="label">Wave {wave}</span>
         <span className={`mono text-2xs ${failed ? "text-ink" : "text-ink-faint"}`}>
           {settled.length}/{group.length} settled{failed ? ` · ${failed} failed` : ""}

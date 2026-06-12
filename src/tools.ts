@@ -3,8 +3,9 @@ import * as path from "path";
 import { SwarmConfig } from "./config";
 import { ToolSchema } from "./deepseek";
 import { SandboxRuntime } from "./sandbox";
-import { RunMeta } from "./types";
+import { ForecastKind, RunMeta } from "./types";
 import { crawlSite, resolveCrawlBackend, slugForUrl } from "./crawltools";
+import { TimeSeriesSource, formatMarketHits, formatTimeSeries, marketOdds, timeSeries } from "./datatools";
 import { renderDocHtml } from "./report";
 import { mergeCandidates } from "./searchcore";
 import { ensureDir, errMsg, escapeHtml, pathInside, truncateMiddle } from "./util";
@@ -411,14 +412,29 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
           query: { type: "string" },
           count: { type: "number", description: "Max results, default 15, max 50" },
           deep: { type: "boolean", description: "Multi-phrasing sweep + fetch pages for quotable passages" },
+          freshness: {
+            type: "string",
+            enum: ["day", "week", "month", "year"],
+            description: "Only results published within this window (best-effort per engine) — use for current-events evidence",
+          },
         },
         required: ["query"],
       },
     },
     run: async (args, ctx) => {
       const count = Math.min(Math.max(Number(args.count) || 15, 1), 50);
-      const hits = await webSearch(ctx.cfg, String(args.query), count, ctx.signal, Boolean(args.deep), (msg) =>
-        ctx.log?.("warn", msg)
+      const freshness = ["day", "week", "month", "year"].includes(String(args.freshness))
+        ? (String(args.freshness) as "day" | "week" | "month" | "year")
+        : undefined;
+      const hits = await webSearch(
+        ctx.cfg,
+        String(args.query),
+        count,
+        ctx.signal,
+        Boolean(args.deep),
+        (msg) => ctx.log?.("warn", msg),
+        false,
+        freshness
       );
       if (!hits.length) return "no results";
       return hits
@@ -462,6 +478,69 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
       return merged
         .map((h, i) => `${i + 1}. ${h.title}${h.date ? ` (${h.date})` : ""} [${h.engine}]\n   ${h.url}\n   ${h.snippet}`)
         .join("\n");
+    },
+  };
+
+  tools.market_odds = {
+    schema: {
+      name: "market_odds",
+      description:
+        "Query prediction markets and forecasting platforms (Manifold, Polymarket, Kalshi — keyless; Metaculus too when its free token is configured) for live crowd probabilities on a topic. Returns matching questions with current P(YES), volume/forecaster count, close date, and URL. Crowd odds are a strong baseline forecast — cite the market URL like any other source, and reason explicitly about why you agree or deviate.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Topic or question to find markets for (try multiple phrasings across calls)" },
+          count: { type: "number", description: "Max markets, default 10, max 25" },
+        },
+        required: ["query"],
+      },
+    },
+    run: async (args, ctx) => {
+      const count = Math.min(Math.max(Number(args.count) || 10, 1), 25);
+      const hits = await marketOdds(ctx.cfg, String(args.query), count, ctx.signal, (m) => ctx.log?.("warn", m));
+      return formatMarketHits(hits);
+    },
+  };
+
+  tools.time_series = {
+    schema: {
+      name: "time_series",
+      description:
+        "Fetch a statistical/financial time series: fred (St. Louis Fed economic series, e.g. CPIAUCSL, UNRATE — needs the free fredApiKey), worldbank (INDICATOR:COUNTRY, e.g. NY.GDP.MKTP.CD:US — keyless), yahoo (daily market data: AAPL, ^GSPC, EURUSD=X, BTC-USD — keyless), gdelt (news-coverage volume for a query — keyless). Returns a stats summary, recent observations, and a ready-made ```chart block for reports. Use real data series to ground trend extrapolation instead of guessing.",
+      parameters: {
+        type: "object",
+        properties: {
+          source: { type: "string", enum: ["fred", "worldbank", "yahoo", "gdelt"] },
+          series: {
+            type: "string",
+            description: "FRED series id, World Bank INDICATOR:COUNTRY, Yahoo Finance symbol, or GDELT search query",
+          },
+          start: { type: "string", description: "Start date YYYY-MM-DD (optional)" },
+          end: { type: "string", description: "End date YYYY-MM-DD (optional)" },
+          project_to: {
+            type: "string",
+            description:
+              "YYYY-MM-DD: also fit an OLS trend line and project it to this date (e.g. the resolution date) with an 80% residual band — deterministic trend math to anchor extrapolation",
+          },
+        },
+        required: ["source", "series"],
+      },
+    },
+    run: async (args, ctx) => {
+      const source = String(args.source) as TimeSeriesSource;
+      if (!["fred", "worldbank", "yahoo", "gdelt"].includes(source)) {
+        throw new Error("source must be fred | worldbank | yahoo | gdelt");
+      }
+      const r = await timeSeries(
+        ctx.cfg,
+        source,
+        String(args.series),
+        args.start ? String(args.start) : undefined,
+        args.end ? String(args.end) : undefined,
+        ctx.signal
+      );
+      const projectTo = /^\d{4}-\d{2}-\d{2}$/.test(String(args.project_to ?? "")) ? String(args.project_to) : undefined;
+      return formatTimeSeries(r, projectTo);
     },
   };
 
@@ -772,6 +851,83 @@ export const REPORT_TOOL: ToolSchema = {
     required: ["status", "report"],
   },
 };
+
+/**
+ * Terminal tool for forecaster-panel agents (replaces report). Kind-aware so
+ * a binary panelist must give a probability and a numeric panelist must give
+ * quantiles — the engine validates, clamps, and aggregates mechanically.
+ */
+export function submitForecastTool(kind: ForecastKind): ToolSchema {
+  const binary = kind === "binary";
+  return {
+    name: "submit_forecast",
+    description:
+      "End your forecasting task by submitting your final structured forecast. This replaces report(...) — it is the ONLY output the conductor and the mechanical aggregator see. Your number is combined with the other panelists' in code; give your honest independent credence, not a hedge toward 50%.",
+    parameters: {
+      type: "object",
+      properties: {
+        ...(binary
+          ? {
+              prior: {
+                type: "number",
+                description:
+                  "FIRST COMMITMENT: the probability your reference classes ALONE imply (percentage 1-99), before weighing any current evidence. Compute this from your base_rates before reading the news mattered.",
+              },
+              probability: {
+                type: "number",
+                description:
+                  "Your FINAL probability the question resolves YES, as a percentage between 1 and 99, after adjusting the prior with concrete current evidence. Never 0 or 100 — certainty is never earned.",
+              },
+            }
+          : {
+              p10: { type: "number", description: "Your 10th percentile: a 10% chance the true value is below this" },
+              p50: { type: "number", description: "Your median estimate" },
+              p90: { type: "number", description: "Your 90th percentile: a 10% chance the true value is above this" },
+            }),
+        method: {
+          type: "string",
+          description: "Your assigned primary method, e.g. outside-view | inside-view | trend | market-anchored",
+        },
+        rationale: {
+          type: "string",
+          description:
+            "Your reasoning: reference classes and base rates FIRST, then case-specific adjustments, with the strongest consideration on each side.",
+        },
+        base_rates: {
+          type: "array",
+          items: { type: "string" },
+          description: "Reference classes you used, each with its historical frequency and source",
+        },
+        key_drivers: {
+          type: "array",
+          items: { type: "string" },
+          description: "The factors your forecast is most sensitive to",
+        },
+        update_triggers: {
+          type: "array",
+          items: { type: "string" },
+          description: "Concrete observable events that should move this forecast, with the direction they move it",
+        },
+        sources: {
+          type: "array",
+          description:
+            "Web sources your forecast rests on — REQUIRED when you drew on the web. They flow into the final report's bibliography.",
+          items: {
+            type: "object",
+            properties: {
+              url: { type: "string" },
+              title: { type: "string" },
+              date: { type: "string", description: "Publication date if known (ISO or year)" },
+              note: { type: "string", description: "What this source supports" },
+            },
+            required: ["url"],
+          },
+        },
+      },
+      required: [...(binary ? ["prior", "probability"] : ["p10", "p50", "p90"]), "method", "rationale"],
+    },
+  };
+}
 
 export const VERDICT_TOOL: ToolSchema = {
   name: "verdict",

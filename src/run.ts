@@ -25,6 +25,7 @@ export function optionsFromConfig(cfg: SwarmConfig, overrides: Partial<RunOption
     maxTasks: cfg.maxTasks,
     maxTokens: cfg.maxTokensPerRun,
     taskTimeoutMs: cfg.taskTimeoutMs,
+    panelSize: cfg.forecastPanelSize,
     verification: cfg.verification,
     thinking: cfg.thinking,
     reasoningEffort: cfg.reasoningEffort,

@@ -421,6 +421,7 @@ body {
   color: var(--color-ink);
   line-height: 1.7;
   font-size: var(--text-base);
+  max-width: 72ch;
 }
 .prose-report > :first-child { margin-top: 0; }
 .prose-report > :last-child { margin-bottom: 0; }
@@ -482,6 +483,7 @@ body {
 .prose-compact {
   font-size: var(--text-sm);
   line-height: 1.6;
+  max-width: none;
 }
 .prose-compact h1 { font-size: 1.2em; margin: 0.2em 0 0.5em; padding-bottom: 0.3em; }
 .prose-compact h2 { font-size: 1.1em; margin: 1em 0 0.4em; }

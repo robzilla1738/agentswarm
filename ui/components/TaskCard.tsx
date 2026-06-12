@@ -39,7 +39,7 @@ export function TaskCard({
   return (
     <button
       onClick={onClick}
-      className="panel panel-hover text-left p-3.5 w-full relative overflow-hidden flex flex-col"
+      className="panel panel-hover text-left p-4 w-full relative overflow-hidden flex flex-col"
       style={{
         animation: "var(--animate-rise)",
         borderColor: active ? "rgb(var(--hi) / 0.16)" : undefined,

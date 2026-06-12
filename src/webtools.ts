@@ -43,6 +43,8 @@ const DEEP_PASSAGES = 3;
  * and re-ranks by content quality. Ranking/passage algorithms live in
  * searchcore.ts.
  */
+export type Freshness = "day" | "week" | "month" | "year";
+
 export async function webSearch(
   cfg: SwarmConfig,
   query: string,
@@ -50,7 +52,8 @@ export async function webSearch(
   signal?: AbortSignal,
   deep = false,
   warn?: (msg: string) => void,
-  _retried = false
+  _retried = false,
+  freshness?: Freshness
 ): Promise<SearchHit[]> {
   // Deep searches widen recall by issuing complementary phrasings; the fast
   // path stays a single query so an agent's tool loop isn't slowed.
@@ -64,7 +67,7 @@ export async function webSearch(
       // `once` engines (context.dev: server-side fanout, billed per result)
       // run a single call on the original query, not one per phrasing.
       if (e.once && q !== queries[0]) continue;
-      let call = e.search(q, perEngine, signal, deep);
+      let call = e.search(q, perEngine, signal, deep, freshness);
       // When a paid engine is the sole engine by configuration, an outage must
       // not blank web research for the whole mission — fall back to the free
       // scraping engines for this call.
@@ -96,7 +99,7 @@ export async function webSearch(
       const alt = reformulate(query);
       if (alt) {
         warn?.(`no results for "${query}" — retrying as "${alt}"`);
-        return webSearch(cfg, alt, count, signal, deep, warn, true);
+        return webSearch(cfg, alt, count, signal, deep, warn, true, freshness);
       }
     }
     // At least one engine answered with a genuine empty result set: that is
@@ -196,7 +199,13 @@ function clip(text: string): string {
 
 export interface SearchEngine {
   name: string;
-  search: (query: string, count: number, signal?: AbortSignal, deep?: boolean) => Promise<Candidate[]>;
+  search: (
+    query: string,
+    count: number,
+    signal?: AbortSignal,
+    deep?: boolean,
+    freshness?: Freshness
+  ) => Promise<Candidate[]>;
   /**
    * Call once per webSearch, not per expanded phrasing — for engines that
    * fan out server-side and/or bill per result (context.dev).
@@ -217,8 +226,8 @@ export function searchEngines(cfg: SwarmConfig): SearchEngine[] {
     return [{ name: "contextdev", once: true, search: (q, n, s, deep) => contextdevSearch(cfg, q, n, s, deep) }];
   }
   const engines: SearchEngine[] = [
-    { name: "duckduckgo", search: ddgSearch },
-    { name: "bing", search: bingSearch },
+    { name: "duckduckgo", search: (q, n, s, _deep, fresh) => ddgSearch(q, n, s, fresh) },
+    { name: "bing", search: (q, n, s, _deep, fresh) => bingSearch(q, n, s, fresh) },
   ];
   if (cfg.searchBackend === "auto" && cfg.tinyfishApiKey) {
     engines.push({ name: "tinyfish", search: (q, n, s) => tinyfishSearch(cfg, q, n, s) });
@@ -348,12 +357,21 @@ const DDG_ENDPOINTS = [
   },
 ];
 
-export async function ddgSearch(query: string, count: number, signal?: AbortSignal): Promise<Candidate[]> {
+/** DDG date filter (`df=`): d/w/m/y windows. */
+const DDG_FRESHNESS: Record<Freshness, string> = { day: "d", week: "w", month: "m", year: "y" };
+
+export async function ddgSearch(
+  query: string,
+  count: number,
+  signal?: AbortSignal,
+  freshness?: Freshness
+): Promise<Candidate[]> {
+  const df = freshness ? `&df=${DDG_FRESHNESS[freshness]}` : "";
   let firstErr: unknown = null;
   let reachedAny = false;
   for (const ep of DDG_ENDPOINTS) {
     try {
-      const res = await engineFetch("duckduckgo", ep.url + encodeURIComponent(query), {
+      const res = await engineFetch("duckduckgo", ep.url + encodeURIComponent(query) + df, {
         headers: { "user-agent": UA },
       }, signal);
       if (!res.ok) throw new Error(`search failed: HTTP ${res.status}`);
@@ -392,9 +410,19 @@ function parseDdgHtml(html: string, count: number, linkRe: RegExp): Candidate[] 
   return hits;
 }
 
+/** Bing's recency filter (`filters=ex1:"ez<N>"`): 1=24h, 2=week, 3=month; no year window exists. */
+const BING_FRESHNESS: Partial<Record<Freshness, string>> = { day: "ez1", week: "ez2", month: "ez3" };
+
 /** Bing's HTML results page: each hit is an <li class="b_algo"> with an <h2><a> link. */
-export async function bingSearch(query: string, count: number, signal?: AbortSignal): Promise<Candidate[]> {
-  const res = await engineFetch("bing", `https://www.bing.com/search?q=${encodeURIComponent(query)}`, {
+export async function bingSearch(
+  query: string,
+  count: number,
+  signal?: AbortSignal,
+  freshness?: Freshness
+): Promise<Candidate[]> {
+  const ez = freshness ? BING_FRESHNESS[freshness] : undefined;
+  const filter = ez ? `&filters=${encodeURIComponent(`ex1:"${ez}"`)}` : "";
+  const res = await engineFetch("bing", `https://www.bing.com/search?q=${encodeURIComponent(query)}${filter}`, {
     headers: { "user-agent": UA, "accept-language": "en-US,en;q=0.9" },
   }, signal);
   if (!res.ok) throw new Error(`bing search ${res.status}`);

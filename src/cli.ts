@@ -33,6 +33,8 @@ import {
 import { Executor } from "./executor";
 import { SANDBOX_KINDS, SandboxKind, dockerAvailable, resolveSandboxKind, testSandbox } from "./sandbox";
 import { TerminalRenderer, watchRun } from "./terminal";
+import { ISO_DATE, calibrationStats, loadLedger, resolveLedgerEntry } from "./forecast";
+import { resolveDue, watchOpenForecasts } from "./resolve";
 import { RunMeta, RunOptions } from "./types";
 import { ansi, errMsg, fmtMoney, fmtTokens } from "./util";
 
@@ -86,6 +88,9 @@ export async function main(): Promise<void> {
       case "run":
         await cmdRun(_.slice(1).join(" "), flags);
         break;
+      case "forecast":
+        await cmdRun(_.slice(1).join(" "), { ...flags, mode: "forecast" });
+        break;
       case "_exec":
         await cmdExec(_[1], Boolean(flags.resume));
         break;
@@ -104,6 +109,15 @@ export async function main(): Promise<void> {
       case "ls":
       case "list":
         cmdList();
+        break;
+      case "forecasts":
+        await cmdForecasts(_[1]);
+        break;
+      case "resolve":
+        await cmdResolve(_.slice(1));
+        break;
+      case "calibration":
+        cmdCalibration();
         break;
       case "report":
         cmdReport(_[1], flags);
@@ -171,6 +185,19 @@ export function optionOverrides(flags: Args["flags"], cfg: SwarmConfig): Partial
     o.reasoningEffort = flags.effort as RunOptions["reasoningEffort"];
   }
   if (flags.safe === false) o.safeMode = false;
+  if (typeof flags.mode === "string") {
+    if (!["research", "forecast"].includes(flags.mode)) {
+      throw new Error("--mode must be one of: research | forecast");
+    }
+    o.mode = flags.mode as RunOptions["mode"];
+  }
+  if (typeof flags.by === "string") {
+    if (!ISO_DATE.test(flags.by) || !Number.isFinite(Date.parse(flags.by))) {
+      throw new Error("--by must be an ISO date (YYYY-MM-DD)");
+    }
+    o.resolutionDate = flags.by;
+  }
+  if (flags.panel) o.panelSize = numFlag("panel", "forecastPanelSize");
   if (typeof flags.sandbox === "string") {
     const v = flags.sandbox;
     if (v !== "auto" && !SANDBOX_KINDS.includes(v as SandboxKind)) {
@@ -528,6 +555,119 @@ function cmdCancel(id: string): void {
   console.log(ansi.yellow("⛔ cancel requested for ") + id);
 }
 
+// ---------------------------------------------------------------- forecasts
+
+async function cmdForecasts(sub?: string): Promise<void> {
+  const cfg = loadConfig();
+  if (sub === "watch") {
+    console.log(ansi.cyan("checking update triggers of open forecasts…"));
+    const alerts = await watchOpenForecasts(cfg, { log: (lvl, msg) => lvl !== "info" && console.error(ansi.gray(`  ${msg}`)) });
+    if (!alerts.length) {
+      console.log(ansi.gray("no open forecasts with update triggers to watch"));
+      return;
+    }
+    for (const a of alerts) {
+      console.log(`\n${a.fired ? ansi.yellow("▲ trigger fired") : ansi.green("· quiet")}  ${ansi.gray(a.id)}  ${a.question}`);
+      console.log(`  ${a.summary}`);
+      if (a.fired) console.log(ansi.gray(`  re-forecast: swarm forecast "${a.question}"`));
+    }
+    return;
+  }
+  const entries = loadLedger();
+  if (!entries.length) {
+    console.log(ansi.gray("no forecasts yet. make one: ") + 'swarm forecast "Will X happen by 2026-12-31?"');
+    return;
+  }
+  console.log(ansi.bold("forecasts") + ansi.gray("  (~/.agentswarm/forecasts/ledger.jsonl)"));
+  for (const e of entries) {
+    const agg = e.aggregate;
+    const headline =
+      typeof agg.probability === "number"
+        ? `${Math.round(agg.probability * 100)}%`
+        : agg.quantiles
+          ? `p50 ${agg.quantiles.p50}`
+          : "—";
+    const due = !e.resolution && Date.parse(`${e.question.resolutionDate}T23:59:59Z`) <= Date.now();
+    const status = e.resolution
+      ? e.resolution.outcome === "void"
+        ? ansi.gray("void")
+        : ansi.green(`resolved ${e.resolution.outcome === 1 ? "YES" : e.resolution.outcome === 0 ? "NO" : e.resolution.outcome}`) +
+          (e.resolution.brier !== undefined ? ansi.gray(`  brier ${e.resolution.brier.toFixed(3)}`) : "") +
+          (e.resolution.intervalScore !== undefined ? ansi.gray(`  interval ${e.resolution.intervalScore.toFixed(2)}`) : "")
+      : due
+        ? ansi.yellow("DUE — run: swarm resolve")
+        : ansi.gray(`open until ${e.question.resolutionDate}`);
+    console.log(`  ${ansi.gray(e.id)}  ${ansi.bold(headline.padEnd(6))} ${status}`);
+    console.log(`     ${clipLine(e.question.text, 90)}`);
+  }
+  const stats = calibrationStats(entries);
+  if (stats.n) {
+    console.log(ansi.gray(`\n${stats.n} resolved · mean Brier ${stats.brierMean.toFixed(3)} · details: swarm calibration`));
+  }
+}
+
+async function cmdResolve(rest: string[]): Promise<void> {
+  const cfg = loadConfig();
+  if (rest[0] === "set") {
+    const [, id, raw] = rest;
+    if (!id || raw === undefined) throw new Error("usage: swarm resolve set <id> yes|no|void|<value>");
+    const entry = loadLedger().find((e) => e.id === id);
+    if (!entry) throw new Error(`forecast not found: ${id}`);
+    if (entry.resolution) throw new Error(`${id} is already resolved`);
+    let outcome: 0 | 1 | number | "void";
+    if (raw === "yes") outcome = 1;
+    else if (raw === "no") outcome = 0;
+    else if (raw === "void") outcome = "void";
+    else if (entry.question.kind === "numeric" && Number.isFinite(Number(raw))) outcome = Number(raw);
+    else throw new Error(`outcome must be yes | no | void${entry.question.kind === "numeric" ? " | <number>" : ""}`);
+    const rec = resolveLedgerEntry(entry, outcome, { evidence: "operator override", sources: [], resolvedBy: "operator" });
+    console.log(
+      ansi.green("✓ resolved ") + id + (rec.brier !== undefined ? ansi.gray(`  brier ${rec.brier.toFixed(3)}`) : "")
+    );
+    return;
+  }
+  console.log(ansi.cyan("resolving past-due forecasts…"));
+  const result = await resolveDue(cfg, {
+    log: (lvl, msg) => (lvl === "info" ? console.log(ansi.gray(`  ${msg}`)) : console.error(ansi.yellow(`  ${msg}`))),
+  });
+  if (!result.resolved.length && !result.skipped.length) {
+    console.log(ansi.gray("nothing due. see open forecasts: swarm forecasts"));
+    return;
+  }
+  for (const r of result.resolved) {
+    const o = r.outcome === "void" ? "void" : r.outcome === 1 ? "YES" : r.outcome === 0 ? "NO" : String(r.outcome);
+    console.log(
+      `  ${ansi.green("✓")} ${ansi.gray(r.id)} → ${ansi.bold(o)}` +
+        (r.brier !== undefined ? ansi.gray(`  brier ${r.brier.toFixed(3)}`) : "") +
+        `  ${clipLine(r.question, 70)}`
+    );
+  }
+  for (const s of result.skipped) {
+    console.log(`  ${ansi.yellow("∅")} ${ansi.gray(s.id)} ${clipLine(s.question, 60)}\n    ${ansi.gray(s.reason)}`);
+  }
+}
+
+function cmdCalibration(): void {
+  const entries = loadLedger();
+  const stats = calibrationStats(entries);
+  if (!stats.n) {
+    console.log(ansi.gray("no resolved binary forecasts yet — resolve some first: swarm resolve"));
+    return;
+  }
+  console.log(ansi.bold("calibration") + ansi.gray(`  (${stats.n} resolved · mean Brier ${stats.brierMean.toFixed(3)} — 0.25 = "always 50%", lower is better)`));
+  console.log(ansi.gray("  band        said   resolved YES   n"));
+  for (const b of stats.bins) {
+    const said = `${Math.round(b.meanP * 100)}%`.padStart(4);
+    const hit = `${Math.round(b.hitRate * 100)}%`.padStart(6);
+    console.log(`  ${`${b.lo * 100}–${b.hi * 100}%`.padEnd(11)} ${said}        ${hit}   ${b.n}`);
+  }
+  const methods = Object.entries(stats.byMethod).sort((a, b) => a[1].brierMean - b[1].brierMean);
+  if (methods.length) {
+    console.log(ansi.bold("\nby panel method") + ansi.gray("  (mean Brier per panelist method)"));
+    for (const [m, s] of methods) console.log(`  ${m.padEnd(18)} ${s.brierMean.toFixed(3)}  ${ansi.gray(`n=${s.n}`)}`);
+  }
+}
+
 // ---------------------------------------------------------------- config / models
 
 async function cmdConfig(rest: string[], flags: Args["flags"]): Promise<void> {
@@ -687,10 +827,17 @@ function printHelp(): void {
 
 ${b("USAGE")}
   swarm run "<mission>" [options]     decompose & execute a mission with a parallel swarm
+  swarm forecast "<question>" [--by YYYY-MM-DD] [--panel N]
+                                      forecast an event: research waves + an independent
+                                      forecaster panel, aggregated into a calibrated probability
   swarm serve [--port 7777] [--open]  start the mission-control web UI + API
   swarm watch <id>                    attach a live dashboard to a run
   swarm resume <id> [--fg]            resume an interrupted run (done tasks keep their results)
   swarm ls                            list runs
+  swarm forecasts [watch]             list the forecast ledger (watch: re-check update triggers)
+  swarm resolve [set <id> <outcome>]  resolve past-due forecasts & score them (Brier/log);
+                                      set = operator override (yes|no|void|<value>)
+  swarm calibration                   the system's track record: reliability table + per-method Brier
   swarm report <id> [--open]          print (or open) a run's final report
   swarm note <id> "<text>"            steer a live run (the conductor reads it)
   swarm cancel <id>                   stop a run gracefully (still synthesizes)

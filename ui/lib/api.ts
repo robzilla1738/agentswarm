@@ -1,4 +1,4 @@
-import type { RunSnapshot, RunSummary, SwarmEvent } from "./types";
+import type { CalibrationStats, LedgerEntry, RunSnapshot, RunSummary, SwarmEvent } from "./types";
 
 /**
  * Resolve the hub base URL. When the UI is served by the hub itself, the API
@@ -93,6 +93,13 @@ export interface PublicConfig {
   contextWindows: Record<string, number>;
   cheapModel: string;
   strongModel: string;
+  fredKeySet: boolean;
+  fredKeyMasked: string;
+  metaculusKeySet: boolean;
+  metaculusKeyMasked: string;
+  forecastPanelSize: number;
+  forecastExtremizeK: number;
+  forecastCoherenceProbe: boolean;
   knownModels: string[];
   pricing: Record<string, { inMiss: number; inHit: number; out: number }>;
 }
@@ -138,5 +145,20 @@ export const api = {
   },
   artifactUrl: (id: string, name: string) => hubBase() + `/api/runs/${id}/artifacts/${encodeURIComponent(name)}`,
   reportUrl: (id: string) => hubBase() + `/api/runs/${id}/report`,
+  reportHtmlUrl: (id: string, opts?: { theme?: "light" | "dark"; print?: boolean }) => {
+    const q = new URLSearchParams();
+    if (opts?.theme) q.set("theme", opts.theme);
+    if (opts?.print) q.set("print", "1");
+    const qs = q.toString();
+    return hubBase() + `/api/runs/${id}/report.html${qs ? `?${qs}` : ""}`;
+  },
   streamUrl: (id: string) => hubBase() + `/api/runs/${id}/stream`,
+  forecasts: () => jget<{ forecasts: LedgerEntry[]; calibration: CalibrationStats }>("/api/forecasts"),
+  resolveForecasts: (ids?: string[]) =>
+    jpost<{
+      resolved: { id: string; outcome: 0 | 1 | number | "void"; brier?: number; question: string }[];
+      skipped: { id: string; question: string; reason: string }[];
+    }>("/api/forecasts/resolve", ids?.length ? { ids } : {}),
+  resolveManual: (id: string, outcome: "yes" | "no" | "void" | number) =>
+    jpost<{ ok: boolean }>(`/api/forecasts/${id}/resolve`, { outcome }),
 };

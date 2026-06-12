@@ -33,12 +33,13 @@ export default function Dashboard() {
       <TopBar hideLogo />
       <main className="max-w-6xl mx-auto px-5 sm:px-8 pb-10">
         <div
-          className="max-w-3xl mx-auto flex flex-col justify-center"
-          style={runs.length === 0 ? { minHeight: "calc(100vh - 3.5rem)" } : { paddingTop: 40 }}
+          className={`max-w-3xl mx-auto flex flex-col justify-center ${
+            runs.length === 0 ? "min-h-[calc(100vh-3.5rem)]" : "pt-10"
+          }`}
         >
           <div className="flex flex-col items-center gap-3 mb-8" style={{ animation: "var(--animate-rise)" }}>
             <LogoMark size={64} />
-            <h1 className="font-display" style={{ fontSize: 26 }}>
+            <h1 className="font-display text-[26px]">
               agentswarm
             </h1>
           </div>
@@ -46,15 +47,15 @@ export default function Dashboard() {
         </div>
 
         {error && (
-          <div className="panel p-4 mt-6 text-sm text-ink-dim">
+          <div className="panel p-4 mt-8 text-sm text-ink-dim">
             Can&apos;t reach the hub: {error}. Make sure <span className="mono text-ink">swarm serve</span> is running.
           </div>
         )}
 
         {live.length > 0 && (
-          <section className="mt-8">
+          <section className="mt-10">
             <h2 className="label mb-4 flex items-center gap-2">
-              <span className="rounded-full bg-ink" style={{ width: 7, height: 7, boxShadow: "0 0 8px var(--color-ink)" }} />
+              <span className="rounded-full bg-ink w-[7px] h-[7px] shadow-[0_0_8px_var(--color-ink)]" />
               Live now · {live.length}
             </h2>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -66,7 +67,7 @@ export default function Dashboard() {
         )}
 
         {loading && runs.length === 0 && (
-          <section className="mt-12">
+          <section className="mt-10">
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
               {[0, 1, 2].map((i) => (
                 <div key={i} className="panel h-40 skeleton opacity-50" />
@@ -76,7 +77,7 @@ export default function Dashboard() {
         )}
 
         {!loading && runs.length === 0 && !error && (
-          <section className="mt-12">
+          <section className="mt-10">
             <EmptyState
               glyph="◇"
               title="No missions yet"
@@ -86,7 +87,7 @@ export default function Dashboard() {
         )}
 
         {past.length > 0 && (
-          <section className="mt-12">
+          <section className="mt-10">
             <div className="flex items-baseline justify-between gap-4 mb-4">
               <h2 className="label">History · {past.length}</h2>
               <span className="mono text-2xs text-ink-faint">

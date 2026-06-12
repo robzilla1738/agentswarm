@@ -6,6 +6,38 @@ import remarkGfm from "remark-gfm";
 import { api } from "@/lib/api";
 import { CopyButton, EmptyState, Spinner } from "./atoms";
 
+/**
+ * Opens the styled report with ?print=1 — the document auto-opens the print
+ * dialog, where "Save as PDF" is the destination. Dark is the default;
+ * the chevron offers light.
+ */
+function PdfMenu({ id }: { id: string }) {
+  const [open, setOpen] = useState(false);
+  const save = (theme: "light" | "dark") => {
+    window.open(api.reportHtmlUrl(id, { theme, print: true }), "_blank", "noreferrer");
+    setOpen(false);
+  };
+  return (
+    <span className="relative" onMouseLeave={() => setOpen(false)}>
+      <button className="btn btn-sm" title="Opens the print dialog — choose “Save as PDF”" onClick={() => setOpen((v) => !v)}>
+        Save PDF <span className="text-[9px]">▼</span>
+      </button>
+      {open && (
+        <span className="absolute right-0 top-full pt-1 z-10 flex">
+          <span className="panel p-1 flex flex-col min-w-[130px]">
+            <button className="btn btn-ghost btn-sm justify-start" onClick={() => save("dark")}>
+              Dark <span className="text-2xs text-ink-faint">default</span>
+            </button>
+            <button className="btn btn-ghost btn-sm justify-start" onClick={() => save("light")}>
+              Light
+            </button>
+          </span>
+        </span>
+      )}
+    </span>
+  );
+}
+
 export function ReportPanel({ id, hasFinal, live }: { id: string; hasFinal: boolean; live?: boolean }) {
   const [report, setReport] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -78,6 +110,10 @@ export function ReportPanel({ id, hasFinal, live }: { id: string; hasFinal: bool
           >
             <span className="label">Final report</span>
             <div className="flex items-center gap-1.5">
+              <a className="btn btn-sm" href={api.reportHtmlUrl(id)} target="_blank" rel="noreferrer">
+                Open HTML ↗
+              </a>
+              <PdfMenu id={id} />
               <CopyButton text={report} label="Copy markdown" />
               <button className="btn btn-sm" onClick={download}>Download .md</button>
               <a className="btn btn-sm" href={api.reportUrl(id)} target="_blank" rel="noreferrer">

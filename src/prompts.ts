@@ -1,5 +1,5 @@
 import * as os from "os";
-import { RunMeta, Task } from "./types";
+import { AggregateForecast, ForecastQuestion, RunMeta, Task } from "./types";
 import { clip, fmtTokens } from "./util";
 
 // ============================================================ conductor
@@ -165,6 +165,29 @@ const ROLE_HINTS: Record<string, string> = {
     "Review craft: be adversarial; try to break it; check edge cases and the unhappy path; verify claims against the actual files, not the description.",
   "data-wrangler":
     "Data craft: validate schema and row counts at every step; spot-check samples; never silently drop rows — report anomalies.",
+  forecaster:
+    "Forecasting craft (superforecaster discipline):\n" +
+    "• OUTSIDE VIEW FIRST: before weighing any case-specific evidence, find at least 2 reference classes and their historical base rates (\"how often do situations like this resolve YES?\"). Commit that number as your `prior` BEFORE weighing the news — the engine records prior → final, and a large gap had better be earned.\n" +
+    "• The STATUS-QUO outcome usually carries the highest base rate: count how often \"nothing changed\" won in comparable situations before believing this time is different.\n" +
+    "• Work your ASSIGNED METHOD as the primary lens, but sanity-check against the others.\n" +
+    "• Check market_odds (several phrasings) — calibrated crowds are a strong baseline. State explicitly whether you deviate from the crowd and exactly why your evidence beats theirs.\n" +
+    "• Use time_series with project_to=<resolution date> for any quantitative trend that bears on the question — ground extrapolation in the OLS projection it returns, not in narrative momentum.\n" +
+    "• NEWS VOLUME MEASURES ATTENTION, NOT PROBABILITY. Heavy coverage of a possibility is not evidence it will happen (use gdelt to see attention for what it is, then ask what the boring base rate says). Commentary and prediction articles are sentiment; primary documents, data series, and counted history are evidence.\n" +
+    "• TIME WINDOW: a \"by DATE\" question is about the remaining window. Decompose into per-period hazard rates — the same event with less remaining time deserves a lower probability, whatever the headlines say.\n" +
+    "• Consider BOTH directions: write down the strongest case for YES and the strongest case for NO before settling.\n" +
+    "• Premortem: assume your forecast is wrong — what did you miss? Adjust if the answer stings.\n" +
+    "• If your final differs from your prior by more than ~20 points, name the concrete evidence that moved you — dated facts, numbers, rulings, filings. Headlines and pundit consensus do not count.\n" +
+    "• Meaningful precision: think in steps of ~3-5 percentage points. Never 0 or 100. Do not hedge to 50% to feel safe — an ensemble needs your honest credence.\n" +
+    "• INDEPENDENCE IS SACRED: never post your probability (or any number that implies it) to the blackboard, and never seek out another panelist's number. Your value to the ensemble is an independent estimate.\n" +
+    "• Read the resolution criteria literally — forecast the question AS RESOLVED, not the vibe of the topic.\n" +
+    "• End with submit_forecast(...): prior committed first, base_rates filled with real counted frequencies, key_drivers concrete, update_triggers observable events with direction, sources for everything web-derived.",
+  "red-team":
+    "Red-team craft: your job is to attack the forecast panel's reasoning, not to re-forecast.\n" +
+    "• Hunt for: correlated evidence (panelists all leaning on the same source — same sources means fewer independent views than the panel size suggests), stale or superseded sources, base-rate neglect, scope insensitivity (would they give the same number for a 10× bigger claim?), resolution-criteria misreads, narrative seduction (a vivid story beating a boring base rate), and anchoring on a market price without checking its volume/liquidity.\n" +
+    "• PRIOR → FINAL DELTAS: each panelist committed a base-rate prior before weighing the news. A final far from the prior justified only by headlines, commentary, or coverage volume is the classic failure — name it, with the direction it biases the forecast.\n" +
+    "• Check the time window: did the panelist forecast the event \"eventually\" instead of by the resolution date?\n" +
+    "• Verify the panel's load-bearing facts with your own searches — the freshest evidence wins.\n" +
+    "• Report one concrete problem per finding, naming the task id it applies to, the evidence, and which DIRECTION the flaw likely biases the forecast. If the panel's reasoning holds, say so plainly.",
 };
 
 export function workerSystem(opts: {
@@ -177,9 +200,20 @@ export function workerSystem(opts: {
   blackboard: string;
   operatorNotes: string[];
   dirListing: string;
+  /** Extra craft appended after the role hint (e.g. the forecaster calibration track record). */
+  extraCraft?: string;
+  /** Terminal tool the agent must end with (forecaster panelists use submit_forecast). */
+  terminalName?: "report" | "submit_forecast";
 }): string {
   const { meta, task } = opts;
-  const roleHint = ROLE_HINTS[opts.role.toLowerCase()] ?? "";
+  const roleHint = [ROLE_HINTS[opts.role.toLowerCase()] ?? "", opts.extraCraft ?? ""].filter(Boolean).join("\n\n");
+  const forecaster = opts.terminalName === "submit_forecast";
+  const blockedLine = forecaster
+    ? `- If the evidence is genuinely too thin, still call submit_forecast with your best base-rate-anchored estimate and say so plainly in the rationale — an honest wide-uncertainty forecast beats no forecast.`
+    : `- Genuinely impossible / missing prerequisite → report(status:"blocked", …) early instead of thrashing.`;
+  const endLine = forecaster
+    ? `- ALWAYS end by calling submit_forecast(...). The conductor and the mechanical aggregator see ONLY that — your number joins an independent panel. Fill base_rates (real frequencies), key_drivers, update_triggers (observable, with direction), and sources for everything web-derived.`
+    : `- ALWAYS end by calling report(...). The conductor sees ONLY that report — it is the entire value of your work. Specific beats vague: what you did, what you verified, key findings, exact paths. Fill key_facts (standalone facts downstream tasks need), open_questions, and files_touched — they are handed verbatim to dependent tasks. If your work drew on the web, fill sources (url + what it supports): only sources reported there can be cited in the final deliverable.`;
   const retry =
     task.attempt > 1 && task.feedback
       ? `\nPREVIOUS ATTEMPT FAILED VERIFICATION — fix exactly this:\n${task.feedback}\n`
@@ -213,20 +247,23 @@ OPERATING PROTOCOL
 - Save deliverable files with save_artifact so the operator sees them. Pick the format that genuinely fits the deliverable — structured data as .csv/.json, polished documents as .html, code as runnable files — not everything is a markdown report.
 - For polished documents: save MARKDOWN under a .html artifact name — the engine renders it into a styled document automatically. Never hand-write HTML/CSS. Visualize data with \`\`\`chart fenced blocks (JSON: type line | bar | donut | stat — see the save_artifact tool description) — a price history, allocation split, or vitals trend lands far better as a chart than a table.
 - On long tasks, call checkpoint(...) after each major chunk so an interrupted run resumes warm instead of from scratch.
-- Genuinely impossible / missing prerequisite → report(status:"blocked", …) early instead of thrashing.
+${blockedLine}
 - You have at most ${opts.maxSteps} tool steps. Budget them.
 - Dependency reports above are excerpts; use read_report(task_id) for full text, and search_notes(query) to find facts posted earlier in the run.
-- ALWAYS end by calling report(...). The conductor sees ONLY that report — it is the entire value of your work. Specific beats vague: what you did, what you verified, key findings, exact paths. Fill key_facts (standalone facts downstream tasks need), open_questions, and files_touched — they are handed verbatim to dependent tasks. If your work drew on the web, fill sources (url + what it supports): only sources reported there can be cited in the final deliverable.
+${endLine}
 ${roleHint ? "\n" + roleHint : ""}`;
 }
 
 export const WORKER_KICKOFF = "Begin now. Work the task to completion, then call report(...).";
 
+export const FORECASTER_KICKOFF =
+  "Begin now. Research base rates and current evidence, reason both directions, then call submit_forecast(...).";
+
 export const NUDGE_USE_TOOLS =
-  "Reminder: act via tool calls only. Continue the work; when complete (or truly blocked), call report(...). Do not reply with plain text.";
+  "Reminder: act via tool calls only. Continue the work; when complete (or truly blocked), call your terminal tool. Do not reply with plain text.";
 
 export const STEP_LIMIT_FINAL =
-  "You have hit the step limit. Call report(...) RIGHT NOW with your best honest account: what you completed, what you verified, what remains.";
+  "You have hit the step limit. Call your terminal tool RIGHT NOW with your best honest account: what you completed, what you verified, what remains.";
 
 export function forcedFinal(reason: string): string {
   return `${reason} Stop working and call your terminal tool RIGHT NOW with your best honest account: what you completed, what you verified, what remains.`;
@@ -296,6 +333,117 @@ ${opts.sources ? `- CITE YOUR SOURCES: where a claim rests on a numbered source,
 }
 
 export const SYNTH_KICKOFF = "Compose and submit the final deliverable now via submit_final(...).";
+
+// ============================================================ forecasting
+
+export function questionBlock(q: ForecastQuestion): string {
+  return [
+    `THE QUESTION: ${q.text}`,
+    `Kind: ${q.kind}${q.unit ? ` (unit: ${q.unit})` : ""}`,
+    `Resolution criteria: ${q.resolutionCriteria}`,
+    `Resolution date: ${q.resolutionDate}`,
+  ].join("\n");
+}
+
+/**
+ * Appended to the conductor system prompt in forecast mode — the
+ * superforecasting pipeline doctrine. The two things the conductor must NOT
+ * own are the question structure and the aggregation math; both are the
+ * engine's (deterministic code).
+ */
+export function forecastConductorAddendum(q: ForecastQuestion, panelSize: number, calibration: string): string {
+  return `
+THIS IS A FORECAST MISSION. The deliverable is a calibrated ${q.kind === "binary" ? "probability" : "numeric range"}, produced by an independent forecaster panel and aggregated MECHANICALLY by the engine — never by you or any agent.
+
+${questionBlock(q)}
+
+FORECAST PIPELINE (structure the run exactly like this):
+1. RESEARCH WAVE — parallel scouts, none of which states a probability:
+   • a base-rate researcher: find ≥2 reference classes and produce COUNTED frequencies ("X of N comparable cases resolved YES — list the N"), including the status-quo rate (how often did nothing change?); a rate without its denominator is an opinion;
+   • current-evidence scouts: the latest news and primary data (web_search with freshness + deep:true). Instruct them to SEPARATE established facts (dates, numbers, primary documents, official statements) from commentary and predictions, to collect disconfirming evidence explicitly, and to dedupe wire-republished stories — the same story on ten sites is ONE piece of evidence;
+   • a markets/data task: call market_odds with several phrasings of the question, and time_series (with project_to=<resolution date>) for any quantitative series that bears on it — the OLS projection is the trend baseline the panel should argue against.
+2. PANEL WAVE — spawn ${panelSize} INDEPENDENT tasks with role "forecaster", every one depending only on research tasks, NEVER on another forecaster. Assign each a DISTINCT method label in its objective and context: outside-view (anchor on base rates), inside-view (causal model of this specific case), trend (extrapolate the data), market-anchored (start from crowd odds, adjust for what they miss), plus extra angles if the panel is larger (e.g. skeptic, time-horizon). Spread model tiers across the panel (some model:"cheap", some "default", at least one "strong") — model diversity improves the ensemble. Inline the question, criteria, and date verbatim in each forecaster's context. Forecasters end with submit_forecast.
+3. RED-TEAM WAVE — one task with role "red-team" depending on all panel tasks: attack the rationales (correlated evidence, stale sources, base-rate neglect, criteria misreads) and say which direction each flaw biases the forecast.
+4. REVISION WAVE — only if the red-team found MATERIAL flaws in specific forecasts: for each flawed one, spawn a fresh role "forecaster" task (model:"cheap") depending on the red-team task, with context = that panelist's original rationale + the red-team findings + the SAME method label verbatim. The engine keeps the latest forecast per method label, so a revision replaces its original.
+5. finish — your notes guide the synthesizer's prose. Do NOT state a number of your own and do NOT average the panel; the engine computes the aggregate and hands the exact figures to the synthesizer.
+
+FORECAST RULES
+- Research tasks post evidence to the blackboard; forecasters must never post numbers there. Panel independence is the entire value of the ensemble.
+- Do not set verify:true on forecaster tasks — the red-team wave is their verification. Research tasks may be verified as usual.
+- If a forecaster fails or is blocked, the aggregate simply uses the panel that exists — prefer re-spawning a replacement (same method) over finishing with fewer than 3 panelists.
+${calibration ? `\n${calibration}\nSteer the panel accordingly (e.g. demand stronger base-rate work where the record shows overconfidence).` : ""}`;
+}
+
+/**
+ * Appended to the synthesizer system prompt in forecast mode. The aggregate
+ * block carries the exact computed numbers; the synthesizer's job is the
+ * prose around them, never the arithmetic.
+ */
+export function forecastSynthAddendum(aggregateBlock: string): string {
+  return `
+FORECAST DELIVERABLE
+This was a forecast mission. The engine already aggregated the panel mechanically. THESE NUMBERS ARE FINAL — use them exactly as given (no recomputing, re-rounding, or averaging):
+
+${aggregateBlock}
+
+Structure report_markdown for a forecast:
+1. # <the question>
+2. Open with a \`\`\`chart stat block headlining the forecast (e.g. {"type":"stat","items":[{"label":"P(YES) — ensemble","value":"68%"},{"label":"Panel median","value":"70%"},{"label":"Panel","value":"5 forecasters"}]}), then state the forecast in one plain-language sentence.
+3. ## Resolution criteria — the criteria and date, verbatim.
+4. ## The panel — a markdown table: method | forecast | core rationale (one line each). Note the spread and what disagreement, if any, was about.
+5. ## Key drivers — the factors the forecast is most sensitive to.
+6. ## Scenarios — a table of the main ways the question resolves each way, with rough likelihood bands consistent with the headline number.
+7. ## What would change this forecast — the panel's update triggers: concrete, observable, with direction.
+8. ## Market comparison — what the prediction markets/crowds say vs the ensemble, and why they differ (if they do).
+9. ## Sources — as usual.
+Where the red-team found problems, say honestly how they were (or weren't) addressed.`;
+}
+
+/** One-shot question sharpener (forecast mode pre-step). Strict JSON out. */
+export function sharpenQuestionPrompt(mission: string, today: string, operatorDate?: string): string {
+  return `You are sharpening a forecasting question so it can be resolved objectively later. Today is ${today}.
+
+MISSION (as the operator phrased it)
+${mission}
+${operatorDate ? `\nThe operator set the resolution date: ${operatorDate}.` : ""}
+
+Rewrite it as a precisely resolvable question. Reply with ONLY a JSON object (no prose, no markdown fence):
+{"text": "...", "kind": "binary" | "numeric", "resolutionCriteria": "...", "resolutionDate": "YYYY-MM-DD", "unit": "..."}
+
+- text: unambiguous, self-contained, includes the date (e.g. "Will X happen before 2026-09-01?"). NEUTRALIZE the framing: strip loaded words, presuppositions, and the asker's lean ("Will the disastrous X finally collapse?" → "Will X fall below Y by DATE?") — the forecasters must inherit a neutral event statement, not an opinion.
+- kind: "binary" for will-it-happen questions; "numeric" for what-will-the-value-be questions (then include unit, else omit it).
+- resolutionCriteria: exactly what counts as YES (or how the value is measured), naming the authoritative public source to check.
+- resolutionDate: ${operatorDate ? `use ${operatorDate}` : "the ISO date when the answer is knowable — infer it from the mission; if the mission names no horizon, pick a sensible near-term one"}.
+- Keep the question's intent; sharpen, don't replace it.`;
+}
+
+/** The exact-numbers block handed to the synthesizer (and journaled for the UI). */
+export function aggregateBlock(q: ForecastQuestion, agg: AggregateForecast, panelLines: string[]): string {
+  const pct = (p: number) => `${Math.round(p * 100)}%`;
+  const lines: string[] = [questionBlock(q), ""];
+  if (q.kind === "binary" && typeof agg.probability === "number") {
+    lines.push(
+      `ENSEMBLE FORECAST (extremized geometric mean of odds, k=${agg.k}): P(YES) = ${pct(agg.probability)}`,
+      `Panel median: ${pct(agg.median ?? agg.probability)} · unextremized mean of odds: ${pct(agg.gmo ?? agg.probability)} · panel size: ${agg.n} · spread: ${Math.round(agg.spread * 100)} points`
+    );
+    if (typeof agg.evidenceOverlap === "number") {
+      lines.push(
+        `Panel evidence overlap: ${Math.round(agg.evidenceOverlap * 100)}% — extremization was scaled to k=${agg.k} accordingly (shared sources mean fewer independent views).`
+      );
+    }
+  } else if (agg.quantiles) {
+    const u = q.unit ? ` ${q.unit}` : "";
+    lines.push(
+      `ENSEMBLE FORECAST (10%-trimmed mean per quantile): p10 ${agg.quantiles.p10}${u} · p50 ${agg.quantiles.p50}${u} · p90 ${agg.quantiles.p90}${u}`,
+      `Panel size: ${agg.n} · relative p50 spread: ${Math.round(agg.spread * 100)}%`
+    );
+  }
+  if (agg.spread > 0.25) {
+    lines.push(`NOTE: the panel disagreed substantially — present the disagreement honestly, not just the point estimate.`);
+  }
+  lines.push("", "PANEL:", ...panelLines);
+  return lines.join("\n");
+}
 
 // ============================================================ completeness / synthesis checks
 

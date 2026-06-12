@@ -14,6 +14,13 @@ const EXAMPLES = [
   ["Plan", "Plan and draft a 6-email onboarding sequence for a developer-tools SaaS, with subject lines and send timing."],
 ] as const;
 
+const FORECAST_EXAMPLES = [
+  ["Rates", "Will the Federal Reserve cut its target rate at the next FOMC meeting?"],
+  ["Elections", "Will the incumbent party win the next national election in Germany?"],
+  ["Tech", "Will a major AI lab release a publicly available model that scores above 95% on SWE-bench Verified before year end?"],
+  ["Markets", "What will the S&P 500 close at on the last trading day of this quarter?"],
+] as const;
+
 const clamp = (v: number, lo: number, hi: number, fallback: number) =>
   Number.isFinite(v) ? Math.min(hi, Math.max(lo, Math.round(v))) : fallback;
 
@@ -45,6 +52,9 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
   const [effort, setEffort] = useState("high");
   const [workspace, setWorkspace] = useState<"sandbox" | "dir">("sandbox");
   const [cwd, setCwd] = useState("");
+  const [mode, setMode] = useState<"research" | "forecast">("research");
+  const [resolutionDate, setResolutionDate] = useState("");
+  const [panelSize, setPanelSize] = useState(5);
 
   // Config arrives async; adopt its defaults unless the operator already
   // touched the options (useState initializers only run on first render).
@@ -58,6 +68,7 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
     setVerification(config.verification);
     setModel(config.model);
     setEffort(config.reasoningEffort);
+    if (config.forecastPanelSize) setPanelSize(config.forecastPanelSize);
   }, [config]);
 
   const noKey = config ? !config.apiKeySet : false;
@@ -112,6 +123,9 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
           verification,
           model,
           reasoningEffort: effort,
+          mode,
+          ...(mode === "forecast" && resolutionDate ? { resolutionDate } : {}),
+          ...(mode === "forecast" ? { panelSize: clamp(panelSize, 3, 11, 5) } : {}),
         },
       });
       router.push(`/run?id=${id}`);
@@ -128,22 +142,61 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
 
   return (
     <section className="panel p-5 sm:p-6" style={{ animation: "var(--animate-rise)" }}>
+      <div className="flex items-center gap-1.5 mb-3">
+        <PresetChip active={mode === "research"} onClick={() => setMode("research")} title="Decompose a mission into parallel research/build tasks">
+          Research
+        </PresetChip>
+        <PresetChip
+          active={mode === "forecast"}
+          onClick={() => setMode("forecast")}
+          title="Forecast an event: research waves feed an independent forecaster panel, mechanically aggregated into a calibrated probability"
+        >
+          Forecast
+        </PresetChip>
+      </div>
+
       <textarea
-        className="input resize-none"
+        className="input resize-none text-[15px] leading-relaxed"
         rows={3}
         autoFocus
-        placeholder="Describe a mission — the swarm decomposes it into parallel tasks and runs them autonomously."
+        placeholder={
+          mode === "forecast"
+            ? 'Ask about the future — "Will X happen by 2026-12-31?" or "What will Y be in Q3?" — and get a calibrated probability from an independent forecaster panel.'
+            : "Describe a mission — the swarm decomposes it into parallel tasks and runs them autonomously."
+        }
         value={mission}
         onChange={(e) => setMission(e.target.value)}
         onKeyDown={(e) => {
           if ((e.metaKey || e.ctrlKey) && e.key === "Enter") launch();
         }}
-        style={{ fontSize: 15, lineHeight: 1.6 }}
       />
+
+      {mode === "forecast" && (
+        <div className="grid grid-cols-2 gap-3 mt-3">
+          <Field label="Resolution date" hint="when the answer is knowable">
+            <input
+              type="date"
+              className="input"
+              value={resolutionDate}
+              onChange={(e) => setResolutionDate(e.target.value)}
+            />
+          </Field>
+          <Field label="Forecaster panel" hint="independent panelists">
+            <input
+              type="number"
+              className="input"
+              min={3}
+              max={11}
+              value={panelSize}
+              onChange={(e) => setPanelSize(+e.target.value)}
+            />
+          </Field>
+        </div>
+      )}
 
       <div className="flex flex-wrap items-center gap-1.5 mt-3">
         <span className="text-2xs text-ink-faint mr-1">Try</span>
-        {EXAMPLES.map(([tag, ex]) => (
+        {(mode === "forecast" ? FORECAST_EXAMPLES : EXAMPLES).map(([tag, ex]) => (
           <button key={tag} onClick={() => setMission(ex)} title={ex} className="chip">
             {tag}
           </button>
@@ -160,7 +213,7 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
           onClick={() => setAdvanced((v) => !v)}
         >
           {preset === "custom" ? "Options · custom" : `Options · ${preset}`}
-          <span style={{ fontSize: 9, transform: advanced ? "rotate(180deg)" : "none", transition: "transform 0.15s" }}>▼</span>
+          <span className="text-[9px]" style={{ transform: advanced ? "rotate(180deg)" : "none", transition: "transform 0.15s" }}>▼</span>
         </button>
       </div>
 
@@ -186,10 +239,10 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
             <PresetChip active={preset === "deep"} onClick={() => applyPreset(DEEP)} title="20 agents · 300 tasks · 120M budget · strict verification — hundreds of sources, long-horizon research">
               Deep research
             </PresetChip>
-            {preset === "custom" && <span className="chip" style={{ color: "var(--color-ink)" }}>custom</span>}
+            {preset === "custom" && <span className="chip text-ink">custom</span>}
           </div>
 
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3" onInput={markTouched}>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3" onInput={markTouched}>
             <Field label="Agents in parallel" hint="working at once">
               <input type="number" className="input" min={1} max={256} value={workers} onChange={(e) => setWorkers(+e.target.value)} />
             </Field>
@@ -260,7 +313,7 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
       </div>
 
       {error && (
-        <div className="mt-3 text-sm text-ink px-3 py-2 rounded-lg" style={{ background: "rgb(var(--hi) / 0.06)", border: "1px solid rgb(var(--hi) / 0.2)" }}>
+        <div className="mt-3 text-sm text-ink px-3 py-2 rounded-[10px]" style={{ background: "rgb(var(--hi) / 0.06)", border: "1px solid rgb(var(--hi) / 0.2)" }}>
           {error}
         </div>
       )}
@@ -284,7 +337,7 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
           )}
         </div>
         <button className="btn btn-primary" disabled={!mission.trim() || submitting || noKey || needsCwd} onClick={launch}>
-          {submitting && <Spinner size={13} dark />} Launch swarm
+          {submitting && <Spinner size={13} dark />} {mode === "forecast" ? "Launch forecast" : "Launch swarm"}
         </button>
       </div>
     </section>

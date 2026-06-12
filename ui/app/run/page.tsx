@@ -4,13 +4,14 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { ArtifactsPanel } from "@/components/ArtifactsPanel";
+import { ForecastHeadline } from "@/components/ForecastHeadline";
 import { ReportPanel } from "@/components/ReportPanel";
 import { CancelButton, NoteComposer } from "@/components/RunControls";
 import { SideRail } from "@/components/SideRail";
 import { SwarmBoard } from "@/components/SwarmBoard";
 import { TaskDetail } from "@/components/TaskDetail";
 import { TopBar } from "@/components/TopBar";
-import { BudgetBar, Sparkline, Spinner, StatusBadge, StatusDot } from "@/components/atoms";
+import { BudgetBar, Spinner, StatusBadge, StatusDot } from "@/components/atoms";
 import { api } from "@/lib/api";
 import { fmtDur, fmtMoney, fmtTokens } from "@/lib/format";
 import { useNow, useRun } from "@/lib/hooks";
@@ -79,7 +80,7 @@ function RunView() {
               Still connecting. This run id may not exist, or the hub isn&apos;t reachable — check that{" "}
               <span className="mono text-ink">swarm serve</span> is running.
               <div className="mt-3">
-                <Link href="/" className="btn btn-sm" style={{ display: "inline-flex" }}>
+                <Link href="/" className="btn btn-sm">
                   Back to dashboard
                 </Link>
               </div>
@@ -129,13 +130,13 @@ function RunView() {
         }
       />
 
-      <main className="max-w-[1400px] mx-auto px-4 sm:px-6 py-5 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_380px] gap-5 items-start">
+      <main className="max-w-[1400px] mx-auto px-5 sm:px-8 py-6 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_380px] gap-6 items-start">
         <div className="min-w-0">
         {failed && (
           <Banner glyph="✕" title="This run failed">
             {data.statusReason || "The run ended without completing."}
             {authIssue && (
-              <Link href="/settings" className="btn btn-sm mt-3" style={{ display: "inline-flex" }}>
+              <Link href="/settings" className="btn btn-sm mt-3">
                 Fix your API key in Settings
               </Link>
             )}
@@ -152,8 +153,18 @@ function RunView() {
           </Banner>
         )}
 
+        {data.question && (
+          <ForecastHeadline
+            question={data.question}
+            aggregate={data.aggregate}
+            tasks={data.tasks}
+            now={now}
+            expectedPanel={meta.options.panelSize}
+          />
+        )}
+
         {/* Header */}
-        <div className="panel p-4 mb-4">
+        <div className="panel p-5 mb-5">
           <div className="flex items-start justify-between gap-4 flex-wrap">
             <div className="min-w-0 flex-1">
               <h1 className="text-base font-semibold leading-snug mb-1.5 text-ink">{meta.mission}</h1>
@@ -202,14 +213,6 @@ function RunView() {
             <div className="flex-1 min-w-0">
               <BudgetBar spent={spent} cap={cap} height={3} />
             </div>
-            {data.budgetSeries.length > 2 && (
-              <span
-                className="shrink-0 text-ink-faint hidden sm:block"
-                title={`token spend over time (${fmtTokens(spent)} total)`}
-              >
-                <Sparkline points={data.budgetSeries.map((p) => p.tokens)} width={96} height={20} />
-              </span>
-            )}
             <span className="mono text-2xs text-ink-faint shrink-0">
               {cap > 0 ? Math.min(100, Math.round((spent / cap) * 100)) : 0}% of {fmtTokens(cap)}
             </span>
@@ -223,7 +226,7 @@ function RunView() {
         </div>
 
         {/* Tab switch */}
-        <div className="flex items-center gap-6 mb-4 border-b border-border-soft">
+        <div className="flex items-center gap-6 mb-5 border-b border-border-soft">
           <button className="tab" data-active={tab === "swarm"} onClick={() => setTab("swarm")}>
             Swarm
           </button>
@@ -304,7 +307,7 @@ function Banner({ glyph, title, children }: { glyph: string; title: string; chil
         animation: "var(--animate-rise)",
       }}
     >
-      <span className="glyph shrink-0 text-ink" style={{ width: 30, height: 30, fontSize: 13 }}>{glyph}</span>
+      <span className="glyph shrink-0 text-ink w-[30px] h-[30px] text-[13px]">{glyph}</span>
       <div className="flex-1 min-w-0">
         <div className="font-semibold text-ink">{title}</div>
         <div className="text-sm mt-0.5 leading-relaxed text-ink-dim">{children}</div>

@@ -948,6 +948,141 @@ async function phaseCitations() {
   fs.rmSync(home, { recursive: true, force: true });
 }
 
+async function phaseForecast() {
+  console.log("\n▶ Phase 22: forecast mode — panel, mechanical aggregation, ledger, resolution");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "forecast" });
+  ok(`mock model server on :${port} (forecast script)`);
+  writeConfig(home, port, { forecastPanelSize: 3 });
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const res = spawnSync(process.execPath, [SWARM, "forecast", "Will the test event happen?", "--fg"], {
+    env, encoding: "utf8", timeout: 120000,
+  });
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); proc.kill(); fail(`swarm forecast exited ${res.status}`); }
+  const { runDir, evs } = soleRunEvents(home);
+  const byType = (t) => evs.filter((e) => e.type === t);
+
+  // The sharpened question is journaled before any orchestration.
+  const q = byType("forecast.question")[0];
+  if (!q || q.question.kind !== "binary" || q.question.resolutionDate !== "2020-02-01") {
+    fail("forecast.question should carry the sharpened binary question with its date");
+  }
+  ok("question sharpened and journaled (binary, dated)");
+
+  // The analytical gate bounced the ungrounded first submission (no prior /
+  // base rates) back to the outside-view panelist with mechanical feedback.
+  const gateFails = byType("verify.result").filter((e) => e.mechanical && !e.pass && /prior|base_rates/.test(e.feedback));
+  if (gateFails.length !== 1) fail(`expected exactly one mechanical gate rejection, got ${gateFails.length}`);
+  const gatedTask = gateFails[0].taskId;
+  if (!byType("task.status").some((e) => e.taskId === gatedTask && e.status === "running" && e.attempt === 2)) {
+    fail("the gated panelist should have retried (attempt 2)");
+  }
+  ok(`analytical gate rejected an ungrounded forecast and forced a retry (${gatedTask})`);
+
+  // Three conductor panelists + the engine's inverted-framing probe.
+  const submitted = byType("forecast.submitted");
+  if (submitted.length !== 4) {
+    fail(`expected 4 forecast.submitted (3 panelists + probe; rejected attempts unjournaled), got ${submitted.length}`);
+  }
+  const probs = submitted.map((e) => e.forecast.probability).sort((a, b) => a - b);
+  if (JSON.stringify(probs) !== JSON.stringify([0.6, 0.7, 0.75, 0.8])) {
+    fail(`panel probabilities should be [0.6,0.7,0.75,0.8], got ${JSON.stringify(probs)}`);
+  }
+  const priors = submitted.map((e) => e.forecast.prior).filter((p) => typeof p === "number").sort((a, b) => a - b);
+  if (JSON.stringify(priors) !== JSON.stringify([0.55, 0.65, 0.7])) {
+    fail(`panelist base-rate priors should be journaled [0.55,0.65,0.7], got ${JSON.stringify(priors)}`);
+  }
+  ok("4 forecasts submitted (3 panelists with priors + probe), percentages normalized");
+
+  // The probe: engine asked P(NO), got 25%, flipped it, and owns the label.
+  const probeSub = submitted.find((e) => e.forecast.method === "inverted-framing");
+  if (!probeSub || Math.abs(probeSub.forecast.probability - 0.75) > 1e-9 || probeSub.forecast.prior !== undefined) {
+    fail(`probe should join as inverted-framing at 0.75 with no prior, got ${JSON.stringify(probeSub && probeSub.forecast)}`);
+  }
+  const probeTask = byType("task.created").map((e) => e.task).find((t) => /Coherence probe/.test(t.title));
+  if (!probeTask || probeTask.status !== "done" || probeTask.id !== probeSub.taskId) {
+    fail("probe should exist as a synthetic done task matching the forecast.submitted event");
+  }
+  ok("inverted-framing probe ran, flipped P(NO)=25% to P(YES)=75%, and joined the panel");
+
+  // The aggregate is the engine's deterministic math — distinct sources per
+  // panelist ⇒ evidence overlap 0 ⇒ full extremization k. Re-derive, never
+  // hard-code.
+  const { aggregateBinary, scaleK } = require(path.join(ROOT, "dist", "forecast.js"));
+  const expected = aggregateBinary([0.6, 0.7, 0.75, 0.8], scaleK(2.5, 0));
+  const aggEv = byType("forecast.aggregated")[0];
+  if (!aggEv) fail("no forecast.aggregated event");
+  const agg = aggEv.aggregate;
+  if (Math.abs(agg.probability - expected.probability) > 1e-9 || agg.n !== 4) {
+    fail(`aggregate mismatch: got ${JSON.stringify(agg)}, expected p=${expected.probability}`);
+  }
+  if (agg.evidenceOverlap !== 0) fail(`distinct sources should give evidenceOverlap 0, got ${agg.evidenceOverlap}`);
+  ok(`mechanical aggregation matches re-derived math (headline ${Math.round(agg.probability * 100)}%, n=4, overlap 0)`);
+
+  // The synthesizer received and echoed the exact engine-computed number.
+  const headlinePct = Math.round(expected.probability * 100);
+  const report = fs.readFileSync(path.join(runDir, "artifacts", "final-report.md"), "utf8");
+  if (/NO-AGGREGATE-IN-PROMPT/.test(report)) fail("the synthesizer never received the aggregate block");
+  if (!new RegExp(`FORECAST-HEADLINE: P\\(YES\\) = ${headlinePct}%`).test(report)) {
+    fail(`final report should carry the exact headline ${headlinePct}%`);
+  }
+  ok("final report carries the exact aggregated probability");
+
+  // The ledger recorded the forecast (panel + priors + triggers + overlap).
+  const ledgerFile = path.join(home, "forecasts", "ledger.jsonl");
+  const ledgerLines = fs.readFileSync(ledgerFile, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  const created = ledgerLines.find((r) => r.rec === "created");
+  if (!created || created.panel.length !== 4 || created.id !== aggEv.ledgerId) {
+    fail("ledger should hold a created record with the 4-member panel, id matching the journal");
+  }
+  if (created.panel.filter((m) => typeof m.prior === "number").length !== 3 || created.evidenceOverlap !== 0) {
+    fail("ledger created record should persist the panelists' priors and the evidence overlap");
+  }
+  if (!Array.isArray(created.triggers) || !created.triggers.some((t) => /TRIGGER/.test(t))) {
+    fail("ledger created record should union the panel's update triggers");
+  }
+  ok("forecast persisted to the ledger with priors, evidence overlap, and update triggers");
+
+  // Past-due resolution: a mini-agent determines the outcome and scores it.
+  const resolveOut = spawnSync(process.execPath, ["-e",
+    `const {resolveDue}=require(${JSON.stringify(path.join(ROOT, "dist", "resolve.js"))});` +
+    `const {loadConfig}=require(${JSON.stringify(path.join(ROOT, "dist", "config.js"))});` +
+    `resolveDue(loadConfig()).then(r=>console.log("RESOLVE="+JSON.stringify(r))).catch(e=>{console.error(e);process.exit(1)})`,
+  ], { env, encoding: "utf8", timeout: 60000 });
+  proc.kill();
+  if (resolveOut.status !== 0) { console.error(resolveOut.stdout, resolveOut.stderr); fail("resolveDue failed"); }
+  const resolveRes = JSON.parse(/RESOLVE=(.*)/.exec(resolveOut.stdout)[1]);
+  if (resolveRes.resolved.length !== 1 || resolveRes.resolved[0].outcome !== 1) {
+    fail(`expected one YES resolution, got ${JSON.stringify(resolveRes)}`);
+  }
+  const expectedBrier = Math.pow(expected.probability - 1, 2);
+  if (Math.abs(resolveRes.resolved[0].brier - expectedBrier) > 1e-9) {
+    fail(`brier should be (p−1)² = ${expectedBrier}, got ${resolveRes.resolved[0].brier}`);
+  }
+  ok(`resolution engine scored the forecast (Brier ${resolveRes.resolved[0].brier.toFixed(4)})`);
+
+  if (!fs.existsSync(path.join(home, "forecasts", "audit", `${created.id}.json`))) {
+    fail("machine resolutions should leave an audit file");
+  }
+  ok("resolution left an audit trail");
+
+  // The flywheel: the resolved record now reduces into calibration stats.
+  const { loadLedger, calibrationStats } = require(path.join(ROOT, "dist", "forecast.js"));
+  const prevHome = process.env.AGENTSWARM_HOME;
+  process.env.AGENTSWARM_HOME = home;
+  const stats = calibrationStats(loadLedger());
+  process.env.AGENTSWARM_HOME = prevHome;
+  if (stats.n !== 1 || Math.abs(stats.brierMean - expectedBrier) > 1e-9) {
+    fail(`calibration stats should score the one resolved forecast, got ${JSON.stringify(stats)}`);
+  }
+  ok("calibration stats reflect the resolved forecast (the flywheel closes)");
+
+  if (byType("run.status").pop().status !== "done") fail("forecast run did not end done");
+  ok("run finished with status=done");
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
 async function main() {
   await phaseHappy();
   await phaseAuthFail();
@@ -970,8 +1105,9 @@ async function main() {
   await phaseDiagnostics();
   await phaseStrictVerify();
   await phaseCitations();
+  await phaseForecast();
   console.log(
-    "\n✅ E2E passed — pipeline, auth failure, resume (with ledger re-seed), budget cap, verify-retry, steering + cancel, compaction, hub API, checkpoint resume, conductor breaker, blind verification, SIGTERM safety, 429 limiter, model tiers, hierarchical teams, the living plan, cascade root causes, and failure diagnostics all work."
+    "\n✅ E2E passed — pipeline, auth failure, resume (with ledger re-seed), budget cap, verify-retry, steering + cancel, compaction, hub API, checkpoint resume, conductor breaker, blind verification, SIGTERM safety, 429 limiter, model tiers, hierarchical teams, the living plan, cascade root causes, failure diagnostics, and forecast mode (panel → mechanical aggregation → ledger → resolution → calibration) all work."
   );
 }
 

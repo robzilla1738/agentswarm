@@ -257,6 +257,18 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 @media (prefers-color-scheme: dark) { body { background: #141413; color: #e7e5e0; } }
+html[data-theme="light"] { color-scheme: light; background: #fdfdfc; }
+html[data-theme="light"] body { background: #fdfdfc; color: #1d1d1b; }
+html[data-theme="dark"] { color-scheme: dark; background: #141413; }
+html[data-theme="dark"] body { background: #141413; color: #e7e5e0; }
+@media print {
+  @page { margin: 0; }
+  /* Browsers strip backgrounds when printing by default — without this a
+     forced-dark document prints as faint gray text on white. */
+  * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body { padding: 52px 56px; }
+  pre, table, blockquote, img { break-inside: avoid; }
+}
 main, header.run-meta { max-width: 720px; margin: 0 auto; }
 header.run-meta {
   margin-bottom: 40px; padding-bottom: 16px;
@@ -311,17 +323,22 @@ export interface DocHtmlOpts {
   title?: string;
   /** Small mono meta strip above the document. Raw HTML spans — escape inputs. */
   metaHtml?: string;
+  /** Force a color scheme; omitted = follow the viewer's OS preference. */
+  theme?: "light" | "dark";
+  /** Open the print dialog on load — the "save as PDF" path. */
+  autoPrint?: boolean;
 }
 
 /**
  * The house document shell: every generated HTML artifact and the final
  * report render through this — one style, self-contained (inline CSS, no
- * scripts, no external fetches), chart blocks included.
+ * external fetches), chart blocks included. The only script ever emitted is
+ * the one-line print trigger when autoPrint is set.
  */
 export function renderDocHtml(o: DocHtmlOpts): string {
   const title = o.title ?? /^#\s+(.+)$/m.exec(o.markdown)?.[1] ?? "Report";
   return `<!doctype html>
-<html lang="en">
+<html lang="en"${o.theme ? ` data-theme="${o.theme}"` : ""}>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -333,6 +350,7 @@ ${o.metaHtml ? `<header class="run-meta">${o.metaHtml}</header>` : ""}
 <main>
 ${mdToHtml(o.markdown)}
 </main>
+${o.autoPrint ? `<script>addEventListener("load",function(){setTimeout(function(){window.print()},80)});</script>` : ""}
 </body>
 </html>
 `;
@@ -344,9 +362,11 @@ export interface FinalHtmlOpts {
   runId: string;
   status: "done" | "failed" | "cancelled";
   finishedAt: number;
+  theme?: "light" | "dark";
+  autoPrint?: boolean;
 }
 
-/** Self-contained HTML document (inline CSS, no scripts, no external fetches). */
+/** Self-contained HTML document (inline CSS, no external fetches). */
 export function renderFinalHtml(o: FinalHtmlOpts): string {
   const date = new Date(o.finishedAt).toISOString().replace("T", " ").slice(0, 16) + " UTC";
   return renderDocHtml({
@@ -356,5 +376,7 @@ export function renderFinalHtml(o: FinalHtmlOpts): string {
       `<span class="badge ${o.status}">${o.status}</span>` +
       `<span>${esc(o.runId)}</span><span>${esc(date)}</span>` +
       `<span title="${esc(o.mission.slice(0, 600))}">${esc(clip(o.mission, 80))}</span>`,
+    theme: o.theme,
+    autoPrint: o.autoPrint,
   });
 }

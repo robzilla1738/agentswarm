@@ -109,7 +109,7 @@ export function TaskDetail({
               <ul className="space-y-1.5">
                 {task.keyFacts.map((f, i) => (
                   <li key={i} className="flex items-start gap-2 text-xs leading-relaxed text-ink-dim">
-                    <span className="text-ink-faint shrink-0" style={{ marginTop: 1 }}>◆</span>
+                    <span className="text-ink-faint shrink-0 mt-px">◆</span>
                     <Md compact dim>{f}</Md>
                   </li>
                 ))}
@@ -122,7 +122,7 @@ export function TaskDetail({
               <ul className="space-y-1.5">
                 {task.openQuestions.map((q, i) => (
                   <li key={i} className="flex items-start gap-2 text-xs leading-relaxed text-ink-faint">
-                    <span className="shrink-0" style={{ marginTop: 1 }}>?</span>
+                    <span className="shrink-0 mt-px">?</span>
                     <Md compact dim>{q}</Md>
                   </li>
                 ))}
@@ -288,7 +288,7 @@ function AgentBlock({ agent, now, expanded, attempt }: { agent: AgentView; now: 
         <span className="text-ink-faint" style={{ fontSize: 9, transform: open ? "rotate(180deg)" : "none", transition: "transform 0.15s" }}>▼</span>
       </button>
       {open && (
-        <div className="px-3 pb-3 space-y-2.5 border-t border-border-soft" style={{ paddingTop: 10 }}>
+        <div className="px-3 pb-3 pt-2.5 space-y-2.5 border-t border-border-soft">
           {agent.lastThink && (
             <div>
               <div className="label mb-1">reasoning</div>

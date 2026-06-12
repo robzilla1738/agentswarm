@@ -34,7 +34,7 @@ export function SideRail({
   ];
 
   return (
-    <div className="panel flex flex-col h-[480px] lg:h-[calc(100vh-88px)] lg:sticky lg:top-[72px]">
+    <div className="panel flex flex-col h-[480px] lg:h-[calc(100vh-96px)] lg:sticky lg:top-20">
       <div className="flex items-center gap-5 px-4 border-b border-border-soft shrink-0">
         {tabs.map((t) => (
           <button key={t.id} className="tab" data-active={tab === t.id} onClick={() => setTab(t.id)}>
@@ -226,7 +226,7 @@ function ConductorFeed({ log, operatorNotes }: { log: ConductorSay[]; operatorNo
         <div key={i} style={{ animation: "var(--animate-rise)" }}>
           {m.kind === "op" ? (
             <div
-              className="rounded-lg p-2.5 text-xs"
+              className="rounded-[10px] p-2.5 text-xs"
               style={{ background: "rgb(var(--hi) / 0.05)", border: "1px solid rgb(var(--hi) / 0.18)" }}
             >
               <div className="flex items-baseline justify-between mb-1">
@@ -307,8 +307,7 @@ function Blackboard({ notes }: { notes: BlackboardNote[] }) {
     <div className="h-full flex flex-col">
       <div className="px-3.5 pt-2.5 pb-2 space-y-2 shrink-0 border-b border-border-soft">
         <input
-          className="input"
-          style={{ padding: "4px 10px", fontSize: 12 }}
+          className="input px-2.5 py-1 text-xs"
           placeholder={`Search ${notes.length} notes…`}
           value={query}
           onChange={(e) => setQuery(e.target.value)}

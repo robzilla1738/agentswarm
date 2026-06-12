@@ -18,6 +18,69 @@ export type TaskStatus =
 
 export type Verification = "off" | "normal" | "strict";
 
+/** What kind of run this is. Forecast runs follow the superforecasting pipeline. */
+export type RunMode = "research" | "forecast";
+
+/** Binary questions resolve YES/NO; numeric questions resolve to a value. */
+export type ForecastKind = "binary" | "numeric";
+
+/** The sharpened, resolvable form of a forecast mission. */
+export interface ForecastQuestion {
+  /** Unambiguous question text, e.g. "Will the ECB cut its deposit rate before 2026-09-01?" */
+  text: string;
+  kind: ForecastKind;
+  /** Exactly what counts as YES (binary) or how the value is measured (numeric). */
+  resolutionCriteria: string;
+  /** ISO date by which the question resolves. */
+  resolutionDate: string;
+  /** Unit for numeric questions ("%", "USD", "people"). */
+  unit?: string;
+}
+
+/** One panelist's structured forecast (submit_forecast terminal tool). */
+export interface Forecast {
+  /** Primary method: outside-view | inside-view | trend | market-anchored | inverted-framing | ... */
+  method: string;
+  /** P(YES) in [0,1] — binary questions. */
+  probability?: number;
+  /**
+   * The probability implied by the panelist's reference classes ALONE, before
+   * current evidence — committing to it first makes the news-driven
+   * adjustment (prior → final) explicit and attackable.
+   */
+  prior?: number;
+  /** Quantile forecast — numeric questions. */
+  quantiles?: { p10: number; p50: number; p90: number };
+  rationale: string;
+  baseRates?: string[];
+  keyDrivers?: string[];
+  updateTriggers?: string[];
+  submittedAt: number;
+}
+
+/** Deterministic combination of the panel (computed in code, never by an LLM). */
+export interface AggregateForecast {
+  /** Headline P(YES): extremized geometric mean of odds. */
+  probability?: number;
+  /** Panel median (binary). */
+  median?: number;
+  /** Un-extremized geometric mean of odds. */
+  gmo?: number;
+  /** Extremization exponent used. */
+  k: number;
+  /** Trimmed-mean quantiles (numeric). */
+  quantiles?: { p10: number; p50: number; p90: number };
+  /** Panel size that actually submitted. */
+  n: number;
+  /** Disagreement: max−min of panel probabilities (binary) or relative p50 spread (numeric). */
+  spread: number;
+  /**
+   * Mean pairwise Jaccard overlap of the panel's cited sources [0,1].
+   * Extremization assumes independent evidence — k is scaled down by this.
+   */
+  evidenceOverlap?: number;
+}
+
 /** Internal effort scale; mapped per provider at request time. */
 export type ReasoningEffort = "low" | "medium" | "high" | "max";
 
@@ -34,6 +97,12 @@ export interface RunOptions {
   maxTokens: number;
   /** Wall-clock cap per worker attempt (ms); 0 disables. Missing on pre-0.10 runs — readers default it. */
   taskTimeoutMs?: number;
+  /** Run mode. Missing on pre-forecast runs — readers default to "research". */
+  mode?: RunMode;
+  /** Forecast mode: operator-supplied resolution date (ISO) for the question. */
+  resolutionDate?: string;
+  /** Forecast mode: independent forecaster panel size (3–11). */
+  panelSize?: number;
   verification: Verification;
   thinking: boolean;
   reasoningEffort: ReasoningEffort;
@@ -109,6 +178,8 @@ export interface Task {
   filesTouched?: string[];
   /** Web sources the worker's findings rely on (report tool's `sources`). */
   sources?: SourceRef[];
+  /** Structured forecast from a forecaster task (submit_forecast terminal). */
+  forecast?: Forecast;
   createdAt: number;
   startedAt?: number;
   endedAt?: number;
@@ -146,6 +217,8 @@ export interface RunSummary {
   /** Distinct web sources touched so far (searches, fetches, cited sources). */
   sourceCount?: number;
   finalSummary?: string;
+  /** Forecast runs: the headline aggregate once computed. */
+  forecast?: { p?: number; p50?: number; unit?: string; n: number; resolutionDate: string };
 }
 
 /**
@@ -177,6 +250,9 @@ export interface RunSummary {
  *  operator.note   { text }
  *  run.final       { summary, reportPath }
  *  log             { level: "info"|"warn"|"error", msg }
+ *  forecast.question   { question: ForecastQuestion }           — sharpened question (forecast mode)
+ *  forecast.submitted  { taskId, agentId, forecast: Forecast }  — one panelist's forecast
+ *  forecast.aggregated { aggregate: AggregateForecast, panel: {taskId,method,probability?,p50?}[], ledgerId? }
  */
 export interface SwarmEvent {
   seq: number;

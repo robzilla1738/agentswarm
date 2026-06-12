@@ -21,6 +21,81 @@ export interface Usage {
   cacheMissTokens: number;
 }
 
+export type RunMode = "research" | "forecast";
+export type ForecastKind = "binary" | "numeric";
+
+export interface ForecastQuestion {
+  text: string;
+  kind: ForecastKind;
+  resolutionCriteria: string;
+  resolutionDate: string;
+  unit?: string;
+}
+
+export interface Forecast {
+  method: string;
+  probability?: number;
+  /** Base-rate prior committed before current evidence (binary). */
+  prior?: number;
+  quantiles?: { p10: number; p50: number; p90: number };
+  rationale: string;
+  baseRates?: string[];
+  keyDrivers?: string[];
+  updateTriggers?: string[];
+  submittedAt: number;
+}
+
+export interface AggregateForecast {
+  probability?: number;
+  median?: number;
+  gmo?: number;
+  k: number;
+  quantiles?: { p10: number; p50: number; p90: number };
+  n: number;
+  spread: number;
+  /** Mean pairwise source overlap of the panel [0,1] — extremization shrinks with it. */
+  evidenceOverlap?: number;
+}
+
+export interface ForecastPanelist {
+  taskId: string;
+  method: string;
+  probability?: number;
+  prior?: number;
+  quantiles?: { p10: number; p50: number; p90: number };
+}
+
+/** One ledger entry from /api/forecasts (created record + optional resolution). */
+export interface LedgerEntry {
+  v: 1;
+  id: string;
+  runId: string;
+  t: number;
+  question: ForecastQuestion;
+  aggregate: AggregateForecast;
+  panel: ForecastPanelist[];
+  triggers?: string[];
+  evidenceOverlap?: number;
+  resolution?: {
+    id: string;
+    t: number;
+    outcome: 0 | 1 | number | "void";
+    evidence: string;
+    sources: string[];
+    resolvedBy: "swarm" | "operator";
+    brier?: number;
+    logScore?: number;
+    intervalScore?: number;
+  };
+}
+
+export interface CalibrationStats {
+  n: number;
+  brierMean: number;
+  bins: { lo: number; hi: number; n: number; meanP: number; hitRate: number }[];
+  byMethod: Record<string, { n: number; brierMean: number }>;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -42,6 +117,8 @@ export interface Task {
   openQuestions?: string[];
   filesTouched?: string[];
   sources?: { url: string; title?: string; date?: string; note?: string }[];
+  /** Structured forecast from a forecaster task (forecast runs). */
+  forecast?: Forecast;
   /** Client-derived: distinct source URLs this task has touched so far (live). */
   liveSourceCount?: number;
   modelTier?: "cheap" | "default" | "strong";
@@ -109,6 +186,9 @@ export interface RunMeta {
     thinking: boolean;
     reasoningEffort: string;
     safeMode: boolean;
+    mode?: RunMode;
+    resolutionDate?: string;
+    panelSize?: number;
   };
 }
 
@@ -134,6 +214,8 @@ export interface RunSummary {
   sourceCount?: number;
   pid: number | null;
   finalSummary?: string;
+  /** Forecast runs: the headline aggregate once computed. */
+  forecast?: { p?: number; p50?: number; unit?: string; n: number; resolutionDate: string };
 }
 
 export interface RunSnapshot {
@@ -151,6 +233,10 @@ export interface RunSnapshot {
   cost: number;
   finalSummary?: string;
   finalReportPath?: string;
+  question?: ForecastQuestion | null;
+  aggregate?: AggregateForecast | null;
+  forecastPanel?: ForecastPanelist[];
+  ledgerId?: string;
   live: boolean;
   lastSeq: number;
 }

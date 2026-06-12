@@ -188,6 +188,22 @@ const server = http.createServer((req, res) => {
         }
         return sse(res, [...toolChunks("wait", { reason: "scouts in flight" })]);
       }
+      if (SCENARIO === "forecast") {
+        if (update.includes("No tasks exist yet")) {
+          return sse(res, [...toolChunks("spawn_tasks", {
+            tasks: [
+              { title: "Base rates", objective: "FC-RESEARCH: find base rates for the event. Done when sourced.", role: "researcher" },
+              { title: "Panelist outside", objective: "Forecast the question. METHOD: outside-view", role: "forecaster", deps: ["T1"] },
+              { title: "Panelist inside", objective: "Forecast the question. METHOD: inside-view", role: "forecaster", deps: ["T1"] },
+              { title: "Panelist trend", objective: "Forecast the question. METHOD: trend", role: "forecaster", deps: ["T1"] },
+            ],
+          })]);
+        }
+        if (/T2 \[done/.test(update) && /T3 \[done/.test(update) && /T4 \[done/.test(update)) {
+          return sse(res, [...toolChunks("finish", { notes: "Panel complete; aggregate mechanically." })]);
+        }
+        return sse(res, [...toolChunks("wait", { reason: "panel in flight" })]);
+      }
       if (update.includes("No tasks exist yet")) {
         if (SCENARIO === "verify-retry") {
           return sse(res, [
@@ -283,8 +299,74 @@ const server = http.createServer((req, res) => {
       ]);
     }
 
+    // Forecaster panelist: submit immediately, probability keyed off the
+    // METHOD label the conductor put in the objective.
+    if (names.has("submit_forecast")) {
+      const system = String((messages[0] && messages[0].content) || "");
+      // Engine-run inverted-framing probe: answer in P(NO) space (25% NO →
+      // the engine flips it to a 75% YES panelist). No sources: the probe
+      // must not move the panel's evidence-overlap math.
+      if (/INVERTED form/.test(system)) {
+        return sse(res, [...toolChunks("submit_forecast", {
+          probability: 25,
+          prior: 30,
+          method: "ignored-by-engine",
+          rationale: "Arguing NO first: in 7 of 10 comparable cases the status quo held, but here the harness is scripted to emit.",
+        })]);
+      }
+      const method = /METHOD: outside-view/.test(system) ? "outside-view" : /METHOD: inside-view/.test(system) ? "inside-view" : "trend";
+      // The outside-view panelist's FIRST attempt is deliberately ungrounded
+      // (no prior, no base_rates) — the engine's analytical gate must bounce
+      // it back with feedback before any forecast.submitted is journaled.
+      const gateRetry = /PREVIOUS ATTEMPT FAILED VERIFICATION/.test(system);
+      if (method === "outside-view" && !gateRetry) {
+        return sse(res, [...toolChunks("submit_forecast", {
+          probability: 60,
+          method,
+          rationale: "The recent headlines feel like it is going to happen.",
+        })]);
+      }
+      const prob = { "outside-view": 60, "inside-view": 70, trend: 80 }[method];
+      const prior = { "outside-view": 55, "inside-view": 65, trend: 70 }[method];
+      // Distinct sources per panelist: evidence overlap must compute to 0.
+      const src = { "outside-view": "https://example.com/base-rates", "inside-view": "https://example.com/inside", trend: "https://example.com/trend" }[method];
+      return sse(res, [...toolChunks("submit_forecast", {
+        probability: prob,
+        prior,
+        method,
+        rationale: `Anchored on the base rate (6 of 10 comparable cases), adjusted via ${method}.`,
+        base_rates: ["similar events resolved YES in 6 of 10 comparable cases"],
+        key_drivers: ["test harness behavior"],
+        update_triggers: ["TRIGGER: the harness emits the event early"],
+        sources: [{ url: src, title: `Evidence for ${method}` }],
+      })]);
+    }
+
+    // Resolution mini-agent (swarm resolve): the event happened.
+    if (names.has("submit_resolution")) {
+      return sse(res, [...toolChunks("submit_resolution", {
+        outcome: "yes",
+        evidence: "The test harness recorded the event before the resolution date.",
+        confidence: "high",
+        sources: ["https://example.com/outcome"],
+      })]);
+    }
+
     // Synthesizer
     if (names.has("submit_final")) {
+      if (SCENARIO === "forecast") {
+        // Echo the engine-computed headline only if it was actually pinned
+        // into the prompt — the e2e asserts both the echo and its value.
+        // (Anchor on the ENSEMBLE line: task reports carry panelist P(YES)
+        // figures of their own earlier in the prompt.)
+        const m = /ENSEMBLE FORECAST[^:]*: P\(YES\) = (\d+)%/.exec(sysContent);
+        return sse(res, [...toolChunks("submit_final", {
+          report_markdown: m
+            ? `# Forecast report\n\nFORECAST-HEADLINE: P(YES) = ${m[1]}%\n\n## Panel\nThree methods reported.\n`
+            : "# Forecast report\n\nNO-AGGREGATE-IN-PROMPT\n",
+          summary: "Forecast composed from the panel aggregate.",
+        })]);
+      }
       if (SCENARIO === "citations") {
         // Cite only if the engine actually threaded the numbered source list
         // (with both deduped URLs) into the synthesizer's prompt.
@@ -350,6 +432,13 @@ const server = http.createServer((req, res) => {
     // Worker: run one real shell tool, then report on the next turn.
     if (names.has("report")) {
       const system = String((messages[0] && messages[0].content) || "");
+      if (SCENARIO === "forecast" && /FC-RESEARCH/.test(system)) {
+        return sse(res, [...toolChunks("report", {
+          status: "done",
+          report: "Base rates researched: similar events resolve YES about 65% of the time.",
+          sources: [{ url: "https://example.com/base-rates", title: "Base rates" }],
+        })]);
+      }
       if (SCENARIO === "verify-retry" && /ISSUE-MARKER/.test(system)) {
         // The retry prompt carried the verifier's structured issue verbatim.
         return sse(res, [...toolChunks("report", {
@@ -462,6 +551,17 @@ const server = http.createServer((req, res) => {
     // Tool-less helper calls: completeness critic / faithfulness check (strict mode).
     if (!tools.length) {
       const lu = lastUser(messages);
+      if (/sharpening a forecasting question/.test(lu)) {
+        return sse(res, [
+          textChunk(JSON.stringify({
+            text: "Will the test event happen by 2020-02-01?",
+            kind: "binary",
+            resolutionCriteria: "YES if the test harness records the event by the date",
+            resolutionDate: "2020-02-01",
+          })),
+          { usage: { prompt_tokens: 40, completion_tokens: 30 } },
+        ]);
+      }
       if (/completeness critic/.test(lu)) {
         return sse(res, [textChunk("COMPLETE"), { usage: { prompt_tokens: 10, completion_tokens: 2 } }]);
       }

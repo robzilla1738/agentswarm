@@ -32,7 +32,7 @@ export function NoteComposer({ id, onSent }: { id: string; onSent?: () => void }
         onKeyDown={(e) => e.key === "Enter" && send()}
         style={{ fontSize: 13, padding: "9px 13px" }}
       />
-      <button className="btn" disabled={!text.trim() || sending} onClick={send} style={{ whiteSpace: "nowrap" }}>
+      <button className="btn" disabled={!text.trim() || sending} onClick={send}>
         {flash ? "Sent ✓" : "Send"}
       </button>
     </div>
@@ -48,7 +48,7 @@ export function CancelButton({ id, live }: { id: string; live: boolean }) {
 
   if (stopping) {
     return (
-      <button className="btn" disabled style={{ padding: "8px 13px" }}>
+      <button className="btn" disabled>
         stopping…
       </button>
     );
@@ -58,7 +58,6 @@ export function CancelButton({ id, live }: { id: string; live: boolean }) {
     <div className="flex items-center gap-1.5">
       <button
         className="btn btn-danger"
-        style={{ padding: "8px 12px" }}
         onClick={async () => {
           setStopping(true);
           setConfirming(false);
@@ -71,12 +70,12 @@ export function CancelButton({ id, live }: { id: string; live: boolean }) {
       >
         Confirm stop
       </button>
-      <button className="btn" style={{ padding: "8px 12px" }} onClick={() => setConfirming(false)}>
+      <button className="btn" onClick={() => setConfirming(false)}>
         Keep
       </button>
     </div>
   ) : (
-    <button className="btn btn-danger" style={{ padding: "8px 13px" }} onClick={() => setConfirming(true)}>
+    <button className="btn btn-danger" onClick={() => setConfirming(true)}>
       Stop
     </button>
   );
