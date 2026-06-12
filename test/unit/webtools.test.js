@@ -321,3 +321,12 @@ test("fetchUrl warns when the scrape backend fails and falls back to direct", as
     fc.restore();
   }
 });
+
+test("looksBiomedical prefix-matches medical stems without firing on ML queries", () => {
+  const { looksBiomedical } = require("../../dist/webtools.js");
+  assert.ok(looksBiomedical("mrna vaccine efficacy"));
+  assert.ok(looksBiomedical("clinical trial results semaglutide"));
+  assert.ok(looksBiomedical("H5N1 outbreak spread"));
+  assert.ok(!looksBiomedical("quantum computing error correction"));
+  assert.ok(!looksBiomedical("transformer attention mechanism"));
+});

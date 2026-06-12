@@ -83,9 +83,21 @@ export async function webSearch(
       engineCalls.push(call);
     }
   }
-  // Scholarly questions also sweep the keyless academic APIs (deep mode only).
+  // Scholarly questions also sweep the keyless academic APIs (deep mode only);
+  // biomedical phrasing adds PubMed, where arXiv/Crossref coverage is thin.
   if (deep && looksAcademic(query)) {
-    engineCalls.push(arxivSearch(query, perEngine, signal), crossrefSearch(query, perEngine, signal));
+    engineCalls.push(
+      arxivSearch(query, perEngine, signal),
+      crossrefSearch(query, perEngine, signal),
+      semanticScholarSearch(query, perEngine, signal)
+    );
+    if (looksBiomedical(query)) engineCalls.push(pubmedSearch(query, perEngine, signal));
+  }
+  // Freshness-scoped sweeps also pull GDELT's keyless news index — direct
+  // article links from mostly paywall-light outlets, exactly where the
+  // scraped engines' date filters run thin.
+  if (freshness) {
+    engineCalls.push(gdeltArticleSearch(query, perEngine, signal, freshness));
   }
 
   const settled = await Promise.allSettled(engineCalls);
@@ -450,6 +462,126 @@ export async function arxivSearch(query: string, count: number, signal?: AbortSi
   return out;
 }
 
+/**
+ * Semantic Scholar Graph API — keyless, and the only academic engine here
+ * that returns citation counts: an influence signal arXiv/Crossref can't give
+ * the ranker. The shared engine cooldown absorbs its keyless rate limit.
+ */
+export async function semanticScholarSearch(query: string, count: number, signal?: AbortSignal): Promise<Candidate[]> {
+  const n = Math.min(count, 20);
+  const url = `https://api.semanticscholar.org/graph/v1/paper/search?query=${encodeURIComponent(query)}&fields=title,abstract,year,citationCount,url,externalIds&limit=${n}`;
+  const res = await engineFetch("semanticscholar", url, { headers: { "user-agent": UA } }, signal);
+  if (!res.ok) throw new Error(`semantic scholar search ${res.status}`);
+  const data: any = await res.json();
+  const out: Candidate[] = [];
+  for (const p of data?.data ?? []) {
+    if (out.length >= count) break;
+    const title = strip(String(p?.title ?? ""));
+    const link = p?.url || (p?.externalIds?.DOI ? `https://doi.org/${p.externalIds.DOI}` : "");
+    if (!title || !/^https?:\/\//.test(link)) continue;
+    const cites = typeof p.citationCount === "number" ? p.citationCount : 0;
+    const abstract = strip(String(p.abstract ?? ""));
+    out.push({
+      title,
+      url: link,
+      snippet: `[${cites} citations] ${abstract}`.slice(0, 300),
+      rank: out.length + 1,
+      engine: "semanticscholar",
+      date: p.year ? String(p.year) : undefined,
+    });
+  }
+  return out;
+}
+
+/** Biomedical intent: routes academic sweeps through PubMed too. Stems are prefix-matched (vaccin → vaccine/vaccination). */
+const BIOMEDICAL_RE =
+  /\b(clinical|trial|patient|disease|cancer|vaccin|drug|therap|epidemi|virus|viral|bacteri|genom|gene\b|protein|medical|medicine|health|fda\b|mortality|infect|outbreak|pandemic|diagnos|symptom|treatment|dosage|pharma|oncolog|cardio|neuro)/i;
+
+export function looksBiomedical(query: string): boolean {
+  return BIOMEDICAL_RE.test(query);
+}
+
+/**
+ * PubMed E-utilities (esearch → esummary, keyless) — the authoritative index
+ * for clinical/public-health/epidemiology literature, where arXiv and
+ * Crossref coverage is thin.
+ */
+export async function pubmedSearch(query: string, count: number, signal?: AbortSignal): Promise<Candidate[]> {
+  const n = Math.min(count, 20);
+  const es = await engineFetch(
+    "pubmed",
+    `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=${encodeURIComponent(query)}&retmax=${n}&retmode=json&sort=relevance`,
+    { headers: { "user-agent": UA } },
+    signal
+  );
+  if (!es.ok) throw new Error(`pubmed esearch ${es.status}`);
+  const ids: string[] = (((await es.json()) as any)?.esearchresult?.idlist ?? []).filter((id: unknown) => /^\d+$/.test(String(id)));
+  if (!ids.length) return [];
+  const sum = await engineFetch(
+    "pubmed",
+    `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id=${ids.join(",")}&retmode=json`,
+    { headers: { "user-agent": UA } },
+    signal
+  );
+  if (!sum.ok) throw new Error(`pubmed esummary ${sum.status}`);
+  const result: any = ((await sum.json()) as any)?.result ?? {};
+  const out: Candidate[] = [];
+  for (const id of ids) {
+    const it = result[id];
+    const title = strip(String(it?.title ?? ""));
+    if (!title) continue;
+    const venue = [it.fulljournalname || it.source, it.pubdate].filter(Boolean).join(", ");
+    out.push({
+      title,
+      url: `https://pubmed.ncbi.nlm.nih.gov/${id}/`,
+      snippet: venue.slice(0, 300),
+      rank: out.length + 1,
+      engine: "pubmed",
+      date: detectDate(String(it.pubdate ?? "")),
+    });
+  }
+  return out;
+}
+
+/**
+ * GDELT DOC 2.0 article search (keyless) — a global news index that links
+ * straight to articles, mostly paywall-light outlets. The API enforces one
+ * request per 5 seconds; its 429s land in the shared engine cooldown. Used
+ * for freshness-scoped sweeps where scraped engines run thin.
+ */
+export async function gdeltArticleSearch(
+  query: string,
+  count: number,
+  signal?: AbortSignal,
+  freshness?: Freshness
+): Promise<Candidate[]> {
+  const spans: Record<Freshness, string> = { day: "1d", week: "1w", month: "1m", year: "12m" };
+  const timespan = spans[freshness ?? "month"];
+  const q = `${query} sourcelang:english`;
+  const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(q)}&mode=artlist&maxrecords=${Math.min(count, 25)}&timespan=${timespan}&format=json&sort=hybridrel`;
+  const res = await engineFetch("gdelt-doc", url, { headers: { "user-agent": UA } }, signal);
+  if (!res.ok) throw new Error(`gdelt article search ${res.status}`);
+  // GDELT reports query errors as 200 + plain text — a JSON parse miss is "no results".
+  const data: any = await res.json().catch(() => null);
+  const out: Candidate[] = [];
+  for (const a of data?.articles ?? []) {
+    if (out.length >= count) break;
+    const link = String(a?.url ?? "");
+    const title = strip(String(a?.title ?? ""));
+    if (!title || !/^https?:\/\//.test(link)) continue;
+    const seen = /^(\d{4})(\d{2})(\d{2})/.exec(String(a.seendate ?? ""));
+    out.push({
+      title,
+      url: link,
+      snippet: [a.domain, seen ? `${seen[1]}-${seen[2]}-${seen[3]}` : ""].filter(Boolean).join(" · "),
+      rank: out.length + 1,
+      engine: "gdelt",
+      date: seen ? `${seen[1]}-${seen[2]}-${seen[3]}` : undefined,
+    });
+  }
+  return out;
+}
+
 /** Crossref's works API — journal/conference metadata with DOIs, no key needed. */
 export async function crossrefSearch(query: string, count: number, signal?: AbortSignal): Promise<Candidate[]> {
   const url = `https://api.crossref.org/works?query=${encodeURIComponent(query)}&rows=${Math.min(count, 20)}&select=title,DOI,abstract,issued,container-title`;
@@ -549,6 +681,15 @@ export async function fetchUrl(
   });
   const ctype = res.headers.get("content-type") || "";
   if (!res.ok) {
+    // Dead or blocked pages often live on in the Wayback Machine — recover
+    // the closest snapshot before declaring the source unusable.
+    if (!raw) {
+      const archived = await waybackFetch(url, maxChars, signal).catch(() => null);
+      if (archived) {
+        warn?.(`HTTP ${res.status} for ${url} — recovered a Wayback Machine snapshot instead`);
+        return archived;
+      }
+    }
     // An error page is not content: returning it as a successful result lets
     // "HTTP 403 ... subscribe to continue" become a "fact" in someone's report.
     const body = await res.text().catch(() => "");
@@ -575,6 +716,39 @@ export async function fetchUrl(
     }
   }
   return truncateMiddle(text, maxChars, "chars");
+}
+
+/**
+ * Wayback Machine recovery (keyless): the availability API names the closest
+ * snapshot; its content comes back clearly labeled as archived so an agent
+ * never mistakes a stale capture for the live page.
+ */
+async function waybackFetch(url: string, maxChars: number, signal?: AbortSignal): Promise<string | null> {
+  const avail = await fetch(`https://archive.org/wayback/available?url=${encodeURIComponent(url)}`, {
+    headers: { "user-agent": UA },
+    signal: mergeSignal(15_000, signal),
+  });
+  if (!avail.ok) return null;
+  const data: any = await avail.json().catch(() => null);
+  const closest = data?.archived_snapshots?.closest;
+  if (!closest?.available || typeof closest.url !== "string") return null;
+  const snap = await fetch(closest.url.replace(/^http:/, "https:"), {
+    headers: { "user-agent": UA, accept: "text/html,text/*;q=0.9,*/*;q=0.5" },
+    signal: mergeSignal(25_000, signal),
+    redirect: "follow",
+  });
+  if (!snap.ok) return null;
+  const ctype = snap.headers.get("content-type") || "";
+  const body = decodeBody(Buffer.from(await snap.arrayBuffer()), ctype);
+  const text = /html/i.test(ctype) ? htmlToText(body) : body;
+  if (!text.trim()) return null;
+  const ts = String(closest.timestamp ?? "");
+  const when = ts.length >= 8 ? `${ts.slice(0, 4)}-${ts.slice(4, 6)}-${ts.slice(6, 8)}` : "unknown date";
+  return truncateMiddle(
+    `[ARCHIVED SNAPSHOT from ${when} — the live page returned an error; this content may be stale]\n${text}`,
+    maxChars,
+    "chars"
+  );
 }
 
 /** Decode a response body honoring its content-type charset (UTF-8 fallback). */

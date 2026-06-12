@@ -24,7 +24,7 @@ async function apiGet(url: string, signal?: AbortSignal, headers: Record<string,
 // ---------------------------------------------------------------- prediction markets
 
 export interface MarketHit {
-  platform: "metaculus" | "manifold" | "polymarket" | "kalshi" | "sportsbook";
+  platform: "metaculus" | "manifold" | "polymarket" | "kalshi" | "sportsbook" | "predictit";
   title: string;
   url: string;
   /** Current crowd P(YES) in [0,1] when the platform exposes one. */
@@ -237,6 +237,65 @@ export function devigProbs(decimalOdds: number[]): number[] {
 }
 
 /**
+ * PredictIt (keyless): real-money US-politics markets. One endpoint returns
+ * every open market; matching is client-side term overlap. Multi-contract
+ * markets emit one hit per matching contract (each contract is its own YES/NO
+ * question). No volume is published, so these hits inform panels via
+ * market_odds but never qualify as a mechanical liquidity-gated anchor.
+ */
+export async function predictitSearch(query: string, count: number, signal?: AbortSignal): Promise<MarketHit[]> {
+  const res = await apiGet("https://www.predictit.org/api/marketdata/all/", signal);
+  const data: any = await res.json();
+  const terms = query.toLowerCase().split(/\s+/).filter((t) => t.length > 2);
+  if (!terms.length) return [];
+  const out: { hit: MarketHit; score: number }[] = [];
+  for (const m of data?.markets ?? []) {
+    const name = String(m?.name ?? "");
+    const url = String(m?.url ?? "");
+    const contracts = Array.isArray(m?.contracts) ? m.contracts : [];
+    if (!name || !url || !contracts.length) continue;
+    const marketScore = terms.reduce((s, t) => s + (name.toLowerCase().includes(t) ? 1 : 0), 0);
+    if (marketScore === 0) continue;
+    const live = contracts.filter((c: any) => String(c?.status ?? "Open") === "Open");
+    if (live.length === 1) {
+      const p = num(live[0]?.lastTradePrice);
+      out.push({
+        score: marketScore,
+        hit: {
+          platform: "predictit",
+          title: name,
+          url,
+          probability: p !== undefined ? Math.min(1, Math.max(0, p)) : undefined,
+          closes: isoDate(live[0]?.dateEnd),
+          externalId: m?.id !== undefined ? String(m.id) : undefined,
+        },
+      });
+    } else {
+      for (const c of live.slice(0, 6)) {
+        const cname = String(c?.name ?? c?.shortName ?? "");
+        const p = num(c?.lastTradePrice);
+        if (!cname || p === undefined) continue;
+        out.push({
+          score: marketScore + terms.reduce((s, t) => s + (cname.toLowerCase().includes(t) ? 1 : 0), 0),
+          hit: {
+            platform: "predictit",
+            title: `${name} — ${cname}`,
+            url,
+            probability: Math.min(1, Math.max(0, p)),
+            closes: isoDate(c?.dateEnd),
+            externalId: c?.id !== undefined ? String(c.id) : undefined,
+          },
+        });
+      }
+    }
+  }
+  return out
+    .sort((a, b) => b.score - a.score)
+    .slice(0, count)
+    .map((s) => s.hit);
+}
+
+/**
  * Sportsbook consensus via The Odds API (free tier, optional key): upcoming
  * events with head-to-head prices, de-vigged and averaged across bookmakers.
  * Sharp sportsbook lines are the strongest probability source in sports.
@@ -321,8 +380,9 @@ export async function marketOdds(
     manifoldSearch(query, per, signal),
     polymarketSearch(query, per, signal),
     kalshiSearch(query, per, signal),
+    predictitSearch(query, per, signal),
   ];
-  const names = ["manifold", "polymarket", "kalshi"];
+  const names = ["manifold", "polymarket", "kalshi", "predictit"];
   // Metaculus requires a (free) token — only fan out to it when keyed.
   if (cfg.metaculusApiKey) {
     calls.push(metaculusSearch(cfg, query, per, signal));
@@ -726,7 +786,7 @@ export async function resolveFromPlatform(
 
 // ---------------------------------------------------------------- time series
 
-export type TimeSeriesSource = "fred" | "worldbank" | "yahoo" | "gdelt" | "gdelttone" | "openmeteo" | "nws";
+export type TimeSeriesSource = "fred" | "worldbank" | "yahoo" | "gdelt" | "gdelttone" | "openmeteo" | "nws" | "wikipageviews";
 
 export interface TimeSeriesResult {
   source: TimeSeriesSource;
@@ -935,6 +995,64 @@ async function nwsSeries(series: string, signal?: AbortSignal): Promise<TimeSeri
   };
 }
 
+/**
+ * Wikipedia pageviews (Wikimedia REST, keyless): daily views for one article.
+ * A clean public-attention series — useful as a leading indicator for
+ * elections, product launches, and emerging events. Series = article title.
+ */
+async function wikiPageviewsSeries(series: string, start?: string, end?: string, signal?: AbortSignal): Promise<TimeSeriesResult> {
+  const title = series.trim().replace(/\s+/g, "_");
+  if (!title) throw new Error('wikipageviews series must be a Wikipedia article title, e.g. "Inflation" or "2026 FIFA World Cup"');
+  const fmt = (iso: string) => iso.replace(/-/g, "");
+  const today = new Date().toISOString().slice(0, 10);
+  const startD = fmt(start ?? new Date(Date.now() - 365 * 86_400_000).toISOString().slice(0, 10));
+  const endD = fmt(end && end <= today ? end : today);
+  const res = await apiGet(
+    `https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/en.wikipedia/all-access/all-agents/${encodeURIComponent(title)}/daily/${startD}/${endD}`,
+    signal
+  );
+  const data: any = await res.json();
+  const points = (data?.items ?? [])
+    .map((it: any) => ({
+      date: String(it?.timestamp ?? "").replace(/^(\d{4})(\d{2})(\d{2}).*$/, "$1-$2-$3"),
+      value: Number(it?.views),
+    }))
+    .filter((p: { date: string; value: number }) => /^\d{4}-\d{2}-\d{2}$/.test(p.date) && Number.isFinite(p.value));
+  if (!points.length) {
+    throw new Error(`no pageview data for "${series}" — use the exact en.wikipedia article title (try wiki_summary first)`);
+  }
+  return { source: "wikipageviews", series, points, label: `Wikipedia daily pageviews: ${series}`, unit: "views/day" };
+}
+
+/**
+ * Wikipedia REST summary (keyless): title + plain-text extract. The fast,
+ * reliable way to ground an entity before deeper searching — no HTML
+ * scraping, no fetch_url round-trip.
+ */
+export async function wikiSummary(title: string, signal?: AbortSignal): Promise<string> {
+  const t = title.trim().replace(/\s+/g, "_");
+  if (!t) throw new Error("wiki_summary needs an article title");
+  let res: Response;
+  try {
+    res = await apiGet(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(t)}`, signal);
+  } catch (e) {
+    throw new Error(`no Wikipedia article "${title}" (${errMsg(e)}) — check the title or use web_search`);
+  }
+  const data: any = await res.json();
+  const extract = String(data?.extract ?? "").trim();
+  if (!extract) throw new Error(`Wikipedia has no summary for "${title}" — check the title or use web_search`);
+  const desc = String(data?.description ?? "").trim();
+  const url = String(data?.content_urls?.desktop?.page ?? `https://en.wikipedia.org/wiki/${t}`);
+  return [
+    `${String(data?.title ?? title)}${desc ? ` — ${desc}` : ""}`,
+    "",
+    extract.slice(0, 3000),
+    "",
+    `Source: ${url}`,
+    "(Encyclopedic overview — pair with web_search for anything time-sensitive.)",
+  ].join("\n");
+}
+
 export async function timeSeries(
   cfg: SwarmConfig,
   source: TimeSeriesSource,
@@ -958,8 +1076,10 @@ export async function timeSeries(
       return openmeteoSeries(series, start, end, signal);
     case "nws":
       return nwsSeries(series, signal);
+    case "wikipageviews":
+      return wikiPageviewsSeries(series, start, end, signal);
     default:
-      throw new Error(`unknown source "${source}" — use fred | worldbank | yahoo | gdelt | gdelttone | openmeteo | nws`);
+      throw new Error(`unknown source "${source}" — use fred | worldbank | yahoo | gdelt | gdelttone | openmeteo | nws | wikipageviews`);
   }
 }
 
@@ -1078,11 +1198,14 @@ export function formatTimeSeries(r: TimeSeriesResult, projectTo?: string): strin
   if (r.source === "gdelttone") {
     headerLines.push("NOTE: tone measures media SENTIMENT, not probability — a darkening tone is a weak, lagging signal at best.");
   }
+  if (r.source === "wikipageviews") {
+    headerLines.push("NOTE: pageviews measure public ATTENTION, not probability — a spike says people are looking, not that the event will happen.");
+  }
   if (projectTo) {
     const proj = olsProject(r.points, projectTo);
     headerLines.push(
       proj
-        ? `OLS trend: ${proj.slopePerDay >= 0 ? "+" : ""}${fmt(proj.slopePerDay)}/day over the window · naive projection to ${projectTo} (${proj.daysAhead}d ahead): ${fmt(proj.projected)} (80% residual band ${fmt(proj.lo)}–${fmt(proj.hi)}) — a trend baseline, not destiny.`
+        ? `OLS trend: ${proj.slopePerDay >= 0 ? "+" : ""}${fmt(proj.slopePerDay)}/day over the window · naive projection to ${projectTo} (${proj.daysAhead}d ahead): ${fmt(proj.projected)} (80% prediction band ${fmt(proj.lo)}–${fmt(proj.hi)}, widens with distance) — a trend baseline, not destiny.`
         : `OLS trend: not fittable for projection to ${projectTo} (need ≥2 dated observations with time variance).`
     );
   }

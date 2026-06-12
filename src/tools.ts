@@ -13,12 +13,13 @@ import {
   marketOdds,
   optionsImplied,
   timeSeries,
+  wikiSummary,
   wikiTables,
 } from "./datatools";
 import { renderDocHtml } from "./report";
 import { mergeCandidates } from "./searchcore";
 import { ensureDir, errMsg, escapeHtml, pathInside, truncateMiddle } from "./util";
-import { arxivSearch, crossrefSearch, fetchUrl, webSearch } from "./webtools";
+import { arxivSearch, crossrefSearch, fetchUrl, looksBiomedical, pubmedSearch, semanticScholarSearch, webSearch } from "./webtools";
 
 export interface ToolCtx {
   cfg: SwarmConfig;
@@ -43,6 +44,29 @@ export interface ToolCtx {
   readBlackboard: () => string;
   /** Journal an operator-visible diagnostic (tool infrastructure problems). */
   log?: (level: "info" | "warn" | "error", msg: string) => void;
+  /**
+   * Run-scoped result cache for fetch_url/web_search, shared across every
+   * agent in the run: wide swarms hit the same pages and queries constantly.
+   * Promises are cached (not results) so concurrent identical requests
+   * coalesce into one network call; failures are evicted so they retry.
+   */
+  webCache?: Map<string, Promise<string>>;
+}
+
+/** Cache-through helper for webCache: coalesces concurrent calls, evicts failures. */
+async function cached(ctx: ToolCtx, key: string, work: () => Promise<string>): Promise<string> {
+  const cache = ctx.webCache;
+  if (!cache) return work();
+  const hit = cache.get(key);
+  if (hit) return hit;
+  const p = work();
+  cache.set(key, p);
+  try {
+    return await p;
+  } catch (e) {
+    cache.delete(key); // a transient failure must not poison the run
+    throw e;
+  }
 }
 
 export interface ToolDef {
@@ -414,7 +438,7 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
       name: "web_search",
       description:
         "Search the web. Fans out across multiple engines (DuckDuckGo, Bing, +TinyFish if configured), merges and quality-ranks results, and dedupes by canonical URL. Returns ranked results with title, URL and snippet. " +
-        "Set deep=true to widen the query into complementary phrasings, fetch the top pages, and return quotable passages with publication dates — use for thorough research and any claim that needs grounding. Raise count (up to 50) to pull more sources per call.",
+        "Set deep=true to widen the query into complementary phrasings, fetch the top pages, and return quotable passages with publication dates — use for thorough research and any claim that needs grounding. Setting freshness also sweeps GDELT's global news index (keyless, direct article links). Raise count (up to 50) to pull more sources per call.",
       parameters: {
         type: "object",
         properties: {
@@ -435,24 +459,19 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
       const freshness = ["day", "week", "month", "year"].includes(String(args.freshness))
         ? (String(args.freshness) as "day" | "week" | "month" | "year")
         : undefined;
-      const hits = await webSearch(
-        ctx.cfg,
-        String(args.query),
-        count,
-        ctx.signal,
-        Boolean(args.deep),
-        (msg) => ctx.log?.("warn", msg),
-        false,
-        freshness
-      );
-      if (!hits.length) return "no results";
-      return hits
-        .map((h, i) => {
-          const head = `${i + 1}. ${h.title}${h.date ? ` (${h.date})` : ""}\n   ${h.url}\n   ${h.snippet}`;
-          const quotes = (h.passages || []).map((p) => `   > ${p}`).join("\n");
-          return quotes ? `${head}\n${quotes}` : head;
-        })
-        .join("\n");
+      const query = String(args.query);
+      const deep = Boolean(args.deep);
+      return cached(ctx, `search|${query}|${count}|${deep}|${freshness ?? ""}`, async () => {
+        const hits = await webSearch(ctx.cfg, query, count, ctx.signal, deep, (msg) => ctx.log?.("warn", msg), false, freshness);
+        if (!hits.length) return "no results";
+        return hits
+          .map((h, i) => {
+            const head = `${i + 1}. ${h.title}${h.date ? ` (${h.date})` : ""}\n   ${h.url}\n   ${h.snippet}`;
+            const quotes = (h.passages || []).map((p) => `   > ${p}`).join("\n");
+            return quotes ? `${head}\n${quotes}` : head;
+          })
+          .join("\n");
+      });
     },
   };
 
@@ -460,7 +479,7 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
     schema: {
       name: "academic_search",
       description:
-        "Search scholarly sources: arXiv preprints and Crossref journal/conference metadata (keyless APIs). Returns papers with title, link (arXiv/DOI), abstract snippet, and date. Use for scientific or technical questions where peer-reviewed and preprint sources beat the open web.",
+        "Search scholarly sources: arXiv preprints, Crossref journal/conference metadata, and Semantic Scholar (with citation counts — an influence signal); biomedical phrasing also sweeps PubMed (all keyless APIs). Returns papers with title, link (arXiv/DOI/PubMed), abstract snippet, citation count where available, and date. Use for scientific or technical questions where peer-reviewed and preprint sources beat the open web.",
       parameters: {
         type: "object",
         properties: {
@@ -473,10 +492,13 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
     run: async (args, ctx) => {
       const count = Math.min(Math.max(Number(args.count) || 15, 1), 40);
       const q = String(args.query);
-      const settled = await Promise.allSettled([
+      const calls = [
         arxivSearch(q, count, ctx.signal),
         crossrefSearch(q, count, ctx.signal),
-      ]);
+        semanticScholarSearch(q, count, ctx.signal),
+      ];
+      if (looksBiomedical(q)) calls.push(pubmedSearch(q, count, ctx.signal));
+      const settled = await Promise.allSettled(calls);
       const candidates = settled.flatMap((s) => (s.status === "fulfilled" ? s.value : []));
       if (!candidates.length) {
         const err = settled.find((s): s is PromiseRejectedResult => s.status === "rejected");
@@ -494,7 +516,7 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
     schema: {
       name: "market_odds",
       description:
-        "Query prediction markets and forecasting platforms (Manifold, Polymarket, Kalshi — keyless; Metaculus too when its free token is configured) for live crowd probabilities on a topic. Returns matching questions with current P(YES), volume/forecaster count, close date, and URL. Crowd odds are a strong baseline forecast — cite the market URL like any other source, and reason explicitly about why you agree or deviate.",
+        "Query prediction markets and forecasting platforms (Manifold, Polymarket, Kalshi, PredictIt — keyless; Metaculus too when its free token is configured) for live crowd probabilities on a topic. Returns matching questions with current P(YES), volume/forecaster count, close date, and URL. Crowd odds are a strong baseline forecast — cite the market URL like any other source, and reason explicitly about why you agree or deviate.",
       parameters: {
         type: "object",
         properties: {
@@ -515,15 +537,15 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
     schema: {
       name: "time_series",
       description:
-        "Fetch a statistical/financial/weather time series: fred (St. Louis Fed economic series, e.g. CPIAUCSL, UNRATE — needs the free fredApiKey), worldbank (INDICATOR:COUNTRY, e.g. NY.GDP.MKTP.CD:US — keyless), yahoo (daily market data: AAPL, ^GSPC, EURUSD=X, BTC-USD — keyless), gdelt (news-coverage volume for a query — keyless), gdelttone (media sentiment tone for a query — keyless), openmeteo (daily weather, series \"lat,lon[,variable]\" e.g. \"39.74,-104.99,snowfall_sum\" — past dates use the ERA5 archive, which turns weather base rates into counted frequencies; keyless), nws (official US hourly point forecast, series \"lat,lon\" — keyless). Returns a stats summary, recent observations, and a ready-made ```chart block for reports. Use real data series to ground trend extrapolation instead of guessing.",
+        "Fetch a statistical/financial/weather time series: fred (St. Louis Fed economic series, e.g. CPIAUCSL, UNRATE — needs the free fredApiKey), worldbank (INDICATOR:COUNTRY, e.g. NY.GDP.MKTP.CD:US — keyless), yahoo (daily market data: AAPL, ^GSPC, EURUSD=X, BTC-USD — keyless), gdelt (news-coverage volume for a query — keyless), gdelttone (media sentiment tone for a query — keyless), openmeteo (daily weather, series \"lat,lon[,variable]\" e.g. \"39.74,-104.99,snowfall_sum\" — past dates use the ERA5 archive, which turns weather base rates into counted frequencies; keyless), nws (official US hourly point forecast, series \"lat,lon\" — keyless), wikipageviews (daily Wikipedia pageviews for an article title — a public-attention leading indicator for elections, launches, and emerging events; keyless). Returns a stats summary, recent observations, and a ready-made ```chart block for reports. Use real data series to ground trend extrapolation instead of guessing.",
       parameters: {
         type: "object",
         properties: {
-          source: { type: "string", enum: ["fred", "worldbank", "yahoo", "gdelt", "gdelttone", "openmeteo", "nws"] },
+          source: { type: "string", enum: ["fred", "worldbank", "yahoo", "gdelt", "gdelttone", "openmeteo", "nws", "wikipageviews"] },
           series: {
             type: "string",
             description:
-              "FRED series id, World Bank INDICATOR:COUNTRY, Yahoo Finance symbol, GDELT search query, or lat,lon[,variable] for weather sources",
+              "FRED series id, World Bank INDICATOR:COUNTRY, Yahoo Finance symbol, GDELT search query, lat,lon[,variable] for weather sources, or a Wikipedia article title for wikipageviews",
           },
           start: { type: "string", description: "Start date YYYY-MM-DD (optional)" },
           end: { type: "string", description: "End date YYYY-MM-DD (optional)" },
@@ -538,8 +560,8 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
     },
     run: async (args, ctx) => {
       const source = String(args.source) as TimeSeriesSource;
-      if (!["fred", "worldbank", "yahoo", "gdelt", "gdelttone", "openmeteo", "nws"].includes(source)) {
-        throw new Error("source must be fred | worldbank | yahoo | gdelt | gdelttone | openmeteo | nws");
+      if (!["fred", "worldbank", "yahoo", "gdelt", "gdelttone", "openmeteo", "nws", "wikipageviews"].includes(source)) {
+        throw new Error("source must be fred | worldbank | yahoo | gdelt | gdelttone | openmeteo | nws | wikipageviews");
       }
       const r = await timeSeries(
         ctx.cfg,
@@ -602,6 +624,22 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
     },
   };
 
+  tools.wiki_summary = {
+    schema: {
+      name: "wiki_summary",
+      description:
+        "Fetch the Wikipedia summary for a topic (keyless REST API): a plain-text extract plus short description and canonical URL. The fastest way to ground an entity, definition, or event before deeper searching — no scraping round-trip. Encyclopedic, not current: pair with web_search for anything time-sensitive.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: 'Wikipedia article title (e.g. "Inflation", "2026 FIFA World Cup", "CRISPR")' },
+        },
+        required: ["title"],
+      },
+    },
+    run: async (args, ctx) => wikiSummary(String(args.title), ctx.signal),
+  };
+
   tools.fetch_url = {
     schema: {
       name: "fetch_url",
@@ -621,7 +659,9 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
       if (!/^https?:\/\//.test(url)) throw new Error("only http(s) URLs are supported");
       // Truncate once, here, to the agent-loop cap — a larger cap would just be
       // middle-cut a second time at agent.ts's maxToolResultChars clamp.
-      return fetchUrl(ctx.cfg, url, Boolean(args.raw), ctx.cfg.maxToolResultChars, ctx.signal, (m) => ctx.log?.("warn", m));
+      return cached(ctx, `fetch|${url}|${Boolean(args.raw)}`, () =>
+        fetchUrl(ctx.cfg, url, Boolean(args.raw), ctx.cfg.maxToolResultChars, ctx.signal, (m) => ctx.log?.("warn", m))
+      );
     },
   };
 

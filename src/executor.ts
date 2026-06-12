@@ -152,6 +152,8 @@ export class Executor {
   private settledSinceUpdate: string[] = [];
   private notes: SwarmNote[] = [];
   private phase: { name: string; goal?: string; exitCriteria?: string } | null = null;
+  /** Run-scoped fetch/search cache — wide swarms hit the same pages and queries constantly. */
+  private webCache = new Map<string, Promise<string>>();
 
   private conductorMessages: ChatMsg[] = [];
   private spentTokens = 0;
@@ -1894,6 +1896,7 @@ PROTOCOL
       log: (level, msg) => {
         this.journal.append("log", { level, msg, agentId, taskId: task?.id });
       },
+      webCache: this.webCache,
     };
   }
 

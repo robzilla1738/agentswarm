@@ -169,3 +169,26 @@ test("synthToolset can recover full task reports via read_report", () => {
   assert.ok(synth.read_file && synth.list_dir && synth.save_artifact);
   assert.ok(!synth.web_search && !synth.shell, "synthesis stays offline — research happens before it");
 });
+
+test("new keyless data tools are registered with the expected surface", () => {
+  const { workerToolset } = require("../../dist/tools.js");
+  const all = workerToolset(undefined);
+  assert.ok(all.wiki_summary, "wiki_summary tool exists");
+  const tsEnum = all.time_series.schema.parameters.properties.source.enum;
+  assert.ok(tsEnum.includes("wikipageviews"), "time_series gained the wikipageviews source");
+  assert.ok(/PredictIt/i.test(all.market_odds.schema.description), "market_odds names PredictIt");
+  assert.ok(/Semantic Scholar/i.test(all.academic_search.schema.description), "academic_search names Semantic Scholar");
+  assert.ok(/PubMed/i.test(all.academic_search.schema.description), "academic_search names PubMed");
+});
+
+test("web_search and fetch_url coalesce through the run-scoped webCache", async () => {
+  const { workerToolset } = require("../../dist/tools.js");
+  const all = workerToolset(undefined);
+  const cache = new Map();
+  // Monkey-patch via the cache itself: pre-seed and verify both tools consult it.
+  cache.set("fetch|https://example.com/x|false", Promise.resolve("CACHED-FETCH"));
+  cache.set("search|q|15|false|", Promise.resolve("CACHED-SEARCH"));
+  const ctx2 = { ...ctx, webCache: cache, cfg: { ...cfg } };
+  assert.equal(await all.fetch_url.run({ url: "https://example.com/x" }, ctx2), "CACHED-FETCH");
+  assert.equal(await all.web_search.run({ query: "q" }, ctx2), "CACHED-SEARCH");
+});
