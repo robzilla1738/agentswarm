@@ -359,11 +359,15 @@ export function questionBlock(q: ForecastQuestion): string {
  * engine's (deterministic code).
  */
 export function forecastConductorAddendum(
-  q: ForecastQuestion,
+  questions: ForecastQuestion[],
   panelSize: number,
   calibration: string,
-  compact = false
+  compact = false,
+  brief = ""
 ): string {
+  // Open-ended decomposition: run the pipeline per sub-forecast.
+  if (questions.length > 1) return forecastConductorAddendumMulti(questions, panelSize, calibration, brief);
+  const q = questions[0];
   const researchWave = compact
     ? `1. RESEARCH WAVE — exactly TWO parallel scouts, no more (this is an imported tournament question: fast, cheap, and calibrated beats exhaustive — the token budget is deliberately tight and the panel is the deliverable):
    • one base-rate + markets scout: market_odds with 2-3 phrasings, ≥1 reference class with a COUNTED frequency, and any single time_series that directly bears on the question (project_to=<resolution date>);
@@ -393,11 +397,64 @@ ${calibration ? `\n${calibration}\nSteer the panel accordingly (e.g. demand stro
 }
 
 /**
+ * Open-ended forecast doctrine: one shared research wave, then an independent
+ * panel PER sub-forecast (each panelist tagged with its sub-forecast id), a
+ * red-team per sub-forecast, then finish. The engine aggregates each
+ * sub-forecast separately and writes one ledger row per sub-forecast.
+ */
+function forecastConductorAddendumMulti(
+  questions: ForecastQuestion[],
+  panelSize: number,
+  calibration: string,
+  brief: string
+): string {
+  // Smaller panels per sub-forecast keep N×panel within budget; the operator
+  // can still raise panelSize. The conductor sees the effective number.
+  const perQ = Math.max(3, Math.min(panelSize, 4));
+  const list = questions
+    .map((q, i) => `  [${q.id ?? `sf${i + 1}`}] (${q.kind}) ${q.text}\n      criteria: ${q.resolutionCriteria}\n      resolves: ${q.resolutionDate}${q.options?.length ? `\n      options: ${q.options.map((o) => JSON.stringify(o)).join(", ")}` : ""}`)
+    .join("\n");
+  return `
+THIS IS AN OPEN-ENDED FORECAST MISSION. It has been decomposed into ${questions.length} independently-resolvable SUB-FORECASTS. The deliverable is a calibrated answer to EACH, aggregated MECHANICALLY by the engine — never by you or any agent. Do not invent, merge, drop, or re-scope the sub-forecasts; forecast exactly these.
+
+${brief ? `BRIEF: ${brief}\n` : ""}SUB-FORECASTS:
+${list}
+
+FORECAST PIPELINE (structure the run exactly like this):
+1. RESEARCH WAVE — a shared set of parallel scouts covering the union of the sub-forecasts (base rates with COUNTED frequencies incl. the status-quo rate; current evidence separating fact from commentary; a markets/data task calling market_odds and time_series with project_to=<the relevant resolution date>). One scout may serve several sub-forecasts; aim for thorough coverage without one task per sub-forecast.
+2. PANEL WAVE — for EACH sub-forecast above, spawn ${perQ} INDEPENDENT role "forecaster" tasks (depending only on research tasks, never on another forecaster). In every forecaster objective write BOTH "QUESTION: <id>" (the sub-forecast id, e.g. ${questions[0].id}) and "METHOD: <label>" — labels must be DISTINCT WITHIN a sub-forecast (the same label may be reused across different sub-forecasts). Use the canonical menu: outside-view, inside-view, trend, market-anchored, decomposition, skeptic. Inline that sub-forecast's question, criteria, and date verbatim in the forecaster's context. Spread model tiers. Forecasters end with submit_forecast.
+3. RED-TEAM WAVE — one role "red-team" task per sub-forecast (or one covering all), depending on that sub-forecast's panel: attack the rationales and say which direction each flaw biases the forecast.
+4. REVISION WAVE — only for sub-forecasts whose red-team found MATERIAL flaws: re-spawn the flawed panelist (same QUESTION + METHOD labels, model:"cheap").
+5. finish — your notes guide the synthesizer. Do NOT state numbers of your own; the engine computes every aggregate.
+
+FORECAST RULES
+- Research tasks post evidence to the blackboard; forecasters must never post numbers there. Panel independence is the entire value of each ensemble.
+- Every forecaster MUST carry a "QUESTION: <id>" line — a forecaster with no question id is attributed to the first sub-forecast, which corrupts the panels. Double-check each one.
+- Do not set verify:true on forecaster tasks. Keep the total task count in budget: ${questions.length} sub-forecasts × ${perQ} panelists is the bulk of the work — lean on a shared research wave rather than per-sub-forecast research sprawl.
+${calibration ? `\n${calibration}\nSteer the panels accordingly.` : ""}`;
+}
+
+/**
  * Appended to the synthesizer system prompt in forecast mode. The aggregate
  * block carries the exact computed numbers; the synthesizer's job is the
  * prose around them, never the arithmetic.
  */
-export function forecastSynthAddendum(aggregateBlock: string): string {
+export function forecastSynthAddendum(aggregateBlock: string, count = 1, brief = ""): string {
+  if (count > 1) {
+    return `
+FORECAST DELIVERABLE (${count} SUB-FORECASTS)
+This open-ended mission was decomposed into ${count} independently-resolvable sub-forecasts. The engine already aggregated each panel mechanically. THESE NUMBERS ARE FINAL — use them exactly as given (no recomputing, re-rounding, or averaging):
+
+${aggregateBlock}
+
+Structure report_markdown:
+1. # <the operator's original question>
+2. ${brief ? `Open with the brief: "${brief}". Then a` : "A"} \`\`\`chart stat block summarizing the sub-forecasts (one item per sub-forecast with its headline number), then one or two sentences answering the overall question by weaving the sub-forecasts together — what they jointly imply.
+3. A "## <sub-forecast question>" section for EACH sub-forecast: its headline number, resolution criteria + date verbatim, a one-line panel table (method | forecast | rationale), and key drivers / what would change it. Keep every number exactly as the engine gave it.
+4. ## How these fit together — the integrated picture, tensions between sub-forecasts, and what to watch.
+5. ## Sources — as usual.
+Where the red-team found problems, say honestly how they were (or weren't) addressed.`;
+  }
   return `
 FORECAST DELIVERABLE
 This was a forecast mission. The engine already aggregated the panel mechanically. THESE NUMBERS ARE FINAL — use them exactly as given (no recomputing, re-rounding, or averaging):
@@ -433,6 +490,34 @@ Rewrite it as a precisely resolvable question. Reply with ONLY a JSON object (no
 - resolutionCriteria: exactly what counts as YES (or how the value/winner/date is measured), naming the authoritative public source to check.
 - resolutionDate: ${operatorDate ? `use ${operatorDate}` : "the ISO date when the answer is knowable — infer it from the mission; if the mission names no horizon, pick a sensible near-term one"}.
 - Keep the question's intent; sharpen, don't replace it. Only use "mc"/"date" when the mission genuinely asks which/when — a will-it-happen mission stays binary.`;
+}
+
+/**
+ * Decompose an open-ended mission into a small set of independently-resolvable
+ * sub-forecasts (or a single one when the mission is already a clean
+ * forecast). Each sub-question follows the same sharpening rules as
+ * sharpenQuestionPrompt; the engine forecasts and resolves each on its own.
+ */
+export function forecastPlanPrompt(mission: string, today: string, operatorDate?: string): string {
+  return `You are turning a forecasting mission into the set of objectively-resolvable questions that best answers it. Today is ${today}.
+
+MISSION (as the operator phrased it)
+${mission}
+${operatorDate ? `\nThe operator set the resolution date: ${operatorDate}.` : ""}
+
+Decide how many forecasts the mission needs:
+- A clean, single will-it-happen / what-value / which / when mission → return EXACTLY ONE question.
+- An OPEN-ENDED mission ("what will happen with X?", "how will Y evolve?", "what's the outlook for Z?") → break it into 2-6 concrete sub-forecasts that, taken together, answer it. Each sub-forecast must be independently resolvable and cover a distinct, decision-relevant facet (key metrics, turning-point events, the main alternative outcomes) — not rephrasings of one another. Prefer fewer, higher-signal sub-forecasts over many trivial ones.
+
+Reply with ONLY a JSON object (no prose, no markdown fence):
+{"brief": "one sentence: what the operator is really asking and how these sub-forecasts cover it", "questions": [{"text": "...", "kind": "binary" | "numeric" | "mc" | "date", "resolutionCriteria": "...", "resolutionDate": "YYYY-MM-DD", "unit": "...", "options": ["...", "..."]}]}
+
+For EACH question:
+- text: unambiguous, self-contained, includes the date. NEUTRALIZE the framing — strip loaded words, presuppositions, and the asker's lean; forecasters must inherit a neutral event statement, not an opinion.
+- kind: "binary" for will-it-happen; "numeric" for what-will-the-value-be (include unit); "mc" for which-of-N (include options: 2-8 mutually exclusive and collectively exhaustive, with a catch-all like "None of the above / other" when the named candidates don't cover every outcome); "date" for when-will-it-happen (resolutionDate is the horizon after which "never" is the answer).
+- resolutionCriteria: exactly what counts as YES (or how the value/winner/date is measured), naming the authoritative public source to check.
+- resolutionDate: ${operatorDate ? `use ${operatorDate} for every question` : "the ISO date when that question is knowable — infer it; if no horizon is implied, pick a sensible near-term one. Sub-forecasts may share a horizon or differ."}.
+- A single-question mission yields a one-element "questions" array — that is expected, not a failure.`;
 }
 
 /** The exact-numbers block handed to the synthesizer (and journaled for the UI). */

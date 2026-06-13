@@ -75,11 +75,15 @@ export class RunState {
   budgetSeries: { t: number; tokens: number; cost: number }[] = [];
   /** Distinct web sources touched (fetches, search hits, cited sources) — canonical URLs. */
   sourceUrls = new Set<string>();
-  /** Forecast mode: the sharpened question, the panel's aggregate, and its ledger id. */
+  /** Forecast mode: the primary sub-forecast + its aggregate (back-compat singular view). */
   question: ForecastQuestion | null = null;
   aggregate: AggregateForecast | null = null;
   forecastPanel: { taskId: string; method: string; probability?: number; quantiles?: { p10: number; p50: number; p90: number } }[] = [];
   ledgerId?: string;
+  /** Forecast mode: all sub-forecasts (1 for a clean question), their aggregates, and the framing. */
+  questions: ForecastQuestion[] = [];
+  forecastBrief = "";
+  aggregates: { questionId: string; aggregate: AggregateForecast; panel: RunState["forecastPanel"]; ledgerId?: string }[] = [];
   finalSummary?: string;
   finalReportPath?: string;
   lastSeq = 0;
@@ -286,19 +290,37 @@ export class RunState {
         this.pushBudgetPoint(ev.t);
         break;
       }
+      case "forecast.plan":
+        if (Array.isArray(ev.questions)) this.questions = ev.questions as ForecastQuestion[];
+        if (typeof ev.brief === "string") this.forecastBrief = ev.brief;
+        break;
       case "forecast.question":
-        this.question = ev.question as ForecastQuestion;
+        // Primary = the first sub-forecast; later per-question events don't overwrite it.
+        if (!this.question) this.question = ev.question as ForecastQuestion;
         break;
       case "forecast.submitted": {
         const t = this.tasks.get(ev.taskId as string);
         if (t) t.forecast = ev.forecast as Forecast;
         break;
       }
-      case "forecast.aggregated":
-        this.aggregate = ev.aggregate as AggregateForecast;
-        if (Array.isArray(ev.panel)) this.forecastPanel = ev.panel as RunState["forecastPanel"];
-        if (typeof ev.ledgerId === "string") this.ledgerId = ev.ledgerId;
+      case "forecast.aggregated": {
+        const agg = ev.aggregate as AggregateForecast;
+        const panel = Array.isArray(ev.panel) ? (ev.panel as RunState["forecastPanel"]) : [];
+        const ledgerId = typeof ev.ledgerId === "string" ? ev.ledgerId : undefined;
+        const qid = typeof ev.questionId === "string" ? ev.questionId : (this.questions[0]?.id ?? "sf1");
+        // Append (or replace on resume) the per-sub-forecast aggregate.
+        const existing = this.aggregates.findIndex((a) => a.questionId === qid);
+        const entry = { questionId: qid, aggregate: agg, panel, ledgerId };
+        if (existing >= 0) this.aggregates[existing] = entry;
+        else this.aggregates.push(entry);
+        // Keep the singular fields pointed at the primary sub-forecast.
+        if (this.aggregates[0]) {
+          this.aggregate = this.aggregates[0].aggregate;
+          this.forecastPanel = this.aggregates[0].panel;
+          this.ledgerId = this.aggregates[0].ledgerId;
+        }
         break;
+      }
       case "run.final":
         this.finalSummary = ev.summary as string;
         this.finalReportPath = ev.reportPath as string | undefined;
@@ -422,6 +444,8 @@ export class RunState {
               unit: this.question.unit,
               n: this.aggregate?.n ?? 0,
               resolutionDate: this.question.resolutionDate,
+              // >1 when an open question fanned out into several sub-forecasts.
+              ...(this.questions.length > 1 ? { count: this.questions.length } : {}),
             },
           }
         : {}),

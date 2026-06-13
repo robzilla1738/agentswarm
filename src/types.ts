@@ -39,8 +39,15 @@ export interface Quantiles {
   p95?: number;
 }
 
-/** The sharpened, resolvable form of a forecast mission. */
+/** The sharpened, resolvable form of a forecast mission (or one sub-forecast of an open question). */
 export interface ForecastQuestion {
+  /**
+   * Stable id within a run, e.g. "sf1". Lets panelists, aggregates, and ledger
+   * rows be partitioned when one open question fans out into several
+   * sub-forecasts. Absent on legacy single-question records (readers default
+   * to the primary question).
+   */
+  id?: string;
   /** Unambiguous question text, e.g. "Will the ECB cut its deposit rate before 2026-09-01?" */
   text: string;
   kind: ForecastKind;
@@ -70,6 +77,8 @@ export interface ForecastOrigin {
 
 /** One panelist's structured forecast (submit_forecast terminal tool). */
 export interface Forecast {
+  /** Which sub-forecast this panelist answered (ForecastQuestion.id). Absent → the run's primary question. */
+  questionId?: string;
   /** Primary method: outside-view | inside-view | trend | market-anchored | inverted-framing | ... */
   method: string;
   /** P(YES) in [0,1] — binary questions. */
@@ -180,6 +189,8 @@ export interface RunOptions {
   forecastOrigin?: ForecastOrigin;
   /** Forecast mode: ledger id this run's forecast supersedes (trigger-driven re-forecast). */
   supersedes?: string;
+  /** Forecast mode: force a single forecast (skip open-ended decomposition into sub-forecasts). */
+  forecastSingle?: boolean;
   verification: Verification;
   thinking: boolean;
   reasoningEffort: ReasoningEffort;
@@ -257,6 +268,8 @@ export interface Task {
   sources?: SourceRef[];
   /** Structured forecast from a forecaster task (submit_forecast terminal). */
   forecast?: Forecast;
+  /** Forecast mode: which sub-forecast a forecaster task answers (parsed from "QUESTION: <id>"). Absent → primary. */
+  questionId?: string;
   createdAt: number;
   startedAt?: number;
   endedAt?: number;
@@ -295,7 +308,7 @@ export interface RunSummary {
   sourceCount?: number;
   finalSummary?: string;
   /** Forecast runs: the headline aggregate once computed. */
-  forecast?: { p?: number; p50?: number; unit?: string; n: number; resolutionDate: string };
+  forecast?: { p?: number; p50?: number; unit?: string; n: number; resolutionDate: string; count?: number };
 }
 
 /**

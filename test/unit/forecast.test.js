@@ -19,6 +19,9 @@ const {
   logScore,
   intervalScore,
   parseQuestionJson,
+  parseForecastPlan,
+  clampHorizon,
+  extractQuestionRef,
   validateForecastAnalytics,
   evidenceOverlap,
   scaleK,
@@ -693,6 +696,77 @@ test("extractMethodLabel parses the spawn-time method assignment", () => {
   assert.equal(extractMethodLabel("method: Decomposition\nmore text"), "decomposition");
   assert.equal(extractMethodLabel('Use METHOD = "skeptic" here'), "skeptic");
   assert.equal(extractMethodLabel("no label anywhere"), null);
+});
+
+test("extractQuestionRef parses the sub-forecast id assignment", () => {
+  assert.equal(extractQuestionRef("QUESTION: sf2\nMETHOD: trend"), "sf2");
+  assert.equal(extractQuestionRef('question = "SF10" here'), "sf10");
+  assert.equal(extractQuestionRef("METHOD: trend (no question tag)"), null);
+});
+
+test("clampHorizon: operator date wins; missing/past → fallback; far future capped", () => {
+  const today = "2026-06-13";
+  // operator date always wins, even if the model offered something else
+  assert.equal(clampHorizon("2027-01-01", "2026-09-01", today), "2026-09-01");
+  // missing/garbage → today + 90d
+  assert.equal(clampHorizon("", undefined, today), "2026-09-11");
+  assert.equal(clampHorizon("not-a-date", undefined, today), "2026-09-11");
+  // a past date with no operator date is pushed out to the fallback
+  assert.equal(clampHorizon("2020-01-01", undefined, today), "2026-09-11");
+  // a sane future date is kept
+  assert.equal(clampHorizon("2026-12-31", undefined, today), "2026-12-31");
+  // absurdly far future is capped to ~5 years
+  assert.equal(clampHorizon("2099-01-01", undefined, today), "2031-06-12");
+});
+
+test("parseForecastPlan: multi-question decomposition with stable ids", () => {
+  const raw = JSON.stringify({
+    brief: "Outlook for US housing in 2026.",
+    questions: [
+      { text: "Will 30y mortgage rate fall below 6% in 2026?", kind: "binary", resolutionCriteria: "Freddie Mac PMMS weekly avg < 6.0% any week in 2026.", resolutionDate: "2026-12-31" },
+      { text: "US median existing-home price YoY % change at year-end 2026?", kind: "numeric", unit: "%", resolutionCriteria: "NAR December 2026 YoY.", resolutionDate: "2027-01-20" },
+    ],
+  });
+  const plan = parseForecastPlan(raw, undefined, "2026-06-13", 6);
+  assert.ok(plan);
+  assert.equal(plan.brief, "Outlook for US housing in 2026.");
+  assert.equal(plan.questions.length, 2);
+  assert.deepEqual(plan.questions.map((q) => q.id), ["sf1", "sf2"]);
+  assert.equal(plan.questions[0].kind, "binary");
+  assert.equal(plan.questions[1].unit, "%");
+});
+
+test("parseForecastPlan: a clean single question yields a one-element plan", () => {
+  const raw = JSON.stringify({
+    brief: "",
+    questions: [{ text: "Will the Fed cut by 2026-09-01?", kind: "binary", resolutionCriteria: "FOMC statement.", resolutionDate: "2026-09-01" }],
+  });
+  const plan = parseForecastPlan(raw, undefined, "2026-06-13");
+  assert.equal(plan.questions.length, 1);
+  assert.equal(plan.questions[0].id, "sf1");
+});
+
+test("parseForecastPlan: operator date overrides every sub-question; bad dates are clamped, not dropped", () => {
+  const raw = JSON.stringify({
+    questions: [
+      { text: "A?", kind: "binary", resolutionCriteria: "x", resolutionDate: "2099-01-01" },
+      { text: "B?", kind: "binary", resolutionCriteria: "y", resolutionDate: "garbage" },
+    ],
+  });
+  const plan = parseForecastPlan(raw, "2026-10-01", "2026-06-13");
+  assert.equal(plan.questions.length, 2, "neither sub-question is dropped on a bad date");
+  assert.ok(plan.questions.every((q) => q.resolutionDate === "2026-10-01"), "operator date wins everywhere");
+});
+
+test("parseForecastPlan: caps at maxN and tolerates a bare single-object reply", () => {
+  const many = JSON.stringify({ questions: Array.from({ length: 9 }, (_, i) => ({ text: `Q${i}?`, kind: "binary", resolutionCriteria: "c", resolutionDate: "2026-12-31" })) });
+  assert.equal(parseForecastPlan(many, undefined, "2026-06-13", 6).questions.length, 6);
+  const bare = JSON.stringify({ text: "Will X?", kind: "binary", resolutionCriteria: "c", resolutionDate: "2026-12-31" });
+  const plan = parseForecastPlan(bare, undefined, "2026-06-13");
+  assert.equal(plan.questions.length, 1);
+  // nothing parseable → null (caller falls back to single-question sharpening)
+  assert.equal(parseForecastPlan("not json", undefined, "2026-06-13"), null);
+  assert.equal(parseForecastPlan(JSON.stringify({ questions: [{ text: "" }] }), undefined, "2026-06-13"), null);
 });
 
 test("canonicalMethodLabel strips revision decorations so revisions replace their originals", () => {

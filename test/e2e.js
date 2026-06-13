@@ -967,8 +967,9 @@ async function phaseForecast() {
   ok(`mock model server on :${port} (forecast script)`);
   // forecastMarketWeight 0: the engine's market anchor would otherwise hit
   // live prediction-market APIs mid-test — determinism beats coverage here
-  // (the blend math is unit-tested).
-  writeConfig(home, port, { forecastPanelSize: 3, forecastMarketWeight: 0 });
+  // (the blend math is unit-tested). forecastDecompose off: this phase tests
+  // the single-question path; decomposition has its own phase.
+  writeConfig(home, port, { forecastPanelSize: 3, forecastMarketWeight: 0, forecastDecompose: false });
   const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
 
   const res = spawnSync(process.execPath, [SWARM, "forecast", "Will the test event happen?", "--fg"], {
@@ -1166,6 +1167,81 @@ async function phaseTournamentPreset() {
   fs.rmSync(home, { recursive: true, force: true });
 }
 
+async function phaseForecastMulti() {
+  console.log("\n▶ Phase 24: open-ended forecast — decomposition into independent sub-forecasts");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "forecast-multi" });
+  ok(`mock model server on :${port} (forecast-multi script)`);
+  writeConfig(home, port, { forecastPanelSize: 3, forecastMarketWeight: 0 });
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const res = spawnSync(process.execPath, [SWARM, "forecast", "What will happen with the test domain in 2027?", "--fg"], {
+    env, encoding: "utf8", timeout: 180000,
+  });
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); proc.kill(); fail(`swarm forecast (multi) exited ${res.status}`); }
+  const { runDir, evs } = soleRunEvents(home);
+  const byType = (t) => evs.filter((e) => e.type === t);
+
+  // The plan: one forecast.plan with 3 sub-forecasts + a brief.
+  const plan = byType("forecast.plan")[0];
+  if (!plan || !Array.isArray(plan.questions) || plan.questions.length !== 3 || !plan.brief) {
+    fail(`forecast.plan should carry a brief and 3 sub-forecasts, got ${JSON.stringify(plan && { n: plan.questions?.length, brief: plan.brief })}`);
+  }
+  if (JSON.stringify(plan.questions.map((q) => q.id)) !== JSON.stringify(["sf1", "sf2", "sf3"])) {
+    fail(`sub-forecasts should have stable ids sf1..sf3, got ${JSON.stringify(plan.questions.map((q) => q.id))}`);
+  }
+  ok("open question decomposed into 3 sub-forecasts with a brief (forecast.plan)");
+
+  // Each sub-forecast aggregated independently — 3 forecast.aggregated events,
+  // each tagged with its question id.
+  const aggs = byType("forecast.aggregated");
+  if (aggs.length !== 3) fail(`expected 3 forecast.aggregated events (one per sub-forecast), got ${aggs.length}`);
+  if (JSON.stringify(aggs.map((a) => a.questionId).sort()) !== JSON.stringify(["sf1", "sf2", "sf3"])) {
+    fail(`aggregates should be tagged sf1..sf3, got ${JSON.stringify(aggs.map((a) => a.questionId))}`);
+  }
+  // Each panel = 3 conductor panelists + 1 inverted-framing probe = 4.
+  for (const a of aggs) {
+    if (a.panel.length !== 4) fail(`${a.questionId} panel should be 4 (3 panelists + probe), got ${a.panel.length}`);
+  }
+  ok("each sub-forecast aggregated independently (3 aggregates, 4 panelists each incl. probe)");
+
+  // Panelist forecasts are partitioned by question id (no cross-contamination).
+  const submitted = byType("forecast.submitted");
+  const byQ = {};
+  for (const e of submitted) {
+    const qid = e.forecast.questionId ?? "sf1";
+    byQ[qid] = (byQ[qid] || 0) + 1;
+  }
+  if (byQ.sf1 !== 4 || byQ.sf2 !== 4 || byQ.sf3 !== 4) {
+    fail(`each sub-forecast should own 4 submissions, got ${JSON.stringify(byQ)}`);
+  }
+  ok("panelists partitioned by sub-forecast id (4 each, incl. inverted-framing probe)");
+
+  // The ledger holds 3 created records sharing one setId (the run id) + brief.
+  const ledgerLines = fs.readFileSync(path.join(home, "forecasts", "ledger.jsonl"), "utf8")
+    .split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  const created = ledgerLines.filter((r) => r.rec === "created");
+  if (created.length !== 3) fail(`ledger should hold 3 created records, got ${created.length}`);
+  const setIds = [...new Set(created.map((r) => r.setId))];
+  if (setIds.length !== 1 || !setIds[0]) fail(`all 3 sub-forecasts should share one setId, got ${JSON.stringify(setIds)}`);
+  if (!created.every((r) => r.brief && r.evidenceOverlap === 0)) {
+    fail("each sub-forecast record should carry the brief and evidence overlap 0 (distinct domains)");
+  }
+  ok("ledger holds 3 grouped sub-forecast records (shared setId + brief, overlap 0)");
+
+  // The synthesizer received all 3 aggregate blocks + the brief.
+  const report = fs.readFileSync(path.join(runDir, "artifacts", "final-report.md"), "utf8");
+  if (!/SUBFORECAST-BLOCKS: 3/.test(report) || !/BRIEF-PINNED: true/.test(report)) {
+    fail("the synthesizer should receive all 3 sub-forecast blocks and the brief");
+  }
+  ok("synthesizer composed from all 3 sub-forecast aggregates + the brief");
+
+  if (byType("run.status").pop().status !== "done") fail("multi-forecast run did not end done");
+  ok("run finished with status=done");
+  proc.kill();
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
 async function main() {
   await phaseHappy();
   await phaseAuthFail();
@@ -1189,9 +1265,10 @@ async function main() {
   await phaseStrictVerify();
   await phaseCitations();
   await phaseForecast();
+  await phaseForecastMulti();
   await phaseTournamentPreset();
   console.log(
-    "\n✅ E2E passed — pipeline, auth failure, resume (with ledger re-seed), budget cap, verify-retry, steering + cancel, compaction, hub API, checkpoint resume, conductor breaker, blind verification, SIGTERM safety, 429 limiter, model tiers, hierarchical teams, the living plan, cascade root causes, failure diagnostics, forecast mode (panel → mechanical aggregation → ledger → resolution → calibration), and tournament imports (preset question, ledger origin, platform-resolution fallback) all work."
+    "\n✅ E2E passed — pipeline, auth failure, resume (with ledger re-seed), budget cap, verify-retry, steering + cancel, compaction, hub API, checkpoint resume, conductor breaker, blind verification, SIGTERM safety, 429 limiter, model tiers, hierarchical teams, the living plan, cascade root causes, failure diagnostics, forecast mode (panel → mechanical aggregation → ledger → resolution → calibration), open-ended decomposition (one question → independent sub-forecasts), and tournament imports (preset question, ledger origin, platform-resolution fallback) all work."
   );
 }
 

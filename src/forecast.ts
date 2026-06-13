@@ -586,6 +586,16 @@ export function extractMethodLabel(text: string): string | null {
 }
 
 /**
+ * Pull the "QUESTION: <id>" assignment out of a forecaster task's objective —
+ * which sub-forecast it answers when an open question decomposed. Null when
+ * absent (single-question runs need no tag; readers default to the primary).
+ */
+export function extractQuestionRef(text: string): string | null {
+  const m = /question(?:\s+id)?\s*[:=]\s*["'`]?(sf\d+)/i.exec(text);
+  return m ? m[1].toLowerCase() : null;
+}
+
+/**
  * Canonicalize a submitted method label: lowercase, and strip revision
  * decorations ("trend (revised)", "trend v2", "trend - updated"). Revisions
  * MUST land on their original label or the latest-per-method dedup keeps both
@@ -607,21 +617,34 @@ export function canonicalMethodLabel(raw: string): string {
 export const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 /**
- * Parse the sharpener's JSON reply into a ForecastQuestion, tolerating code
- * fences and surrounding prose. An operator-supplied resolution date always
- * wins over the model's. Returns null when anything required is unusable —
- * the caller falls back to a mechanically-built question.
+ * Resolve a sub-forecast's horizon when decomposing (best-effort, never
+ * rejects): operator date wins; an absent/unparseable/past model date falls
+ * back to today + `fallbackDays`; a valid future date is clamped to ~5 years
+ * out so a model can't park a question a century away.
  */
-export function parseQuestionJson(raw: string, operatorDate?: string): ForecastQuestion | null {
-  const start = raw.indexOf("{");
-  const end = raw.lastIndexOf("}");
-  if (start < 0 || end <= start) return null;
-  let obj: Record<string, unknown>;
-  try {
-    obj = JSON.parse(raw.slice(start, end + 1));
-  } catch {
-    return null;
-  }
+export function clampHorizon(rawDate: string, operatorDate: string | undefined, today: string, fallbackDays = 90): string {
+  if (operatorDate && ISO_DATE.test(operatorDate)) return operatorDate;
+  const t0 = isoToDays(today);
+  if (t0 === null) return ISO_DATE.test(rawDate) ? rawDate : "";
+  const fallback = daysToIso(t0 + fallbackDays);
+  if (!ISO_DATE.test(rawDate)) return fallback;
+  const d = isoToDays(rawDate);
+  if (d === null || d < t0 + 1) return fallback; // past/today with no operator date → push out
+  if (d > t0 + 1825) return daysToIso(t0 + 1825); // cap ~5 years
+  return rawDate;
+}
+
+/**
+ * Build a ForecastQuestion from an already-parsed object. In strict mode
+ * (no `fallbackDate`), an invalid date returns null — the historical
+ * single-question behavior. In plan mode (`fallbackDate` set), the date is
+ * resolved/clamped instead of rejected so a sub-forecast always survives.
+ */
+function questionFromObj(
+  obj: Record<string, unknown>,
+  operatorDate?: string,
+  fallbackDate?: string
+): ForecastQuestion | null {
   if (!obj || typeof obj !== "object") return null;
   const text = String(obj.text ?? "").trim();
   const criteria = String(obj.resolutionCriteria ?? "").trim();
@@ -630,6 +653,7 @@ export function parseQuestionJson(raw: string, operatorDate?: string): ForecastQ
     : null;
   let date = String(obj.resolutionDate ?? "").trim();
   if (operatorDate && ISO_DATE.test(operatorDate)) date = operatorDate;
+  if (fallbackDate && !ISO_DATE.test(date)) date = fallbackDate; // plan mode: never reject on date
   if (!text || !criteria || !kind || !ISO_DATE.test(date)) return null;
   const unit = obj.unit ? String(obj.unit).trim().slice(0, 40) : undefined;
   // mc questions need a usable option list — 2-8 distinct non-empty strings —
@@ -648,6 +672,75 @@ export function parseQuestionJson(raw: string, operatorDate?: string): ForecastQ
     ...(kind === "numeric" && unit ? { unit } : {}),
     ...(options ? { options } : {}),
   };
+}
+
+/**
+ * Parse the sharpener's JSON reply into a ForecastQuestion, tolerating code
+ * fences and surrounding prose. An operator-supplied resolution date always
+ * wins over the model's. Returns null when anything required is unusable —
+ * the caller falls back to a mechanically-built question.
+ */
+export function parseQuestionJson(raw: string, operatorDate?: string): ForecastQuestion | null {
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  let obj: Record<string, unknown>;
+  try {
+    obj = JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+  return questionFromObj(obj, operatorDate);
+}
+
+/** An open-ended question decomposed into 1+ resolvable sub-forecasts plus the framing they answer. */
+export interface ForecastPlan {
+  brief: string;
+  questions: ForecastQuestion[];
+}
+
+/**
+ * Parse the decomposition model's reply into a ForecastPlan, tolerating prose,
+ * fences, a `{brief, questions:[...]}` shape, a bare `questions` array, or a
+ * single question object. Each sub-question runs through the same validation
+ * as `parseQuestionJson` (best-effort dates so none is dropped on a horizon),
+ * gets a stable id (sf1..sfN), and the set is capped at `maxN`. Returns null
+ * only when nothing parses — the caller then falls back to single-question
+ * sharpening, then to the mechanical binary question.
+ */
+export function parseForecastPlan(
+  raw: string,
+  operatorDate: string | undefined,
+  today: string,
+  maxN = 6
+): ForecastPlan | null {
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  let obj: Record<string, unknown>;
+  try {
+    obj = JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+  if (!obj || typeof obj !== "object") return null;
+  const items: unknown[] = Array.isArray(obj.questions)
+    ? obj.questions
+    : obj.text // a single question object with no wrapper
+      ? [obj]
+      : [];
+  const questions: ForecastQuestion[] = [];
+  for (const item of items) {
+    if (questions.length >= Math.max(1, maxN)) break;
+    if (!item || typeof item !== "object") continue;
+    const rawDate = String((item as Record<string, unknown>).resolutionDate ?? "").trim();
+    const fallbackDate = clampHorizon(rawDate, operatorDate, today);
+    const q = questionFromObj(item as Record<string, unknown>, operatorDate, fallbackDate);
+    if (q) questions.push({ ...q, id: `sf${questions.length + 1}` });
+  }
+  if (!questions.length) return null;
+  const brief = String(obj.brief ?? "").trim().slice(0, 600);
+  return { brief, questions };
 }
 
 // ---------------------------------------------------------------- ledger
@@ -688,6 +781,13 @@ export interface LedgerCreated {
   evidenceOverlap?: number;
   /** Set for tournament-imported questions: source platform, id, and its price at import. */
   origin?: ForecastOrigin;
+  /**
+   * Sub-forecasts of one open-ended question share a set id (the run id) and a
+   * brief — the overall framing the sub-forecasts together answer. Absent on a
+   * lone single-question forecast.
+   */
+  setId?: string;
+  brief?: string;
   /**
    * The ledger id this forecast supersedes (a trigger-driven re-forecast of
    * the same question). Both ends of the chain still resolve and score — that

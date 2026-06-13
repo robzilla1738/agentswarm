@@ -85,7 +85,9 @@ export interface PublicConfig {
   maxStepsPerTask: number;
   maxTasks: number;
   maxTokensPerRun: number;
+  maxToolResultChars: number;
   verification: string;
+  verifyMaxAttempts: number;
   thinking: boolean;
   reasoningEffort: string;
   safeMode: boolean;
@@ -97,9 +99,14 @@ export interface PublicConfig {
   fredKeyMasked: string;
   metaculusKeySet: boolean;
   metaculusKeyMasked: string;
+  oddsKeySet: boolean;
+  oddsKeyMasked: string;
   forecastPanelSize: number;
   forecastExtremizeK: number;
   forecastCoherenceProbe: boolean;
+  forecastMarketWeight: number;
+  forecastDecompose: boolean;
+  forecastMaxSubQuestions: number;
   knownModels: string[];
   pricing: Record<string, { inMiss: number; inHit: number; out: number }>;
 }

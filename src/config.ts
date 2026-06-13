@@ -63,6 +63,14 @@ export interface SwarmConfig {
    */
   forecastMarketWeight: number;
   /**
+   * Forecast mode: let an open-ended question decompose into several
+   * independently-resolvable sub-forecasts (each its own panel + ledger entry).
+   * A clean single question still resolves to one. `--single` overrides per run.
+   */
+  forecastDecompose: boolean;
+  /** Forecast mode: cap on sub-forecasts a decomposed question fans out into. */
+  forecastMaxSubQuestions: number;
+  /**
    * Where isolated runs execute. Default "host": the run's private workspace
    * directory on this machine — works out of the box, no Docker or cloud
    * account needed. "auto" opts into auto-detection: configured cloud
@@ -163,6 +171,8 @@ export const DEFAULTS: SwarmConfig = {
   forecastExtremizeK: 2.5,
   forecastCoherenceProbe: true,
   forecastMarketWeight: 0.4,
+  forecastDecompose: true,
+  forecastMaxSubQuestions: 6,
   sandboxRuntime: "host",
   sandboxImage: "node:22-bookworm",
   e2bApiKey: "",
@@ -372,6 +382,9 @@ export const SETTABLE_KEYS: (keyof SwarmConfig)[] = [
   "forecastExtremizeK",
   "forecastCoherenceProbe",
   "forecastMarketWeight",
+  "forecastDecompose",
+  "forecastMaxSubQuestions",
+  "maxToolResultChars",
   "sandboxRuntime",
   "sandboxImage",
   "e2bApiKey",
@@ -398,7 +411,9 @@ const NUM_RANGES: Partial<Record<keyof SwarmConfig, [number, number]>> = {
   maxTokensPerRun: [50_000, 2_000_000_000],
   taskTimeoutMs: [60_000, 86_400_000],
   contextTokenLimit: [8_000, 900_000],
+  maxToolResultChars: [4_000, 500_000],
   forecastPanelSize: [3, 11],
+  forecastMaxSubQuestions: [1, 8],
   hubPort: [0, 65535],
   uiPort: [0, 65535],
 };
@@ -436,7 +451,7 @@ export function coerceConfigValue(key: keyof SwarmConfig, raw: unknown): unknown
     if (!Number.isFinite(n)) throw new Error(`${key} must be a number`);
     return Math.min(floatRange[1], Math.max(floatRange[0], n));
   }
-  if (key === "thinking" || key === "safeMode" || key === "forecastCoherenceProbe") {
+  if (key === "thinking" || key === "safeMode" || key === "forecastCoherenceProbe" || key === "forecastDecompose") {
     if (typeof raw === "boolean") return raw;
     return raw === "true" || raw === "1" || raw === "on";
   }

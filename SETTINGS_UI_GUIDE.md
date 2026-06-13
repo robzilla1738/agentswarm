@@ -157,6 +157,35 @@ Click "Test sandbox" to verify execution works. Shows which runtime is active.
 - **Token budget**: 50K - 2B (default 12M)
   - Spend cap per mission, stops early if hit
 
+- **Verify attempts**: 1-5 (default 2)
+  - Retries before a verified task is accepted or failed
+
+- **Tool result cap (chars)**: 4K - 500K (default 50K)
+  - Max characters returned from `fetch_url` and other tools (one truncation point)
+
+---
+
+## 5b. Forecasting
+
+**Section**: "Forecasting" card
+
+Forecast runs (`swarm forecast`) put an independent forecaster panel behind every question and combine it with deterministic math. Open-ended questions fan out into several resolvable sub-forecasts.
+
+### Fields:
+- **Panel size**: 3-11 (default 5) — independent forecasters per question
+- **Extremization k**: 1-4 (default 2.5) — aggregation exponent; auto-tunes once ≥30 forecasts resolve
+- **Market anchor weight**: 0-1 (default 0.4) — base blend toward a verified market price (×liquidity); 0 disables; auto-tunes once ≥20 resolve
+- **Max sub-forecasts**: 1-8 (default 6) — cap when an open-ended question decomposes
+- **Coherence probe** (toggle, default on) — engine re-asks the question inverted and folds the flipped answer into the panel (counters affirmative-framing bias)
+- **Decompose open questions** (toggle, default on) — fan an open-ended question into several resolvable sub-forecasts; `swarm forecast --single` overrides per run
+
+### API keys (all optional, free):
+- **FRED API key** — economic time series (`time_series` tool) · fred.stlouisfed.org
+- **Metaculus API token** — adds the Metaculus forecaster crowd to `market_odds` · metaculus.com
+- **The Odds API key** — de-vigged sportsbook consensus in `market_odds` · the-odds-api.com
+
+Manifold, Polymarket, Kalshi, and PredictIt odds need no key. Clear any key with its "clear" link, same as other sections.
+
 ---
 
 ## 6. Model Config (Advanced)

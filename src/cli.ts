@@ -57,7 +57,7 @@ interface Args {
 
 /** Flags that never take a value — they must not swallow the next positional
  *  (`swarm run --fg "mission"` would otherwise eat the mission). */
-const BOOL_FLAGS = new Set(["fg", "open", "resume", "auto", "dry-run", "reforecast"]);
+const BOOL_FLAGS = new Set(["fg", "open", "resume", "auto", "dry-run", "reforecast", "single"]);
 
 function parseArgs(argv: string[]): Args {
   const _: string[] = [];
@@ -214,6 +214,8 @@ export function optionOverrides(flags: Args["flags"], cfg: SwarmConfig): Partial
     o.resolutionDate = flags.by;
   }
   if (flags.panel) o.panelSize = numFlag("panel", "forecastPanelSize");
+  // Forecast: --single forces one forecast (skip open-ended decomposition).
+  if (flags.single === true || flags.single === "true") o.forecastSingle = true;
   if (typeof flags.sandbox === "string") {
     const v = flags.sandbox;
     if (v !== "auto" && !SANDBOX_KINDS.includes(v as SandboxKind)) {
@@ -667,7 +669,8 @@ async function cmdForecasts(sub?: string, flags: Args["flags"] = {}): Promise<vo
         ? ansi.yellow("DUE — run: swarm resolve")
         : ansi.gray(`open until ${e.question.resolutionDate}`);
     const chain = superseded.has(e.id) ? ansi.gray("  (superseded)") : e.supersedes ? ansi.gray(`  (supersedes ${e.supersedes})`) : "";
-    console.log(`  ${ansi.gray(e.id)}  ${ansi.bold(headline.padEnd(6))} ${status}${chain}`);
+    const set = e.setId ? ansi.gray("  ⊂ sub-forecast") : "";
+    console.log(`  ${ansi.gray(e.id)}  ${ansi.bold(headline.padEnd(6))} ${status}${chain}${set}`);
     console.log(`     ${clipLine(e.question.text, 90)}`);
   }
   const stats = calibrationStats(entries);
@@ -1099,9 +1102,11 @@ function printHelp(): void {
 
 ${b("USAGE")}
   swarm run "<mission>" [options]     decompose & execute a mission with a parallel swarm
-  swarm forecast "<question>" [--by YYYY-MM-DD] [--panel N]
+  swarm forecast "<question>" [--by YYYY-MM-DD] [--panel N] [--single]
                                       forecast an event: research waves + an independent
-                                      forecaster panel, aggregated into a calibrated probability
+                                      forecaster panel, aggregated into a calibrated probability.
+                                      open-ended questions ("what will happen with X?") fan out
+                                      into several resolvable sub-forecasts; --single forces one
   swarm serve [--port 7777] [--open]  start the mission-control web UI + API
   swarm watch <id>                    attach a live dashboard to a run
   swarm resume <id> [--fg]            resume an interrupted run (done tasks keep their results)

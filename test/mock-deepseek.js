@@ -204,6 +204,34 @@ const server = http.createServer((req, res) => {
         }
         return sse(res, [...toolChunks("wait", { reason: "panel in flight" })]);
       }
+      // Open-ended decomposition: one shared research scout + a 3-panelist
+      // panel for EACH of the 3 sub-forecasts (sf1/sf2/sf3), tagged QUESTION+METHOD.
+      if (SCENARIO === "forecast-multi") {
+        if (update.includes("No tasks exist yet")) {
+          const panel = [];
+          for (const qid of ["sf1", "sf2", "sf3"]) {
+            for (const m of ["outside-view", "inside-view", "trend"]) {
+              panel.push({
+                title: `${qid} ${m}`,
+                objective: `Forecast sub-forecast ${qid}. QUESTION: ${qid} METHOD: ${m}`,
+                role: "forecaster",
+                deps: ["T1"],
+              });
+            }
+          }
+          return sse(res, [...toolChunks("spawn_tasks", {
+            tasks: [
+              { title: "Shared research", objective: "FC-RESEARCH: base rates + evidence for all sub-forecasts. Done when sourced.", role: "researcher" },
+              ...panel,
+            ],
+          })]);
+        }
+        // 9 panel tasks are T2..T10; finish once the last one is done.
+        if (/T10 \[done/.test(update)) {
+          return sse(res, [...toolChunks("finish", { notes: "All sub-forecast panels complete; aggregate each mechanically." })]);
+        }
+        return sse(res, [...toolChunks("wait", { reason: "sub-forecast panels in flight" })]);
+      }
       if (update.includes("No tasks exist yet")) {
         if (SCENARIO === "verify-retry") {
           return sse(res, [
@@ -314,6 +342,23 @@ const server = http.createServer((req, res) => {
           rationale: "Arguing NO first: in 7 of 10 comparable cases the status quo held, but here the harness is scripted to emit.",
         })]);
       }
+      // Open-ended decomposition: grounded forecast keyed by (sub-forecast, method),
+      // with distinct sources per pair so each panel's evidence overlap is 0.
+      if (SCENARIO === "forecast-multi") {
+        const qid = (/QUESTION:\s*(sf\d+)/i.exec(system) || [])[1] || "sf1";
+        const method = /METHOD: outside-view/.test(system) ? "outside-view" : /METHOD: inside-view/.test(system) ? "inside-view" : "trend";
+        const prob = { "outside-view": 60, "inside-view": 70, trend: 80 }[method];
+        return sse(res, [...toolChunks("submit_forecast", {
+          probability: prob,
+          prior: prob - 5,
+          method,
+          rationale: `Sub-forecast ${qid}: anchored on the base rate (6 of 10 comparable cases), adjusted via ${method}.`,
+          base_rates: ["similar events resolved YES in 6 of 10 comparable cases"],
+          key_drivers: ["test harness behavior"],
+          update_triggers: [`TRIGGER: ${qid} resolves early`],
+          sources: [{ url: `https://${qid}-${method}.example/x`, title: `Evidence for ${qid} ${method}` }],
+        })]);
+      }
       const method = /METHOD: outside-view/.test(system) ? "outside-view" : /METHOD: inside-view/.test(system) ? "inside-view" : "trend";
       // The outside-view panelist's FIRST attempt is deliberately ungrounded
       // (no prior, no base_rates) — the engine's analytical gate must bounce
@@ -355,6 +400,16 @@ const server = http.createServer((req, res) => {
 
     // Synthesizer
     if (names.has("submit_final")) {
+      if (SCENARIO === "forecast-multi") {
+        // The engine pins one ENSEMBLE line per sub-forecast; echo a count so
+        // the e2e confirms all three blocks reached the synthesizer.
+        const n = (sysContent.match(/ENSEMBLE FORECAST/g) || []).length;
+        const hasBrief = /three sub-forecasts/.test(sysContent);
+        return sse(res, [...toolChunks("submit_final", {
+          report_markdown: `# Open-ended forecast\n\nSUBFORECAST-BLOCKS: ${n}\nBRIEF-PINNED: ${hasBrief}\n\n## How these fit together\nThree sub-forecasts answered.\n`,
+          summary: "Composed from three sub-forecast aggregates.",
+        })]);
+      }
       if (SCENARIO === "forecast") {
         // Echo the engine-computed headline only if it was actually pinned
         // into the prompt — the e2e asserts both the echo and its value.
@@ -552,6 +607,20 @@ const server = http.createServer((req, res) => {
     // Tool-less helper calls: completeness critic / faithfulness check (strict mode).
     if (!tools.length) {
       const lu = lastUser(messages);
+      // Open-ended decomposition: 3 binary sub-forecasts + a brief.
+      if (/turning a forecasting mission into the set/.test(lu) && SCENARIO === "forecast-multi") {
+        return sse(res, [
+          textChunk(JSON.stringify({
+            brief: "Outlook for the test domain, covered by three sub-forecasts.",
+            questions: [
+              { text: "Will sub-event A happen by 2027-01-01?", kind: "binary", resolutionCriteria: "YES if the harness records A.", resolutionDate: "2027-01-01" },
+              { text: "Will sub-event B happen by 2027-01-01?", kind: "binary", resolutionCriteria: "YES if the harness records B.", resolutionDate: "2027-01-01" },
+              { text: "Will sub-event C happen by 2027-01-01?", kind: "binary", resolutionCriteria: "YES if the harness records C.", resolutionDate: "2027-01-01" },
+            ],
+          })),
+          { usage: { prompt_tokens: 60, completion_tokens: 80 } },
+        ]);
+      }
       if (/sharpening a forecasting question/.test(lu)) {
         return sse(res, [
           textChunk(JSON.stringify({
@@ -563,6 +632,8 @@ const server = http.createServer((req, res) => {
           { usage: { prompt_tokens: 40, completion_tokens: 30 } },
         ]);
       }
+      // forecast-multi never reaches the single-question sharpen prompt, but if
+      // decomposition is disabled elsewhere, fall back cleanly.
       if (/completeness critic/.test(lu)) {
         return sse(res, [textChunk("COMPLETE"), { usage: { prompt_tokens: 10, completion_tokens: 2 } }]);
       }

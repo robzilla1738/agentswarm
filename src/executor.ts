@@ -31,6 +31,7 @@ import {
   depReportBlock,
   FORECASTER_KICKOFF,
   forecastConductorAddendum,
+  forecastPlanPrompt,
   forecastSynthAddendum,
   questionBlock,
   reportBlock,
@@ -59,6 +60,7 @@ import {
   daysToIso,
   evidenceOverlap,
   extractMethodLabel,
+  extractQuestionRef,
   fitRecalibration,
   ISO_DATE,
   isoToDays,
@@ -68,6 +70,7 @@ import {
   methodWeights,
   monotoneQuantiles,
   normalizeOptionProbs,
+  parseForecastPlan,
   parseQuestionJson,
   scaleK,
   validateForecastAnalytics,
@@ -167,12 +170,27 @@ export class Executor {
   private conductorFailures = 0;
   private resumed = false;
 
-  /** Forecast mode: the sharpened question (set before the conductor seeds). */
-  private question: ForecastQuestion | null = null;
-  /** Forecast mode: the mechanical panel aggregate (computed at synthesis). */
-  private aggregate: AggregateForecast | null = null;
-  /** Forecast mode: panel tasks behind the aggregate (latest per method). */
-  private panelTasks: Task[] = [];
+  /**
+   * Forecast mode: the sub-forecasts this run answers (1 for a clean question,
+   * 2-6 when an open question decomposes), set before the conductor seeds.
+   */
+  private questions: ForecastQuestion[] = [];
+  /** Forecast mode: the framing the sub-forecasts together answer (open questions). */
+  private forecastBrief = "";
+  /** Forecast mode: mechanical panel aggregates, keyed by question id, computed at synthesis. */
+  private aggregates = new Map<string, AggregateForecast>();
+  /** Forecast mode: panel tasks behind each aggregate (latest per method, per question). */
+  private panelTasksByQ = new Map<string, Task[]>();
+
+  /** The primary (first) sub-forecast — back-compat for readers that only need one. */
+  private get question(): ForecastQuestion | null {
+    return this.questions[0] ?? null;
+  }
+  /** The primary aggregate — back-compat for the summary/fallback singular readers. */
+  private get aggregate(): AggregateForecast | null {
+    const id = this.questions[0]?.id;
+    return id ? (this.aggregates.get(id) ?? null) : null;
+  }
 
   private sandbox: SandboxRuntime;
   private mode: "root" | "team";
@@ -245,13 +263,17 @@ export class Executor {
       .filter((n) => !(n.kind === "claim" && (n.teamId || (n.taskId && settled.has(n.taskId)))));
     const lastPhase = state.phases[state.phases.length - 1];
     if (lastPhase) this.phase = { name: lastPhase.name, goal: lastPhase.goal, exitCriteria: lastPhase.exitCriteria };
-    // A sharpened question survives restarts via the journal — never re-sharpen.
-    this.question = state.question;
-    // Likewise a computed aggregate: a crash between forecast.aggregated and
-    // run.final must not re-aggregate and append a duplicate ledger record
-    // (aggregateAndLedger early-returns when this.aggregate is set).
-    this.aggregate = state.aggregate;
-    if (this.aggregate) this.panelTasks = this.panelFromTasks();
+    // A sharpened/decomposed question set survives restarts via the journal —
+    // never re-plan. Likewise computed aggregates: a crash between
+    // forecast.aggregated and run.final must not re-aggregate and append
+    // duplicate ledger records (aggregateAndLedger skips questions already
+    // aggregated).
+    this.questions = state.questions.length ? state.questions : state.question ? [state.question] : [];
+    this.forecastBrief = state.forecastBrief;
+    for (const a of state.aggregates) this.aggregates.set(a.questionId, a.aggregate);
+    for (const q of this.questions) {
+      if (q.id && this.aggregates.has(q.id)) this.panelTasksByQ.set(q.id, this.panelFromTasks(q.id));
+    }
     this.spentTokens = state.totalUsage.promptTokens + state.totalUsage.completionTokens;
     this.cost = state.cost;
     try {
@@ -388,12 +410,12 @@ export class Executor {
     // Forecast missions pin a precisely resolvable question before any
     // orchestration — the question's structure is engine-owned, not LLM-owned.
     // (Resumed runs already re-read it from the journal in seedFromState.)
-    if (this.forecastMode() && !this.question) {
-      await this.sharpenQuestion();
+    if (this.forecastMode() && !this.questions.length) {
+      await this.planForecast();
     }
     const forecastDoctrine =
-      this.forecastMode() && this.question
-        ? `\n\n${forecastConductorAddendum(this.question, this.panelSize(), this.safeCalibrationBlock(), Boolean(this.meta.options.forecastOrigin))}`
+      this.forecastMode() && this.questions.length
+        ? `\n\n${forecastConductorAddendum(this.questions, this.panelSize(), this.safeCalibrationBlock(), Boolean(this.meta.options.forecastOrigin), this.forecastBrief)}`
         : "";
 
     // Real-directory runs remember: prior missions in the same workspace feed
@@ -532,50 +554,98 @@ export class Executor {
   }
 
   /**
-   * Pre-step for forecast runs: one model call turns the mission into a
-   * precisely resolvable question (text, kind, criteria, date). Falls back to
-   * a mechanically-built binary question — a flaky model may cost sharpness,
-   * never the run.
+   * Pre-step for forecast runs: turn the mission into the set of resolvable
+   * sub-forecasts that best answers it. A clean question yields one; an
+   * open-ended question fans out into several (each independently resolvable).
+   * Best-effort and never blocks — decomposition → single-question sharpening
+   * → a mechanically-built binary question, so a flaky model costs sharpness,
+   * never the run. The chosen plan is journaled (forecast.plan) so the operator
+   * sees exactly what is being forecast.
    */
-  private async sharpenQuestion(): Promise<void> {
+  private async planForecast(): Promise<void> {
+    const commit = (qs: ForecastQuestion[], brief: string) => {
+      this.questions = qs.map((q, i) => ({ ...q, id: q.id ?? `sf${i + 1}` }));
+      this.forecastBrief = brief;
+      this.journal.append("forecast.plan", { brief, questions: this.questions });
+      // Per-question events keep the primary-question state path working.
+      for (const q of this.questions) this.journal.append("forecast.question", { question: q });
+      // Human-readable echo so a detached run surfaces its interpretation in
+      // the dashboard/log — best-effort transparency, never blocks.
+      const echo =
+        this.questions.length > 1
+          ? `forecasting ${this.questions.length} sub-forecasts${brief ? ` — ${brief}` : ""}:\n` +
+            this.questions.map((q) => `  • [${q.id}] (${q.kind}, by ${q.resolutionDate}) ${oneLine(q.text, 110)}`).join("\n")
+          : `forecasting: ${oneLine(this.questions[0]?.text ?? "", 140)} (${this.questions[0]?.kind}, resolves ${this.questions[0]?.resolutionDate})`;
+      this.journal.append("log", { level: "info", msg: echo });
+    };
+
     // Tournament imports arrive already sharp (the platform wrote the precise
-    // question and criteria) — re-sharpening would only drift the wording away
-    // from what the source market actually resolves on.
+    // question and criteria) — re-planning would drift from what it resolves on.
     const preset = this.meta.options.presetQuestion;
     if (preset?.text && preset.resolutionCriteria && ISO_DATE.test(preset.resolutionDate ?? "")) {
-      this.question = preset;
-      this.journal.append("forecast.question", { question: preset });
+      commit([preset], "");
       return;
     }
+
     const today = new Date(this.meta.createdAt).toISOString().slice(0, 10);
     const operatorDate = this.meta.options.resolutionDate;
+    const maxN = Math.max(1, this.cfg.forecastMaxSubQuestions ?? 6);
+    const decompose = this.cfg.forecastDecompose && !this.meta.options.forecastSingle;
+    const ask = async (prompt: string, maxTokens: number): Promise<string> => {
+      const res = await chat(this.cfg, {
+        model: this.meta.options.conductorModel,
+        priority: "high",
+        messages: [{ role: "user", content: prompt }],
+        thinking: false,
+        maxTokens,
+        signal: this.ac.signal,
+      });
+      this.onUsage(this.meta.options.conductorModel, res.usage);
+      return res.content || "";
+    };
+
+    // 1) Open-ended decomposition (may return one sub-forecast for a clean mission).
+    if (decompose) {
+      let lastErr = "";
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const out = await ask(
+            forecastPlanPrompt(this.meta.mission, today, operatorDate) +
+              (lastErr ? `\n\nYour previous reply was unusable (${lastErr}). Reply with ONLY the JSON object.` : ""),
+            2048
+          );
+          const plan = parseForecastPlan(out, operatorDate, today, maxN);
+          if (plan) {
+            commit(plan.questions, plan.brief);
+            return;
+          }
+          lastErr = "not a valid {brief, questions:[...]} object";
+        } catch (e) {
+          if (this.ac.signal.aborted) return;
+          lastErr = errMsg(e);
+        }
+      }
+    }
+
+    // 2) Single-question sharpening (--single, decomposition disabled, or it failed).
     let parsed: ForecastQuestion | null = null;
     let lastErr = "";
     for (let attempt = 0; attempt < 2 && !parsed; attempt++) {
       try {
-        const res = await chat(this.cfg, {
-          model: this.meta.options.conductorModel,
-          priority: "high",
-          messages: [
-            {
-              role: "user",
-              content:
-                sharpenQuestionPrompt(this.meta.mission, today, operatorDate) +
-                (lastErr ? `\n\nYour previous reply was unusable (${lastErr}). Reply with ONLY the JSON object.` : ""),
-            },
-          ],
-          thinking: false,
-          maxTokens: 1024,
-          signal: this.ac.signal,
-        });
-        this.onUsage(this.meta.options.conductorModel, res.usage);
-        parsed = parseQuestionJson(res.content || "", operatorDate);
+        const out = await ask(
+          sharpenQuestionPrompt(this.meta.mission, today, operatorDate) +
+            (lastErr ? `\n\nYour previous reply was unusable (${lastErr}). Reply with ONLY the JSON object.` : ""),
+          1024
+        );
+        parsed = parseQuestionJson(out, operatorDate);
         if (!parsed) lastErr = "not valid JSON with the required fields";
       } catch (e) {
         if (this.ac.signal.aborted) return;
         lastErr = errMsg(e);
       }
     }
+
+    // 3) Mechanical fallback.
     if (!parsed) {
       const fallbackDate =
         operatorDate && ISO_DATE.test(operatorDate)
@@ -590,23 +660,24 @@ export class Executor {
       };
       this.journal.append("log", {
         level: "warn",
-        msg: "question sharpening failed — using the mission verbatim as a binary question",
+        msg: "question planning failed — using the mission verbatim as a binary question",
       });
     }
-    this.question = parsed;
-    this.journal.append("forecast.question", { question: parsed });
+    commit([parsed], "");
   }
 
   /**
    * Validate and clamp a submit_forecast payload into a Forecast, or null
    * when the numbers are unusable (the task retries with a fresh agent).
    */
-  private intakeForecast(args: Record<string, unknown>): Forecast | null {
-    const q = this.question;
+  private intakeForecast(args: Record<string, unknown>, q: ForecastQuestion | null): Forecast | null {
     if (!q) return null;
     const strList = (v: unknown, max: number) =>
       Array.isArray(v) && v.length ? v.map((x) => clip(String(x), 300)).slice(0, max) : undefined;
     const f: Forecast = {
+      // Stamp the sub-forecast id so the panel partitions correctly when an
+      // open question decomposed (omitted for single-question runs).
+      ...(this.questions.length > 1 && q.id ? { questionId: q.id } : {}),
       method: canonicalMethodLabel(oneLine(String(args.method ?? "unspecified"), 60)),
       rationale: String(args.rationale ?? "").trim(),
       baseRates: strList(args.base_rates, 6),
@@ -723,13 +794,29 @@ export class Executor {
       }));
   }
 
-  /** Latest usable forecast per method label — revisions and the probe replace/extend originals. */
-  private panelFromTasks(): Task[] {
-    const q = this.question;
+  /** Resolve which sub-forecast a forecaster task answers; defaults to the primary. */
+  private questionFor(task: Task): ForecastQuestion | null {
+    if (!this.questions.length) return null;
+    const id = task.questionId ?? extractQuestionRef(`${task.objective}\n${task.context ?? ""}`);
+    return (id && this.questions.find((q) => q.id === id)) || this.questions[0];
+  }
+
+  /**
+   * Latest usable forecast per method label for one sub-forecast — revisions
+   * and the probe replace/extend originals. With one question (the common
+   * case) every forecaster matches; with several, panelists are partitioned by
+   * the question id stamped on their forecast.
+   */
+  private panelFromTasks(questionId?: string): Task[] {
+    const q = questionId ? this.questions.find((x) => x.id === questionId) : this.question;
     if (!q) return [];
+    const qid = q.id;
+    const single = this.questions.length <= 1;
     const byMethod = new Map<string, Task>();
     for (const t of this.taskList()) {
       if (t.status !== "done" || !t.forecast) continue;
+      // Partition by question id once decomposed; a forecast with no id belongs to the primary.
+      if (!single && (t.forecast.questionId ?? this.questions[0].id) !== qid) continue;
       const prev = byMethod.get(t.forecast.method);
       if (!prev || prev.forecast!.submittedAt <= t.forecast.submittedAt) byMethod.set(t.forecast.method, t);
     }
@@ -745,17 +832,17 @@ export class Executor {
   /**
    * Engine-injected time-window discipline: a "by DATE" probability is about
    * the remaining window, not the topic in general. Computed at worker-spawn
-   * time so multi-day runs don't drift.
+   * time so multi-day runs don't drift. Scoped to the sub-forecast the task answers.
    */
-  private hazardLine(): string {
-    if (!this.question) return "";
+  private hazardLine(q: ForecastQuestion | null = this.question): string {
+    if (!q) return "";
     const today = new Date().toISOString().slice(0, 10);
-    const deadline = Date.parse(`${this.question.resolutionDate}T23:59:59Z`);
+    const deadline = Date.parse(`${q.resolutionDate}T23:59:59Z`);
     if (!Number.isFinite(deadline)) return "";
     const days = Math.ceil((deadline - Date.now()) / 86_400_000);
     return days >= 0
-      ? `TIME WINDOW: today is ${today}; the question resolves ${this.question.resolutionDate} — ${days} day(s) remain. A "by date" probability is about THIS window: think in per-period hazard rates, and remember that less remaining time means less probability, whatever the headlines say.`
-      : `TIME WINDOW: today is ${today}; the stated resolution date (${this.question.resolutionDate}) has already passed — forecast whether the event had occurred by that date, on the evidence available now.`;
+      ? `TIME WINDOW: today is ${today}; the question resolves ${q.resolutionDate} — ${days} day(s) remain. A "by date" probability is about THIS window: think in per-period hazard rates, and remember that less remaining time means less probability, whatever the headlines say.`
+      : `TIME WINDOW: today is ${today}; the stated resolution date (${q.resolutionDate}) has already passed — forecast whether the event had occurred by that date, on the evidence available now.`;
   }
 
   /**
@@ -767,35 +854,46 @@ export class Executor {
    * toward a verified matching market price (best-effort, engine-owned).
    */
   private async aggregateAndLedger(): Promise<void> {
-    if (!this.forecastMode() || !this.question || this.aggregate) return;
-    const q = this.question;
-    const panel = this.panelFromTasks();
+    if (!this.forecastMode() || !this.questions.length) return;
+    // Read the resolved ledger once and reuse across every sub-forecast.
+    let ledger: ReturnType<typeof loadLedger> = [];
+    try {
+      ledger = loadLedger();
+    } catch {
+      /* no ledger yet — defaults apply */
+    }
+    for (const q of this.questions) {
+      if (!q.id || this.aggregates.has(q.id)) continue; // idempotent on resume
+      await this.aggregateOne(q, ledger);
+    }
+  }
+
+  /** Aggregate + ledger one sub-forecast. The math is the v0.13.0 pipeline, scoped to question q. */
+  private async aggregateOne(q: ForecastQuestion, ledger: ReturnType<typeof loadLedger>): Promise<void> {
+    const panel = this.panelFromTasks(q.id);
     if (!panel.length) {
-      this.journal.append("log", { level: "warn", msg: "forecast: no panel forecasts were submitted — no aggregate" });
+      this.journal.append("log", {
+        level: "warn",
+        msg: `forecast: no panel forecasts submitted for ${q.id ?? "question"} — no aggregate`,
+      });
       return;
     }
-    // k adapts to the resolved track record once there is enough of one;
-    // until then it is the configured default. Ledger reads are best-effort.
     let k = this.cfg.forecastExtremizeK;
     try {
-      k = chooseExtremizeK(loadLedger(), this.cfg.forecastExtremizeK);
+      k = chooseExtremizeK(ledger, this.cfg.forecastExtremizeK);
     } catch {
       /* keep the configured k */
     }
     // Extremization assumes independent evidence: a panel that cited the same
     // pages holds fewer independent views than it has members, so k shrinks
-    // with the panel's source overlap. Probability-shaped kinds only — the
-    // quantile aggregation doesn't extremize.
+    // with the panel's source overlap. Probability-shaped kinds only.
     const overlap =
       q.kind === "binary" || q.kind === "mc"
         ? evidenceOverlap(panel.map((t) => (t.sources ?? []).map((s) => s.url)))
         : 0;
-    // Track-record method weights: a lens that has been scoring better than
-    // the others earns more say in the weighted GMO. All 1 until the ledger
-    // holds enough resolutions per method.
     let mw: Record<string, number> = {};
     try {
-      mw = q.kind === "binary" || q.kind === "mc" ? methodWeights(loadLedger()) : {};
+      mw = q.kind === "binary" || q.kind === "mc" ? methodWeights(ledger) : {};
     } catch {
       /* equal weights */
     }
@@ -809,7 +907,7 @@ export class Executor {
             ? aggregateMc(panel.map((t) => t.forecast!.optionProbs!), q.options ?? [], scaleK(k, overlap), weights)
             : aggregateQuantiles(panel.map((t) => t.forecast!.quantiles!), k);
     } catch (e) {
-      this.journal.append("log", { level: "error", msg: `forecast aggregation failed: ${errMsg(e)}` });
+      this.journal.append("log", { level: "error", msg: `forecast aggregation failed (${q.id}): ${errMsg(e)}` });
       return;
     }
     if (q.kind === "mc") agg.evidenceOverlap = overlap;
@@ -832,9 +930,8 @@ export class Executor {
     if (q.kind === "binary") {
       agg.evidenceOverlap = overlap;
       agg.components = { panelGmo: agg.gmo, extremized: agg.probability };
-      // Market anchor: the strongest single forecast available is a liquid
-      // market's price. Blend toward it in log-odds space AFTER extremization
-      // (the market is already an aggregate; extremizing it would double-count).
+      // Market anchor: blend toward a verified market price in log-odds space
+      // AFTER extremization (the market is already an aggregate).
       const anchor = await this.marketAnchor(q);
       if (anchor) {
         const blended = blendWithMarket(agg.probability!, anchor.probability, anchor.weight);
@@ -843,20 +940,19 @@ export class Executor {
         agg.probability = blended;
         this.journal.append("log", {
           level: "info",
-          msg: `market anchor: [${anchor.platform}] ${Math.round(anchor.probability * 100)}% (weight ${anchor.weight.toFixed(2)}) — panel ${Math.round(agg.components.extremized! * 100)}% → blended ${Math.round(blended * 100)}%`,
+          msg: `market anchor (${q.id}): [${anchor.platform}] ${Math.round(anchor.probability * 100)}% (weight ${anchor.weight.toFixed(2)}) — panel ${Math.round(agg.components.extremized! * 100)}% → blended ${Math.round(blended * 100)}%`,
         });
       }
-      // Recalibration: the last layer, fitted on the ledger's own resolved
-      // record (pre-recalibration values, so refitting is never circular).
+      // Recalibration: fitted on the ledger's own resolved record (pre-recalibration values).
       try {
-        const recal = fitRecalibration(loadLedger());
+        const recal = fitRecalibration(ledger);
         if (recal) {
           const r = applyRecalibration(agg.probability!, recal);
           agg.components.recalibrated = r;
           if (Math.abs(r - agg.probability!) >= 0.005) {
             this.journal.append("log", {
               level: "info",
-              msg: `recalibration (a=${recal.a}, b=${recal.b}, n=${recal.n}): ${Math.round(agg.probability! * 100)}% → ${Math.round(r * 100)}%`,
+              msg: `recalibration (${q.id}, a=${recal.a}, b=${recal.b}, n=${recal.n}): ${Math.round(agg.probability! * 100)}% → ${Math.round(r * 100)}%`,
             });
           }
           agg.probability = r;
@@ -865,8 +961,10 @@ export class Executor {
         /* recalibration is best-effort */
       }
     }
-    this.aggregate = agg;
-    this.panelTasks = panel;
+    if (q.id) {
+      this.aggregates.set(q.id, agg);
+      this.panelTasksByQ.set(q.id, panel);
+    }
     const panelRecs = panel.map((t, i) => ({
       taskId: t.id,
       method: t.forecast!.method,
@@ -878,13 +976,14 @@ export class Executor {
       ...(weights[i] !== 1 ? { weight: Number(weights[i].toFixed(3)) } : {}),
     }));
     const ledgerId = rid("f");
-    this.journal.append("forecast.aggregated", { aggregate: agg, panel: panelRecs, ledgerId });
+    this.journal.append("forecast.aggregated", { questionId: q.id, question: q, aggregate: agg, panel: panelRecs, ledgerId });
     // Cancelled runs keep the aggregate for the report but stay out of the
     // ledger — a half-run panel is not a forecast the system should be scored on.
     if (this.finishReason.includes("cancel")) return;
     const triggers = [...new Set(panel.flatMap((t) => t.forecast!.updateTriggers ?? []))].slice(0, 12);
     const origin = this.meta.options.forecastOrigin;
     const supersedes = this.meta.options.supersedes;
+    const multi = this.questions.length > 1;
     try {
       appendLedger({
         v: 1,
@@ -899,6 +998,8 @@ export class Executor {
         ...(q.kind === "binary" || q.kind === "mc" ? { evidenceOverlap: overlap } : {}),
         ...(origin ? { origin } : {}),
         ...(supersedes ? { supersedes } : {}),
+        // Sub-forecasts of one open question group by the run id + share the brief.
+        ...(multi ? { setId: this.meta.id, brief: this.forecastBrief } : {}),
       });
     } catch (e) {
       this.journal.append("log", { level: "warn", msg: `forecast ledger write failed: ${errMsg(e)}` });
@@ -991,14 +1092,28 @@ Same event, same direction (the market's YES means this question's YES), compati
     }
   }
 
-  /** The exact-numbers block the synthesizer must echo. */
-  private forecastBlock(): string {
-    if (!this.question || !this.aggregate) return "";
-    const panelLines = this.panelTasks.map(
-      (t) =>
-        `- ${t.id} [${t.forecast!.method}] → ${this.forecastHeadline(t.forecast!)}${this.priorNote(t.forecast!)} — ${oneLine(t.forecast!.rationale, 160)}`
-    );
-    return aggregateBlock(this.question, this.aggregate, panelLines);
+  /**
+   * The exact-numbers block(s) the synthesizer must echo. For a decomposed
+   * question this is the brief plus one block per sub-forecast (in plan order);
+   * for a single question it is one block, byte-identical to before.
+   */
+  private forecastBlocks(): string {
+    const blocks: string[] = [];
+    for (const q of this.questions) {
+      const agg = q.id ? this.aggregates.get(q.id) : null;
+      if (!agg) continue;
+      const panelLines = (q.id ? (this.panelTasksByQ.get(q.id) ?? []) : []).map(
+        (t) =>
+          `- ${t.id} [${t.forecast!.method}] → ${this.forecastHeadline(t.forecast!)}${this.priorNote(t.forecast!)} — ${oneLine(t.forecast!.rationale, 160)}`
+      );
+      blocks.push(aggregateBlock(q, agg, panelLines));
+    }
+    if (!blocks.length) return "";
+    if (blocks.length === 1) return blocks[0];
+    const header = this.forecastBrief
+      ? `OVERALL QUESTION: ${this.meta.mission}\nBRIEF: ${this.forecastBrief}\n${blocks.length} sub-forecasts:`
+      : `${blocks.length} sub-forecasts:`;
+    return `${header}\n\n${blocks.map((b, i) => `── SUB-FORECAST ${i + 1} ──\n${b}`).join("\n\n")}`;
   }
 
   /**
@@ -1013,17 +1128,31 @@ Same event, same direction (the market's YES means this question's YES), compati
    * loses it and the idempotence gate re-probes on resume.
    */
   private async coherenceProbe(): Promise<void> {
-    if (!this.cfg.forecastCoherenceProbe || !this.forecastMode() || this.question?.kind !== "binary") return;
+    if (!this.cfg.forecastCoherenceProbe || !this.forecastMode()) return;
     if (this.ac.signal.aborted || this.finishReason.includes("cancel")) return;
-    if (this.budgetExceeded()) {
-      this.journal.append("log", { level: "info", msg: "coherence probe skipped — budget is in the synthesis reserve" });
-      return;
+    // Probe each binary sub-forecast (cap to bound cost on a wide decomposition).
+    const binaryQs = this.questions.filter((q) => q.kind === "binary").slice(0, 4);
+    const primaryId = this.questions[0]?.id;
+    for (const q of binaryQs) {
+      if (this.budgetExceeded()) {
+        this.journal.append("log", { level: "info", msg: "coherence probe skipped — budget is in the synthesis reserve" });
+        return;
+      }
+      if (!this.panelFromTasks(q.id).length) continue;
+      // Idempotent across resume, scoped per sub-forecast: the (method, question) pair is the marker.
+      if (
+        this.taskList().some(
+          (t) => t.forecast?.method === "inverted-framing" && (t.forecast.questionId ?? primaryId) === q.id
+        )
+      )
+        continue;
+      await this.coherenceProbeOne(q);
     }
-    if (!this.panelFromTasks().length) return;
-    // Idempotent across resume: the method label is the marker.
-    if (this.taskList().some((t) => t.forecast?.method === "inverted-framing")) return;
+  }
 
-    const q = this.question;
+  /** One inverted-framing probe for a single binary sub-forecast q. */
+  private async coherenceProbeOne(q: ForecastQuestion): Promise<void> {
+    const multi = this.questions.length > 1;
     const research = this.taskList().filter((t) => t.status === "done" && !t.forecast);
     const digest = research.length ? truncateMiddle(research.map(reportBlock).join("\n\n"), 30_000, "chars") : "";
     const agentId = rid("p");
@@ -1067,7 +1196,7 @@ PROTOCOL
         return;
       }
       const args = outcome.terminal.args as Record<string, unknown>;
-      const f = this.intakeForecast(args);
+      const f = this.intakeForecast(args, q);
       if (!f || typeof f.probability !== "number") {
         this.journal.append("log", { level: "warn", msg: "coherence probe forecast was unusable — panel unchanged" });
         return;
@@ -1077,6 +1206,7 @@ PROTOCOL
       f.probability = clampProb(1 - f.probability);
       f.prior = undefined;
       f.method = "inverted-framing"; // engine-owned: dedup, ledger, and idempotence key on this label
+      if (multi && q.id) f.questionId = q.id;
       f.rationale = `(Inverted-framing probe: the agent estimated P(NO); the engine flipped it to P(YES).) ${f.rationale}`;
       const derived = this.forecastReportFields(f);
       const sources = this.parseSources(args.sources);
@@ -1098,6 +1228,7 @@ PROTOCOL
         endedAt: Date.now(),
         agentIds: [agentId],
         forecast: f,
+        ...(multi && q.id ? { questionId: q.id } : {}),
         report: derived.report,
         reportStatus: "done",
         keyFacts: derived.keyFacts,
@@ -1492,23 +1623,30 @@ PROTOCOL
    * Unparseable labels degrade to advisory — never block.
    */
   private validatePanelDiversity(specs: TaskSpec[]): string | null {
+    // Uniqueness is per sub-forecast: the same method label may appear once on
+    // EACH sub-question's panel, but not twice on one. Key = questionId|label.
+    const primaryId = this.questions[0]?.id ?? "sf1";
+    const qOf = (text: string): string => extractQuestionRef(text) ?? primaryId;
     const seen = new Map<string, string>();
     for (const t of this.taskList()) {
       if (t.role !== "forecaster" || t.status === "failed" || t.status === "blocked") continue;
       const label = t.forecast?.method ?? extractMethodLabel(`${t.objective}\n${t.context ?? ""}`);
-      if (label) seen.set(label, t.id);
+      if (label) seen.set(`${t.questionId ?? qOf(`${t.objective}\n${t.context ?? ""}`)}|${label}`, t.id);
     }
     for (const spec of specs) {
       if (String(spec.role ?? "").toLowerCase() !== "forecaster") continue;
-      const label = extractMethodLabel(`${spec.objective ?? ""}\n${spec.context ?? ""}`);
+      const text = `${spec.objective ?? ""}\n${spec.context ?? ""}`;
+      const label = extractMethodLabel(text);
       if (!label) continue;
       const isRevision = (spec.deps ?? []).some((d) => this.tasks.get(String(d))?.role === "red-team");
       if (isRevision) continue;
-      const dup = seen.get(label);
+      const key = `${qOf(text)}|${label}`;
+      const dup = seen.get(key);
       if (dup) {
-        return `Rejected — no tasks were created: forecaster method label "${label}" duplicates ${dup}. Every panelist needs a DISTINCT method (write "METHOD: <label>" in each forecaster objective; only red-team revision tasks may reuse a label). Re-spawn the batch with corrected labels.`;
+        const scope = this.questions.length > 1 ? ` for ${qOf(text)}` : "";
+        return `Rejected — no tasks were created: forecaster method label "${label}" duplicates ${dup}${scope}. Every panelist on a sub-forecast needs a DISTINCT method (write "METHOD: <label>"${this.questions.length > 1 ? ' and "QUESTION: <id>"' : ""} in each forecaster objective; only red-team revision tasks may reuse a label). Re-spawn the batch with corrected labels.`;
       }
-      seen.set(label, "this batch");
+      seen.set(key, "this batch");
     }
     return null;
   }
@@ -1548,11 +1686,19 @@ PROTOCOL
         return false;
       });
       const rawSpec = spec as TaskSpec & { team_max_workers?: number; team_budget_tokens?: number };
+      const role = (spec.role ? String(spec.role) : inferRole(spec)).toLowerCase();
+      // Stamp the sub-forecast a forecaster answers (only when decomposed; one
+      // question needs no tag and stays byte-identical to single-question runs).
+      const questionId =
+        role === "forecaster" && this.questions.length > 1
+          ? (extractQuestionRef(`${spec.objective ?? ""}\n${spec.context ?? ""}`) ?? this.questions[0]?.id)
+          : undefined;
       const task: Task = {
         id,
         title: clip(String(spec.title ?? "task"), 120),
         objective: String(spec.objective ?? spec.title ?? ""),
-        role: (spec.role ? String(spec.role) : inferRole(spec)).toLowerCase(),
+        role,
+        ...(questionId ? { questionId } : {}),
         deps,
         verify: Boolean(spec.verify) && this.cfg.verification !== "off",
         context: spec.context ? String(spec.context) : undefined,
@@ -1987,7 +2133,9 @@ PROTOCOL
     // Forecaster panelists run isolated (verifier-style): dep research reports
     // only, no blackboard, no note search — another panelist's number reaching
     // them would anchor the panel and undo the ensemble.
-    const isForecaster = this.forecastMode() && this.question !== null && task.role === "forecaster";
+    const isForecaster = this.forecastMode() && this.questions.length > 0 && task.role === "forecaster";
+    // The sub-forecast this panelist answers (the primary for single-question runs).
+    const taskQ = isForecaster ? this.questionFor(task) : null;
     const system = workerSystem({
       agentId,
       role: task.role,
@@ -1999,7 +2147,9 @@ PROTOCOL
       operatorNotes: this.peekOperatorNotes(),
       dirListing,
       extraCraft: isForecaster
-        ? [this.hazardLine(), this.safeCalibrationBlock()].filter(Boolean).join("\n\n") || undefined
+        ? [taskQ && this.questions.length > 1 ? questionBlock(taskQ) : "", this.hazardLine(taskQ), this.safeCalibrationBlock()]
+            .filter(Boolean)
+            .join("\n\n") || undefined
         : undefined,
       terminalName: isForecaster ? "submit_forecast" : "report",
     });
@@ -2041,7 +2191,7 @@ PROTOCOL
         system,
         kickoff: isForecaster ? FORECASTER_KICKOFF : WORKER_KICKOFF,
         tools: workerToolset(this.cfg),
-        terminal: isForecaster ? [submitForecastTool(this.question!.kind, this.question!.options)] : [REPORT_TOOL],
+        terminal: isForecaster && taskQ ? [submitForecastTool(taskQ.kind, taskQ.options)] : [REPORT_TOOL],
         maxSteps: this.meta.options.maxStepsPerTask,
         signal: deadline.signal,
         ctx: workerCtx(deadline.signal),
@@ -2083,7 +2233,7 @@ PROTOCOL
     }
     if (outcome.terminal.name === "submit_forecast") {
       const args = outcome.terminal.args as Record<string, unknown>;
-      const f = this.intakeForecast(args);
+      const f = this.intakeForecast(args, taskQ);
       if (!f || !f.rationale) {
         task.error = "submit_forecast was missing a usable probability/quantiles or rationale";
         return "retry";
@@ -2093,7 +2243,7 @@ PROTOCOL
       // this enforces. Retry only while the run can afford it: at wind-down
       // or the attempt cap, a usable-but-ungrounded number still beats
       // shrinking the panel.
-      const gate = this.question ? validateForecastAnalytics(f, this.question.kind) : null;
+      const gate = taskQ ? validateForecastAnalytics(f, taskQ.kind) : null;
       if (gate) {
         if (task.attempt < this.cfg.verifyMaxAttempts && !this.finishing && !this.budgetExceeded()) {
           task.feedback = gate;
@@ -2716,7 +2866,7 @@ PROTOCOL
             artifactList,
             reason: this.finishReason || "completed",
             sources: sourcesText,
-          }) + (this.aggregate ? `\n${forecastSynthAddendum(this.forecastBlock())}` : ""),
+          }) + (this.aggregates.size ? `\n${forecastSynthAddendum(this.forecastBlocks(), this.aggregates.size, this.forecastBrief)}` : ""),
         kickoff: SYNTH_KICKOFF,
         tools: synthToolset(),
         terminal: [SUBMIT_FINAL_TOOL],
@@ -2882,7 +3032,7 @@ PROTOCOL
     const lines = [`# ${this.meta.mission}`, ``, `_Run ${this.meta.id} — ${this.finishReason}_`, ``];
     // A forecast run's aggregate is the deliverable — it survives even when
     // the synthesizer doesn't.
-    if (this.aggregate) lines.push("## Forecast", "", this.forecastBlock(), "");
+    if (this.aggregates.size) lines.push(this.aggregates.size > 1 ? "## Forecasts" : "## Forecast", "", this.forecastBlocks(), "");
     // Even without a synthesizer, surface the cross-task essentials first.
     const facts = tasks.flatMap((t) => (t.keyFacts ?? []).map((f) => `- ${f} _(${t.id})_`));
     if (facts.length) lines.push(`## Key facts`, ...facts.slice(0, 60), "");

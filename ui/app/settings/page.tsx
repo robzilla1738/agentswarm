@@ -12,6 +12,8 @@ const NUM_FIELDS: { key: string; label: string; min: number; max: number; hint?:
   { key: "maxTasks", label: "Task limit", min: 1, max: 1000 },
   { key: "maxStepsPerTask", label: "Steps per task", min: 3, max: 200 },
   { key: "maxTokensPerRun", label: "Token budget", min: 50_000, max: 2_000_000_000 },
+  { key: "verifyMaxAttempts", label: "Verify attempts", min: 1, max: 5, hint: "Retries before a verified task is accepted/failed" },
+  { key: "maxToolResultChars", label: "Tool result cap (chars)", min: 4_000, max: 500_000, hint: "Max characters returned from fetch_url / tools" },
 ];
 
 export default function SettingsPage() {
@@ -25,6 +27,7 @@ export default function SettingsPage() {
   const [tinyfishApiKey, setTinyfishApiKey] = useState("");
   const [fredApiKey, setFredApiKey] = useState("");
   const [metaculusApiKey, setMetaculusApiKey] = useState("");
+  const [oddsApiKey, setOddsApiKey] = useState("");
   const [form, setForm] = useState<Record<string, any>>({});
   // Per-provider drafts: key inputs start blank ("leave blank to keep").
   const [provKeys, setProvKeys] = useState<Record<string, string>>({});
@@ -77,7 +80,9 @@ export default function SettingsPage() {
         maxTasks: config.maxTasks,
         maxStepsPerTask: config.maxStepsPerTask,
         maxTokensPerRun: config.maxTokensPerRun,
+        maxToolResultChars: config.maxToolResultChars,
         verification: config.verification,
+        verifyMaxAttempts: config.verifyMaxAttempts,
         thinking: config.thinking,
         reasoningEffort: config.reasoningEffort,
         safeMode: config.safeMode,
@@ -87,6 +92,9 @@ export default function SettingsPage() {
         forecastPanelSize: config.forecastPanelSize,
         forecastExtremizeK: config.forecastExtremizeK,
         forecastCoherenceProbe: config.forecastCoherenceProbe,
+        forecastMarketWeight: config.forecastMarketWeight,
+        forecastDecompose: config.forecastDecompose,
+        forecastMaxSubQuestions: config.forecastMaxSubQuestions,
         sandboxRuntime: config.sandboxRuntime,
         sandboxImage: config.sandboxImage,
         e2bTemplate: config.e2bTemplate,
@@ -123,6 +131,7 @@ export default function SettingsPage() {
       if (tinyfishApiKey.trim()) patch.tinyfishApiKey = tinyfishApiKey.trim();
       if (fredApiKey.trim()) patch.fredApiKey = fredApiKey.trim();
       if (metaculusApiKey.trim()) patch.metaculusApiKey = metaculusApiKey.trim();
+      if (oddsApiKey.trim()) patch.oddsApiKey = oddsApiKey.trim();
       for (const k of ["e2bApiKey", "modalTokenId", "modalTokenSecret", "vercelToken"]) {
         if (sbxSecrets[k]?.trim()) patch[k] = sbxSecrets[k].trim();
       }
@@ -145,6 +154,7 @@ export default function SettingsPage() {
       setTinyfishApiKey("");
       setFredApiKey("");
       setMetaculusApiKey("");
+      setOddsApiKey("");
       await reload();
       api.models().then((r) => setModels(r.models)).catch(() => {});
       setSaved(true);
@@ -454,7 +464,7 @@ export default function SettingsPage() {
 
         <Card
           title="Forecasting"
-          sub="Forecast runs put an independent forecaster panel behind every question and combine it mechanically (extremized geometric mean of odds). Manifold, Polymarket, and Kalshi odds are keyless; a free Metaculus token adds its forecaster crowd, and a free FRED key adds economic series to the time_series tool."
+          sub="Forecast runs put an independent forecaster panel behind every question and combine it mechanically (extremized geometric mean of odds). Open-ended questions fan out into several resolvable sub-forecasts. Manifold, Polymarket, Kalshi, and PredictIt odds are keyless; a free Metaculus token adds its forecaster crowd, a free Odds API key adds de-vigged sportsbook consensus, and a free FRED key adds economic series to the time_series tool."
         >
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <Field label="Panel size" hint="independent forecasters per question (3–11)">
@@ -471,11 +481,32 @@ export default function SettingsPage() {
                 onChange={(e) => setForm({ ...form, forecastExtremizeK: e.target.value })}
               />
             </Field>
+            <Field label="Market anchor weight" hint="base blend toward a verified market price, ×liquidity (0 disables; auto-tunes once ≥20 resolve)">
+              <input
+                type="number" className="input" min={0} max={1} step={0.05}
+                value={form.forecastMarketWeight ?? 0.4}
+                onChange={(e) => setForm({ ...form, forecastMarketWeight: e.target.value })}
+              />
+            </Field>
+            <Field label="Max sub-forecasts" hint="cap when an open question decomposes (1–8)">
+              <input
+                type="number" className="input" min={1} max={8}
+                value={form.forecastMaxSubQuestions ?? 6}
+                onChange={(e) => setForm({ ...form, forecastMaxSubQuestions: e.target.value })}
+              />
+            </Field>
             <Field label="Coherence probe" hint="engine re-asks the question inverted and folds the flipped answer into the panel — counters affirmative-framing bias">
               <Toggle
                 on={!!form.forecastCoherenceProbe}
                 onChange={(v) => setForm({ ...form, forecastCoherenceProbe: v })}
                 label={form.forecastCoherenceProbe ? "on" : "off"}
+              />
+            </Field>
+            <Field label="Decompose open questions" hint="fan an open-ended question out into several resolvable sub-forecasts (--single overrides per run)">
+              <Toggle
+                on={!!form.forecastDecompose}
+                onChange={(v) => setForm({ ...form, forecastDecompose: v })}
+                label={form.forecastDecompose ? "on" : "off"}
               />
             </Field>
           </div>
@@ -496,6 +527,14 @@ export default function SettingsPage() {
                 onChange={(e) => setMetaculusApiKey(e.target.value)}
               />
             </Field>
+            <Field label="The Odds API key" hint={config.oddsKeySet ? `current: ${config.oddsKeyMasked}` : "free tier — the-odds-api.com"}>
+              <input
+                className="input mono" type="password" autoComplete="off"
+                placeholder={config.oddsKeySet ? "•••••• (leave blank to keep)" : "optional — de-vigged sportsbook consensus"}
+                value={oddsApiKey}
+                onChange={(e) => setOddsApiKey(e.target.value)}
+              />
+            </Field>
           </div>
           <p className="text-2xs text-ink-faint">
             Keys:{" "}
@@ -505,9 +544,14 @@ export default function SettingsPage() {
             ·{" "}
             <a href="https://www.metaculus.com/aib/" target="_blank" rel="noreferrer" className="text-ink underline underline-offset-2">
               metaculus.com
+            </a>{" "}
+            ·{" "}
+            <a href="https://the-odds-api.com/" target="_blank" rel="noreferrer" className="text-ink underline underline-offset-2">
+              the-odds-api.com
             </a>
             {config.fredKeySet && <ClearKey label="FRED" onClear={() => clearKey({ fredApiKey: "" })} />}
             {config.metaculusKeySet && <ClearKey label="Metaculus" onClear={() => clearKey({ metaculusApiKey: "" })} />}
+            {config.oddsKeySet && <ClearKey label="Odds API" onClear={() => clearKey({ oddsApiKey: "" })} />}
           </p>
         </Card>
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.14.0
+
+Open-ended forecasting: ask broad predictive questions, not just yes/no ones.
+
+### Question decomposition
+- **`swarm forecast "what will happen with X?"`** now fans an open-ended question out into a small set (up to 6) of concrete, independently-resolvable **sub-forecasts** — each with its own forecaster panel, mechanical aggregate, ledger row, market anchor, coherence probe, and calibration — then synthesizes one narrative answer that ties them together. A clean single question ("Will the Fed cut by 2026-09-01?") still resolves to exactly one forecast, unchanged.
+- The engine plans the forecast first (model call → `{brief, questions[]}`), validates each sub-question through the same sharpening rules, assigns stable ids (`sf1…sfN`), and **clamps horizons** (operator `--by` wins; missing/past/absurd model dates fall back to today+90d / cap at ~5y). Best-effort and non-blocking: decomposition → single-question sharpening → mechanical binary fallback.
+- **Echoes its interpretation**: the plan (brief + each sub-forecast, kind, and date) is journaled (`forecast.plan`) and printed, so a detached run shows exactly what it decided to forecast. Re-run with `--by`, `--panel`, or `--single` to steer.
+- **`--single`** forces one forecast (skip decomposition). Per-sub-forecast panels auto-scale (≤4 each when decomposed) to keep the task count in budget; a shared research wave serves all sub-forecasts.
+- Each sub-forecast is an independent ledger entry sharing a `setId` + `brief`, so `swarm resolve` scores them on their own dates and `swarm forecasts` groups them. Resolution and the calibration flywheel are unchanged — they were already per-entry.
+
+### Settings surfaced in the web UI
+- The Settings page now exposes every forecast knob: **market anchor weight**, **decompose open questions** (toggle), and **max sub-forecasts**, alongside the existing panel size / extremization k / coherence probe. Added the **Odds API key** field (de-vigged sportsbook consensus) and, under Swarm defaults, **verify attempts** and the **tool-result character cap**.
+- `forecastMarketWeight` and `oddsApiKey` were settable but hidden — now visible, readable, and clearable like the other keys. New config keys `forecastDecompose` (default on) and `forecastMaxSubQuestions` (default 6), plus `maxToolResultChars`, are now in `SETTABLE_KEYS` (CLI `swarm config set` + UI).
+
 ## 0.13.0
 
 A correctness, calibration-quality, and data-coverage release. No breaking changes; new tools and time-series sources are additive and keyless.
