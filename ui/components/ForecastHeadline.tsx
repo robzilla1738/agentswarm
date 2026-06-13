@@ -131,12 +131,14 @@ export function ForecastHeadline({
   tasks,
   now,
   expectedPanel,
+  dateInferred,
 }: {
   question: ForecastQuestion;
   aggregate: AggregateForecast | null;
   tasks: Task[];
   now: number;
   expectedPanel?: number;
+  dateInferred?: boolean;
 }) {
   const submitted = tasks.filter((t) => t.forecast);
   const probs = submitted
@@ -169,6 +171,14 @@ export function ForecastHeadline({
           Forecast
         </span>
         <span className="mono text-2xs text-ink-faint">{countdown}</span>
+        {dateInferred && (
+          <span
+            className="mono text-2xs text-ink-faint"
+            title="No resolution date was given — the engine inferred this horizon from the question."
+          >
+            · inferred
+          </span>
+        )}
         {aggregate && aggregate.spread > 0.25 && (
           <span className="mono text-2xs text-ink" title="The panel disagreed substantially — read the panel breakdown in the report">
             ⚠ panel split {binary ? `${Math.round(aggregate.spread * 100)} pts` : `${Math.round(aggregate.spread * 100)}%`}
@@ -206,6 +216,19 @@ export function ForecastHeadline({
             {question.kind === "date" && typeof aggregate.pNever === "number" && (
               <div className="mono text-2xs text-ink-faint mt-2" title="The panel's combined probability the event simply doesn't happen by the horizon">
                 P(never by {question.resolutionDate}) = {pctOf(aggregate.pNever)}
+              </div>
+            )}
+            {aggregate.dilation && aggregate.dilation.d !== 1 && (
+              <div
+                className="mono text-2xs text-ink-faint mt-2"
+                title={
+                  aggregate.dilation.source === "learned"
+                    ? `Interval widened ×${aggregate.dilation.d} to correct over-confidence, learned from ${aggregate.dilation.n} resolved forecasts.`
+                    : `Interval widened ×${aggregate.dilation.d} by default — LLM intervals run too narrow; the factor is learned once enough forecasts resolve.`
+                }
+              >
+                · interval ×{aggregate.dilation.d}
+                {aggregate.dilation.source === "default" ? " (default)" : ""}
               </div>
             )}
           </div>

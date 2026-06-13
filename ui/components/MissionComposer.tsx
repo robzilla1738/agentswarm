@@ -161,7 +161,7 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
         autoFocus
         placeholder={
           mode === "forecast"
-            ? 'Ask about the future — "Will X happen by 2026-12-31?" or "What will Y be in Q3?" — and get a calibrated probability from an independent forecaster panel.'
+            ? 'Ask anything about the future — "Who will win the game tonight?" or "Will X ship before year end?" — and get a calibrated probability from an independent forecaster panel. Leave the date blank and we will infer when it resolves.'
             : "Describe a mission — the swarm decomposes it into parallel tasks and runs them autonomously."
         }
         value={mission}
@@ -173,7 +173,7 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
 
       {mode === "forecast" && (
         <div className="grid grid-cols-2 gap-3 mt-3">
-          <Field label="Resolution date" hint="when the answer is knowable">
+          <Field label="Resolution date" hint="optional — inferred if blank">
             <input
               type="date"
               className="input"

@@ -5,6 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api } from "@/lib/api";
 import { CopyButton, EmptyState, Spinner } from "./atoms";
+import { markdownChartComponents } from "./ChartBlock";
 
 /**
  * Opens the styled report with ?print=1 — the document auto-opens the print
@@ -123,7 +124,9 @@ export function ReportPanel({ id, hasFinal, live }: { id: string; hasFinal: bool
           </div>
           <div className="p-5 sm:p-8">
             <div className="prose-report">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{report}</ReactMarkdown>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownChartComponents}>
+                {report}
+              </ReactMarkdown>
             </div>
           </div>
         </>

@@ -5,6 +5,7 @@ import { useLayoutEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { statusColor } from "@/lib/format";
+import { markdownChartComponents } from "./ChartBlock";
 
 /**
  * The one way to render model-written text. Everything an agent or the
@@ -14,7 +15,9 @@ import { statusColor } from "@/lib/format";
 export function Md({ children, compact, dim }: { children: string; compact?: boolean; dim?: boolean }) {
   return (
     <div className={`prose-report${compact ? " prose-compact" : ""}${dim ? " prose-dim" : ""}`}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{children}</ReactMarkdown>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownChartComponents}>
+        {children}
+      </ReactMarkdown>
     </div>
   );
 }

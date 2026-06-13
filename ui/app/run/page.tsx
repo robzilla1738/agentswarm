@@ -160,6 +160,7 @@ function RunView() {
             tasks={data.tasks}
             now={now}
             expectedPanel={meta.options.panelSize}
+            dateInferred={!meta.options.resolutionDate}
           />
         )}
 

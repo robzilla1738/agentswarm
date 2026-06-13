@@ -50,6 +50,7 @@ import {
   aggregateMc,
   aggregateQuantiles,
   appendLedger,
+  applyQuantileDilation,
   applyRecalibration,
   blendWithMarket,
   calibrationBlock,
@@ -61,6 +62,7 @@ import {
   evidenceOverlap,
   extractMethodLabel,
   extractQuestionRef,
+  fitQuantileCalibration,
   fitRecalibration,
   ISO_DATE,
   isoToDays,
@@ -927,6 +929,24 @@ export class Executor {
         agg.pNever = clampProb(odds / (1 + odds));
       }
     }
+    // Numeric & date intervals: correct systematic LLM over-confidence by
+    // dilating the combined quantiles away from p50 (the within-forecaster
+    // share the LOP can't fix). The factor is learned from the resolved record
+    // and falls back to a conservative default; the pre-dilation quantiles are
+    // kept so the next fit refits on un-dilated values — never circular. pNever
+    // is a separate binary-style mass and stays untouched.
+    if ((q.kind === "numeric" || q.kind === "date") && agg.quantiles) {
+      const cal = fitQuantileCalibration(ledger);
+      agg.predilationQuantiles = agg.quantiles;
+      agg.dilation = { d: cal.d, source: cal.source, n: cal.n };
+      if (cal.d !== 1) {
+        agg.quantiles = applyQuantileDilation(agg.quantiles, cal.d, Boolean(agg.logSpace));
+        this.journal.append("log", {
+          level: "info",
+          msg: `interval dilation (${q.id}, ×${cal.d}, ${cal.source}, n=${cal.n}): p10–p90 widened around the median`,
+        });
+      }
+    }
     if (q.kind === "binary") {
       agg.evidenceOverlap = overlap;
       agg.components = { panelGmo: agg.gmo, extremized: agg.probability };
@@ -934,13 +954,21 @@ export class Executor {
       // AFTER extremization (the market is already an aggregate).
       const anchor = await this.marketAnchor(q);
       if (anchor) {
-        const blended = blendWithMarket(agg.probability!, anchor.probability, anchor.weight);
+        // The panel already carries ~one share of the market via its
+        // market-anchored lens (forecasters consult market_odds), so the
+        // mechanical blend must add only the RESIDUAL market weight — subtract
+        // 1/n. 1/n is a deliberate upper bound on the embedded share (a future
+        // learnable constant); store the effective weight so the ledger and
+        // logs reflect what was actually applied.
+        const wEff = Math.max(0, anchor.weight - 1 / panel.length);
+        anchor.weight = Number(wEff.toFixed(4));
+        const blended = blendWithMarket(agg.probability!, anchor.probability, wEff);
         agg.components.market = anchor;
         agg.components.blended = blended;
         agg.probability = blended;
         this.journal.append("log", {
           level: "info",
-          msg: `market anchor (${q.id}): [${anchor.platform}] ${Math.round(anchor.probability * 100)}% (weight ${anchor.weight.toFixed(2)}) — panel ${Math.round(agg.components.extremized! * 100)}% → blended ${Math.round(blended * 100)}%`,
+          msg: `market anchor (${q.id}): [${anchor.platform}] ${Math.round(anchor.probability * 100)}% (residual weight ${wEff.toFixed(2)} after −1/${panel.length} panel share) — panel ${Math.round(agg.components.extremized! * 100)}% → blended ${Math.round(blended * 100)}%`,
         });
       }
       // Recalibration: fitted on the ledger's own resolved record (pre-recalibration values).

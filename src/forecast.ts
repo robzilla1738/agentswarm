@@ -41,6 +41,16 @@ export function trimmedMean(values: number[], frac = 0.1): number {
   return kept.reduce((s, v) => s + v, 0) / kept.length;
 }
 
+/** Linear-interpolated quantile q∈[0,1] over an unsorted sample. */
+function quantile(values: number[], q: number): number {
+  if (values.length <= 1) return values[0] ?? NaN;
+  const sorted = [...values].sort((a, b) => a - b);
+  const idx = (sorted.length - 1) * Math.min(1, Math.max(0, q));
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  return lo === hi ? sorted[lo] : sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+}
+
 export const DEFAULT_EXTREMIZE_K = 2.5;
 
 /**
@@ -112,28 +122,144 @@ export function shouldUseLogSpace(qs: Quantiles[]): boolean {
 }
 
 /**
- * Combine a numeric panel: median per quantile below 10 panelists (a 10% trim
- * removes nothing at those sizes, and the median is the honest outlier guard),
- * 10%-trimmed mean at 10+ (log-space for heavily skewed positive quantities).
- * Values are re-sorted across quantile keys for monotonicity. Optional
- * quantiles aggregate only when every panelist provided them — a percentile
- * averaged over half the panel is a different statistic than its neighbors.
+ * Robust linear opinion pool (LOP) of a numeric/date panel, computed in the
+ * caller's working space (log for heavy skew). Each panelist's stated quantiles
+ * define a piecewise-linear quantile function — hence a piecewise-linear CDF;
+ * the pool's CDF is the mean of those, inverted back at the canonical taus.
+ * Unlike per-quantile averaging (Vincentization), the pool WIDENS when
+ * forecasters disagree about LOCATION — disagreement becomes honest uncertainty
+ * instead of being averaged away into a falsely tight band.
+ *
+ * Robustified two ways so one rogue panelist can't hijack a 3–5 member panel:
+ *   1. each panelist's quantile vector is winsorized toward the panel's per-key
+ *      median (±3·MAD) before pooling, so a 10× outlier is clipped, not pooled;
+ *   2. the pooled curve is recentered so its p50 equals the panel's robust
+ *      median p50 — location stays exactly as outlier-resistant as the old
+ *      median-of-medians (a wild panelist cannot drag the center), while the
+ *      WIDTH now reflects genuine between-forecaster disagreement.
  */
-export function aggregateQuantiles(qs: Quantiles[], k = DEFAULT_EXTREMIZE_K): AggregateForecast {
+function mixtureQuantiles(
+  qs: Quantiles[],
+  keys: (keyof Quantiles)[],
+  fwd: (v: number) => number,
+  back: (v: number) => number
+): Quantiles {
+  const taus = keys.map((key) => QUANTILE_TAUS.find((t) => t.key === key)!.tau);
+  const M = keys.length;
+  const N = qs.length;
+  // Per-panelist quantile values in working (fwd) space: rows[panelist][keyIdx].
+  const rows = qs.map((q) => keys.map((key) => fwd(q[key] as number)));
+  // Winsorize each key column toward its median by a robust (MAD) scale.
+  for (let c = 0; c < M; c++) {
+    const col = rows.map((r) => r[c]);
+    const med = median([...col].sort((a, b) => a - b));
+    const mad = median(col.map((x) => Math.abs(x - med)).sort((a, b) => a - b)) * 1.4826;
+    if (mad > 0) {
+      const lo = med - 3 * mad;
+      const hi = med + 3 * mad;
+      for (let r = 0; r < N; r++) rows[r][c] = Math.min(hi, Math.max(lo, rows[r][c]));
+    }
+  }
+  // Re-sort each panelist's clipped values so its quantile function is monotone.
+  for (let r = 0; r < N; r++) rows[r].sort((a, b) => a - b);
+
+  const pts = rows.map((r) => r.map((v, j) => ({ tau: taus[j], v })));
+  // Piecewise-linear CDF of one panelist, with linearly-extrapolated tails.
+  const cdf = (p: { tau: number; v: number }[], x: number): number => {
+    const m = p.length;
+    if (x <= p[0].v) {
+      const dv = p[1].v - p[0].v;
+      if (dv <= 0) return x < p[0].v ? 0 : p[0].tau;
+      return Math.max(0, p[0].tau + ((x - p[0].v) * (p[1].tau - p[0].tau)) / dv);
+    }
+    if (x >= p[m - 1].v) {
+      const dv = p[m - 1].v - p[m - 2].v;
+      if (dv <= 0) return x > p[m - 1].v ? 1 : p[m - 1].tau;
+      return Math.min(1, p[m - 1].tau + ((x - p[m - 1].v) * (p[m - 1].tau - p[m - 2].tau)) / dv);
+    }
+    for (let j = 0; j < m - 1; j++) {
+      if (x <= p[j + 1].v) {
+        const dv = p[j + 1].v - p[j].v;
+        if (dv <= 0) return p[j + 1].tau;
+        return p[j].tau + ((x - p[j].v) * (p[j + 1].tau - p[j].tau)) / dv;
+      }
+    }
+    return p[m - 1].tau;
+  };
+  // Breakpoints: every panelist value plus where each CDF hits 0 and 1, so the
+  // pooled CDF is exactly piecewise-linear between sorted breakpoints.
+  const bpset = new Set<number>();
+  for (const p of pts) {
+    for (const { v } of p) bpset.add(v);
+    const d0 = p[1].v - p[0].v;
+    if (d0 > 0) bpset.add(p[0].v - (p[0].tau * d0) / (p[1].tau - p[0].tau));
+    const dN = p[p.length - 1].v - p[p.length - 2].v;
+    if (dN > 0)
+      bpset.add(p[p.length - 1].v + ((1 - p[p.length - 1].tau) * dN) / (p[p.length - 1].tau - p[p.length - 2].tau));
+  }
+  const bps = [...bpset].sort((a, b) => a - b);
+  // Degenerate (panel of one or all-identical): the pool is a point — no spread.
+  if (bps.length < 2) {
+    const out = {} as Quantiles;
+    keys.forEach((key) => (out[key] = back(rows[0][0])));
+    return out;
+  }
+  const pool = (x: number) => pts.reduce((s, p) => s + cdf(p, x), 0) / N;
+  const gvals = bps.map(pool);
+  const invert = (t: number): number => {
+    if (t <= gvals[0]) return bps[0];
+    for (let j = 1; j < bps.length; j++) {
+      if (gvals[j] >= t) {
+        const dG = gvals[j] - gvals[j - 1];
+        if (dG <= 0) return bps[j];
+        return bps[j - 1] + ((t - gvals[j - 1]) * (bps[j] - bps[j - 1])) / dG;
+      }
+    }
+    return bps[bps.length - 1];
+  };
+  // Recenter onto the robust median location so a rogue cannot drag the center.
+  const robustMid = median(qs.map((q) => fwd(q.p50)).sort((a, b) => a - b));
+  const shift = robustMid - invert(0.5);
+  const values = taus.map((t) => back(invert(t) + shift)).sort((a, b) => a - b);
+  const out = {} as Quantiles;
+  keys.forEach((key, i) => (out[key] = values[i]));
+  return out;
+}
+
+/**
+ * Combine a numeric panel into one predictive distribution. Default is a robust
+ * linear opinion pool (`mixtureQuantiles`) — the pool's CDF, which captures
+ * between-forecaster disagreement as real width; `combine:"vincent"` keeps the
+ * legacy per-quantile median/trimmed-mean (kept as the backtest baseline). Both
+ * run in log space for heavily skewed positive quantities, and only over the
+ * quantile keys every panelist provided (a percentile averaged across half the
+ * panel is a different statistic than its neighbours). Within-forecaster
+ * overconfidence is corrected separately, by interval dilation in `aggregateOne`.
+ */
+export function aggregateQuantiles(
+  qs: Quantiles[],
+  k = DEFAULT_EXTREMIZE_K,
+  opts: { combine?: "lop" | "vincent" } = {}
+): AggregateForecast {
   if (!qs.length) throw new Error("aggregateQuantiles: empty panel");
   const logSpace = shouldUseLogSpace(qs);
   const fwd = (v: number) => (logSpace ? Math.log(v) : v);
   const back = (v: number) => (logSpace ? Math.exp(v) : v);
-  const center = (vals: number[]): number =>
-    vals.length < 10 ? median([...vals].sort((a, b) => a - b)) : trimmedMean(vals);
   const keys = QUANTILE_TAUS.map((t) => t.key).filter((key) => qs.every((q) => typeof q[key] === "number"));
-  const values = keys.map((key) => back(center(qs.map((q) => fwd(q[key] as number))))).sort((a, b) => a - b);
-  const quantiles = {} as Quantiles;
-  keys.forEach((key, i) => {
-    quantiles[key] = values[i];
-  });
+  let quantiles: Quantiles;
+  if ((opts.combine ?? "lop") === "vincent") {
+    const center = (vals: number[]): number =>
+      vals.length < 10 ? median([...vals].sort((a, b) => a - b)) : trimmedMean(vals);
+    const values = keys.map((key) => back(center(qs.map((q) => fwd(q[key] as number))))).sort((a, b) => a - b);
+    quantiles = {} as Quantiles;
+    keys.forEach((key, i) => {
+      quantiles[key] = values[i];
+    });
+  } else {
+    quantiles = mixtureQuantiles(qs, keys, fwd, back);
+  }
   const p50s = qs.map((q) => q.p50).sort((a, b) => a - b);
-  const scale = Math.max(Math.abs(quantiles.p50), 1e-9);
+  const scale = Math.max(Math.abs(quantiles.p50 as number), 1e-9);
   return {
     quantiles,
     k,
@@ -181,27 +307,42 @@ export function pinballLoss(q: Quantiles, value: number): number {
 
 /**
  * Clamp/normalize a panelist's per-option probabilities onto the question's
- * option list: tolerate percentages, fill missing options with a floor, and
- * renormalize to sum 1. Null when nothing usable was submitted.
+ * option list, fill missing options with a floor, and renormalize to sum 1.
+ * Null when nothing usable was submitted.
+ *
+ * Scale-invariant by construction: we never rescale individual values, we
+ * divide by the sum of the listed options. So {90,9,1} (percentages),
+ * {0.9,0.09,0.01} (fractions), and {60,30,10} all map to the same
+ * distribution. The previous per-value `if (n > 1) n /= 100` was a bug — an
+ * option submitted as exactly `1` (meaning "1%") was not `> 1`, so it slipped
+ * through as `1.0` (=100%) and, after renormalizing against its already-scaled
+ * neighbours, ballooned to ~50% (e.g. 1/(0.9+0.09+1.0) = 0.5025).
  */
 export function normalizeOptionProbs(raw: unknown, options: string[]): Record<string, number> | null {
   if (!raw || typeof raw !== "object" || !options.length) return null;
   const lookup = new Map<string, number>();
   for (const [key, v] of Object.entries(raw as Record<string, unknown>)) {
-    let n = Number(v);
+    const n = Number(v);
     if (!Number.isFinite(n) || n < 0) continue;
-    if (n > 1) n = n / 100; // tolerate percentages
-    lookup.set(key.trim().toLowerCase(), n);
+    lookup.set(key.trim().toLowerCase(), n); // raw scale kept — normalized by the listed-option sum below
   }
   if (!lookup.size) return null;
-  const out: Record<string, number> = {};
+  // Sum over the LISTED options only, so unrelated/typo keys can't distort the scale.
+  let rawSum = 0;
   let matched = 0;
   for (const opt of options) {
     const v = lookup.get(opt.trim().toLowerCase());
-    if (v !== undefined) matched++;
-    out[opt] = Math.max(v ?? 0, 0.005); // unmentioned options keep a floor — certainty is never earned
+    if (v !== undefined) {
+      matched++;
+      rawSum += v;
+    }
   }
-  if (!matched) return null;
+  if (!matched || rawSum <= 0) return null;
+  const out: Record<string, number> = {};
+  for (const opt of options) {
+    const v = lookup.get(opt.trim().toLowerCase());
+    out[opt] = Math.max((v ?? 0) / rawSum, 0.005); // scale-invariant, then floor on the 0–1 scale — certainty is never earned
+  }
   const sum = Object.values(out).reduce((s, v) => s + v, 0);
   for (const opt of options) out[opt] = out[opt] / sum;
   return out;
@@ -220,24 +361,51 @@ export function aggregateMc(
 ): AggregateForecast {
   if (!panels.length) throw new Error("aggregateMc: empty panel");
   if (options.length < 2) throw new Error("aggregateMc: need at least 2 options");
-  const ws =
+  const ws0 =
     weights && weights.length === panels.length && weights.every((w) => Number.isFinite(w) && w > 0)
       ? weights
       : panels.map(() => 1);
+
+  // Guard 1 — drop non-informative ("I don't know") panels whose option probs
+  // are essentially flat: they carry no signal and only drag the aggregate
+  // toward uniform (which is what made a bogus "Other" look meaningful). Keep
+  // the full set if EVERY panel is degenerate — never aggregate an empty panel.
+  const panelSpread = (p: Record<string, number>) => {
+    const vs = options.map((o) => clampProb(p[o] ?? 0.01));
+    return Math.max(...vs) - Math.min(...vs);
+  };
+  const tagged = panels.map((p, i) => ({ p, w: ws0[i], flat: panelSpread(p) < 0.02 }));
+  const kept = tagged.some((t) => !t.flat) ? tagged.filter((t) => !t.flat) : tagged;
+  const panelsK = kept.map((t) => t.p);
+  const ws = kept.map((t) => t.w);
+
   const wSum = ws.reduce((s, w) => s + w, 0);
-  const kEff = panels.length > 1 ? k : 1;
+  const kEff = panelsK.length > 1 ? k : 1;
   const result: Record<string, number> = {};
   let spread = 0;
   for (const opt of options) {
-    const ps = panels.map((p) => clampProb(p[opt] ?? 0.01));
+    const raw = panelsK.map((p) => clampProb(p[opt] ?? 0.01));
+    spread = Math.max(spread, Math.max(...raw) - Math.min(...raw)); // honest disagreement, pre-winsorize
+    // Guard 2 — winsorize per-option outliers once the panel is large enough
+    // for quantiles to mean something, so one rogue or mis-scaled vote can't
+    // dominate an option, without dropping anyone's ballot.
+    let ps = raw;
+    if (panelsK.length >= 5) {
+      const lo = quantile(raw, 0.1);
+      const hi = quantile(raw, 0.9);
+      ps = raw.map((p) => Math.min(hi, Math.max(lo, p)));
+    }
     const logOddsMean = ps.reduce((s, p, i) => s + ws[i] * Math.log(p / (1 - p)), 0) / wSum;
     const extremized = Math.exp(kEff * logOddsMean);
     result[opt] = clampProb(extremized / (1 + extremized));
-    spread = Math.max(spread, Math.max(...ps) - Math.min(...ps));
   }
+  // Each option is aggregated as an independent binary (GMO of odds) then
+  // renormalized to restore the simplex. A weighted log-opinion-pool over the
+  // simplex would be more principled, but it needs its own k recalibration —
+  // deferred to keep the golden-section-tuned k valid.
   const sum = Object.values(result).reduce((s, v) => s + v, 0);
   for (const opt of options) result[opt] = result[opt] / sum;
-  return { optionProbs: result, k: kEff, n: panels.length, spread };
+  return { optionProbs: result, k: kEff, n: panelsK.length, spread };
 }
 
 /** Multiclass Brier: Σ over options of (p − 1{realized})². 0 perfect; 2 is the worst possible. */
@@ -378,10 +546,14 @@ export function chooseMarketWeight(entries = loadLedger(), fallback = DEFAULT_MA
     let sum = 0;
     for (const e of usable) {
       const c = e.aggregate.components!;
-      // Re-apply each market's own liquidity scaling so the fitted w plays
-      // the same role it plays live (a base weight, not an absolute one).
+      // Re-apply each market's own liquidity scaling so the fitted w plays the
+      // same role it plays live (a base weight, not an absolute one), and
+      // subtract the share the panel already carries via its market-anchored
+      // lens (see aggregateOne) so double-counting doesn't inflate the fit.
       const liq = liquidityFactor(c.market!.volume);
-      const p = blendWithMarket(c.extremized!, c.market!.probability, w * liq);
+      const panelN = Math.max(1, e.panel?.length || e.aggregate.n || 1);
+      const wEff = Math.max(0, w * liq - 1 / panelN);
+      const p = blendWithMarket(c.extremized!, c.market!.probability, wEff);
       sum += -logScore(p, e.resolution!.outcome as 0 | 1);
     }
     const mean = sum / usable.length;
@@ -499,6 +671,81 @@ export function applyRecalibration(p: number, r: Recalibration | null): number {
   const cp = clampProb(p);
   const odds = Math.exp(r.a * Math.log(cp / (1 - cp)) + r.b);
   return clampProb(odds / (1 + odds));
+}
+
+// ---------------------------------------------------------------- interval dilation
+
+/**
+ * Interval dilation is to numeric/date forecasts what recalibration is to
+ * binary ones: the learned correction for systematic OVER-confidence. LLM
+ * predictive intervals are reliably too narrow (an "80%" p10–p90 band covers
+ * far less than 80% of outcomes), and the linear-opinion pool only fixes the
+ * BETWEEN-forecaster share of that — a panel that agrees and is jointly
+ * overconfident still states a tight band. Dilation widens every quantile away
+ * from p50 by a factor d (d=1 is identity), in log space for skewed positive
+ * quantities so the stretch is proportional rather than additive. pNever is a
+ * separate binary-style mass and is never dilated.
+ */
+export function applyQuantileDilation(q: Quantiles, d: number, logSpace = false): Quantiles {
+  const out = { ...q };
+  if (!(d > 0) || d === 1) return out;
+  const p50 = q.p50;
+  for (const { key } of QUANTILE_TAUS) {
+    const v = q[key];
+    if (typeof v !== "number") continue;
+    out[key] = logSpace && p50 > 0 && v > 0 ? p50 * Math.exp(d * Math.log(v / p50)) : p50 + d * (v - p50);
+  }
+  return out;
+}
+
+/** Out-of-the-box dilation: LLM 80% intervals cover ~50–60%; the LOP adds some width, so 1.15 is deliberately conservative. */
+export const DEFAULT_QUANTILE_DILATION = 1.15;
+/** Below this many resolved numeric/date forecasts, dilation is the default — fitting d on a handful of intervals is just noise. */
+export const MIN_QCAL_N = 25;
+
+export interface QuantileCalibration {
+  d: number;
+  n: number;
+  source: "default" | "learned";
+}
+
+/**
+ * Fit the interval dilation d on the resolved numeric/date record: the d that
+ * minimizes mean pinball loss when each entry's PRE-dilation quantiles are
+ * re-dilated by d (fitting on already-dilated numbers would be circular —
+ * mirrors `fitRecalibration`'s pre-recalibration choice). Pinball is the proper
+ * score and uses every stated quantile, not just the p10/p90 band. Regularized
+ * toward d=1 (γ=2/n) so small samples barely move it; falls back to the default
+ * below MIN_QCAL_N.
+ */
+export function fitQuantileCalibration(
+  entries = loadLedger(),
+  fallback = DEFAULT_QUANTILE_DILATION
+): QuantileCalibration {
+  const pts: { q: Quantiles; logSpace: boolean; outcome: number }[] = [];
+  for (const e of entries) {
+    if ((e.question.kind !== "numeric" && e.question.kind !== "date") || !e.resolution) continue;
+    const o = e.resolution.outcome;
+    if (typeof o !== "number") continue;
+    const q = e.aggregate.predilationQuantiles ?? e.aggregate.quantiles;
+    if (!q || typeof q.p50 !== "number") continue;
+    pts.push({ q, logSpace: Boolean(e.aggregate.logSpace), outcome: o });
+  }
+  if (pts.length < MIN_QCAL_N) return { d: fallback, n: pts.length, source: "default" };
+  const gamma = 2 / pts.length;
+  let bestD = 1;
+  let bestLoss = Infinity;
+  for (let i = 0; i <= 50; i++) {
+    const d = 0.5 + i * 0.05; // 0.5 .. 3.0
+    let sum = 0;
+    for (const pt of pts) sum += pinballLoss(applyQuantileDilation(pt.q, d, pt.logSpace), pt.outcome);
+    const loss = sum / pts.length + gamma * (d - 1) * (d - 1);
+    if (loss < bestLoss - 1e-12) {
+      bestLoss = loss;
+      bestD = d;
+    }
+  }
+  return { d: Number(bestD.toFixed(2)), n: pts.length, source: "learned" };
 }
 
 // ---------------------------------------------------------------- analytical gate
@@ -1310,6 +1557,114 @@ export function backtest(entries = loadLedger()): BacktestReport {
       marketBrier:
         tourney.reduce((s, u) => s + brierScore(u.entry.origin!.marketProbAtCreate!, u.outcome), 0) / tourney.length,
     };
+  }
+  return report;
+}
+
+// ---------------------------------------------------------------- numeric backtest
+
+export interface BacktestNumericRow {
+  config: string;
+  n: number;
+  /** Mean pinball loss over stated quantiles (proper score; lower is better). */
+  pinballMean: number;
+  /** Bootstrap 95% CI on the mean pinball (seeded). */
+  pinballLo: number;
+  pinballHi: number;
+  /** Mean 80% interval score (width + out-of-interval penalty). */
+  intervalMean: number;
+  /** Fraction of outcomes inside the p10–p90 band — well-calibrated ≈ 0.80. */
+  coverage: number;
+  /** True when the learned dilation never had enough data to leave the default. */
+  learnedEqualsDefault?: boolean;
+}
+
+export interface BacktestNumericReport {
+  rows: BacktestNumericRow[];
+  skipped: { nonNumeric: number; noPanel: number; unresolved: number };
+}
+
+/**
+ * Replay the resolved numeric/date ledger under each quantile-aggregation
+ * strategy and score them side by side — the regression gate for the LOP
+ * combiner and the interval-dilation calibrator. Learned dilation is fitted
+ * OUT-OF-FOLD (10-fold by time order). Pure deterministic replay; no agents.
+ * Standalone from `backtest()` so the binary path is untouched.
+ */
+export function backtestNumeric(entries = loadLedger()): BacktestNumericReport {
+  const skipped = { nonNumeric: 0, noPanel: 0, unresolved: 0 };
+  const usable: { panel: Quantiles[]; outcome: number; entry: LedgerEntry }[] = [];
+  for (const e of entries) {
+    if (e.question.kind !== "numeric" && e.question.kind !== "date") {
+      skipped.nonNumeric++;
+      continue;
+    }
+    if (!e.resolution || typeof e.resolution.outcome !== "number") {
+      skipped.unresolved++;
+      continue;
+    }
+    const panel = e.panel
+      .map((p) => p.quantiles)
+      .filter((q): q is Quantiles => Boolean(q && typeof q.p50 === "number" && typeof q.p10 === "number"));
+    if (!panel.length) {
+      skipped.noPanel++;
+      continue;
+    }
+    usable.push({ panel, outcome: e.resolution.outcome, entry: e });
+  }
+  const report: BacktestNumericReport = { rows: [], skipped };
+  if (!usable.length) return report;
+
+  const FOLDS = Math.min(10, usable.length);
+  const trainFor = (idx: number): LedgerEntry[] => usable.filter((_, j) => j % FOLDS !== idx % FOLDS).map((u) => u.entry);
+  // Fit the learned dilation once per fold (reused across entries in that fold).
+  const foldCal = Array.from({ length: FOLDS }, (_, idx) => fitQuantileCalibration(trainFor(idx), DEFAULT_QUANTILE_DILATION));
+  const learnedEqualsDefault = foldCal.every((c) => c.source === "default");
+
+  const def = DEFAULT_QUANTILE_DILATION;
+  const strategies: { config: string; q: (u: (typeof usable)[number], i: number) => Quantiles; learned?: boolean }[] = [
+    { config: "vincent, no dilation (legacy)", q: (u) => aggregateQuantiles(u.panel, DEFAULT_EXTREMIZE_K, { combine: "vincent" }).quantiles! },
+    { config: "LOP, no dilation", q: (u) => aggregateQuantiles(u.panel, DEFAULT_EXTREMIZE_K, { combine: "lop" }).quantiles! },
+    {
+      config: `LOP + default dilation (×${def})`,
+      q: (u) => {
+        const a = aggregateQuantiles(u.panel, DEFAULT_EXTREMIZE_K, { combine: "lop" });
+        return applyQuantileDilation(a.quantiles!, def, Boolean(a.logSpace));
+      },
+    },
+    {
+      config: "LOP + learned dilation (out-of-fold)",
+      learned: true,
+      q: (u, i) => {
+        const a = aggregateQuantiles(u.panel, DEFAULT_EXTREMIZE_K, { combine: "lop" });
+        return applyQuantileDilation(a.quantiles!, foldCal[i % FOLDS].d, Boolean(a.logSpace));
+      },
+    },
+  ];
+
+  for (const s of strategies) {
+    const pinballs: number[] = [];
+    const intervals: number[] = [];
+    let covered = 0;
+    usable.forEach((u, i) => {
+      const q = s.q(u, i);
+      pinballs.push(pinballLoss(q, u.outcome));
+      intervals.push(intervalScore(q.p10, q.p90, u.outcome));
+      const lo = Math.min(q.p10, q.p90);
+      const hi = Math.max(q.p10, q.p90);
+      if (u.outcome >= lo && u.outcome <= hi) covered++;
+    });
+    const ci = bootstrapCi(pinballs);
+    report.rows.push({
+      config: s.config,
+      n: usable.length,
+      pinballMean: pinballs.reduce((a, b) => a + b, 0) / pinballs.length,
+      pinballLo: ci.lo,
+      pinballHi: ci.hi,
+      intervalMean: intervals.reduce((a, b) => a + b, 0) / intervals.length,
+      coverage: covered / usable.length,
+      ...(s.learned ? { learnedEqualsDefault } : {}),
+    });
   }
   return report;
 }

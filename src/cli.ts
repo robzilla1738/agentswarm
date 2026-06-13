@@ -36,6 +36,7 @@ import { TerminalRenderer, watchRun } from "./terminal";
 import {
   ISO_DATE,
   backtest,
+  backtestNumeric,
   calibrationStats,
   daysToIso,
   isoToDays,
@@ -909,38 +910,64 @@ function cmdCalibration(): void {
  * grade its own homework.
  */
 function cmdBacktest(): void {
-  const report = backtest(loadLedger());
+  const ledger = loadLedger();
+  const report = backtest(ledger);
   if (!report.rows.length) {
     console.log(
       ansi.gray("no resolved binary forecasts with panels to replay — grow the ledger first: swarm tournament, then swarm resolve")
     );
-    return;
+  } else {
+    const n = report.rows[0].n;
+    console.log(ansi.bold("backtest") + ansi.gray(`  (${n} resolved binary forecasts replayed; 95% CI by seeded bootstrap)`));
+    console.log(ansi.gray("  strategy                                          brier   [95% CI]        log loss"));
+    const best = Math.min(...report.rows.map((r) => r.brierMean));
+    for (const r of report.rows) {
+      const mark = r.brierMean === best ? ansi.green(" ◀ best") : "";
+      console.log(
+        `  ${r.config.padEnd(48)} ${r.brierMean.toFixed(4)}  [${r.brierLo.toFixed(4)}–${r.brierHi.toFixed(4)}]  ${r.logLossMean.toFixed(4)}${mark}`
+      );
+    }
+    if (report.vsMarket) {
+      const { n: vn, swarmBrier, marketBrier } = report.vsMarket;
+      const verdict =
+        swarmBrier < marketBrier
+          ? ansi.green(`the swarm BEAT the market by ${(marketBrier - swarmBrier).toFixed(4)} Brier`)
+          : ansi.yellow(`the market leads by ${(swarmBrier - marketBrier).toFixed(4)} Brier`);
+      console.log(
+        `\n  ${ansi.bold("vs market")} (tournament imports, n=${vn}): swarm ${swarmBrier.toFixed(4)} vs market-at-import ${marketBrier.toFixed(4)} — ${verdict}`
+      );
+    }
+    const sk = report.skipped;
+    if (sk.nonBinary || sk.noPanel) {
+      console.log(ansi.gray(`\n  skipped: ${sk.nonBinary} non-binary, ${sk.noPanel} without a usable panel`));
+    }
+    console.log(ansi.gray("  note: 'published headline' is what the engine actually said at the time; the other rows re-derive."));
   }
-  const n = report.rows[0].n;
-  console.log(ansi.bold("backtest") + ansi.gray(`  (${n} resolved binary forecasts replayed; 95% CI by seeded bootstrap)`));
-  console.log(ansi.gray("  strategy                                          brier   [95% CI]        log loss"));
-  const best = Math.min(...report.rows.map((r) => r.brierMean));
-  for (const r of report.rows) {
-    const mark = r.brierMean === best ? ansi.green(" ◀ best") : "";
+
+  // Numeric/date interval calibration — graded by pinball, interval score, and
+  // p10–p90 coverage (well-calibrated ≈ 0.80), same out-of-fold + bootstrap rigor.
+  const num = backtestNumeric(ledger);
+  if (num.rows.length) {
+    const nn = num.rows[0].n;
     console.log(
-      `  ${r.config.padEnd(48)} ${r.brierMean.toFixed(4)}  [${r.brierLo.toFixed(4)}–${r.brierHi.toFixed(4)}]  ${r.logLossMean.toFixed(4)}${mark}`
+      "\n" +
+        ansi.bold("backtest (numeric/date)") +
+        ansi.gray(`  (${nn} resolved interval forecasts replayed; pinball 95% CI by seeded bootstrap; coverage target ≈0.80)`)
+    );
+    console.log(ansi.gray("  strategy                                          pinball  [95% CI]            interval  cover"));
+    const bestP = Math.min(...num.rows.map((r) => r.pinballMean));
+    for (const r of num.rows) {
+      const mark = r.pinballMean === bestP ? ansi.green(" ◀ best") : "";
+      const note = r.learnedEqualsDefault ? ansi.gray(" (=default; needs ≥25 resolved)") : "";
+      console.log(
+        `  ${r.config.padEnd(48)} ${r.pinballMean.toFixed(4)} [${r.pinballLo.toFixed(4)}–${r.pinballHi.toFixed(4)}]  ${r.intervalMean.toFixed(3).padStart(9)}  ${r.coverage.toFixed(2)}${mark}${note}`
+      );
+    }
+  } else if (report.rows.length) {
+    console.log(
+      ansi.gray(`\n  numeric/date: none resolved yet (${num.skipped.unresolved} unresolved) — interval tuning needs swarm resolve`)
     );
   }
-  if (report.vsMarket) {
-    const { n: vn, swarmBrier, marketBrier } = report.vsMarket;
-    const verdict =
-      swarmBrier < marketBrier
-        ? ansi.green(`the swarm BEAT the market by ${(marketBrier - swarmBrier).toFixed(4)} Brier`)
-        : ansi.yellow(`the market leads by ${(swarmBrier - marketBrier).toFixed(4)} Brier`);
-    console.log(
-      `\n  ${ansi.bold("vs market")} (tournament imports, n=${vn}): swarm ${swarmBrier.toFixed(4)} vs market-at-import ${marketBrier.toFixed(4)} — ${verdict}`
-    );
-  }
-  const sk = report.skipped;
-  if (sk.nonBinary || sk.noPanel) {
-    console.log(ansi.gray(`\n  skipped: ${sk.nonBinary} non-binary, ${sk.noPanel} without a usable panel`));
-  }
-  console.log(ansi.gray("  note: 'published headline' is what the engine actually said at the time; the other rows re-derive."));
 }
 
 // ---------------------------------------------------------------- config / models

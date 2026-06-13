@@ -982,7 +982,7 @@ export function submitForecastTool(kind: ForecastKind, options?: string[]): Tool
               type: "object",
               additionalProperties: { type: "number" },
               description:
-                `Your probability (percentage) for EVERY option, keys exactly as listed${options?.length ? `: ${options.map((o) => JSON.stringify(o)).join(", ")}` : ""}. They should sum to ~100; the engine renormalizes.`,
+                `Your probability for EVERY option, keys exactly as listed${options?.length ? `: ${options.map((o) => JSON.stringify(o)).join(", ")}` : ""}. Give them as percentages summing to ~100 OR as fractions summing to 1 — the engine normalizes either way, so just keep one consistent scale.`,
             },
           }
         : kind === "date"

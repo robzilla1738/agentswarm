@@ -140,8 +140,12 @@ export interface AggregateForecast {
   gmo?: number;
   /** Extremization exponent used. */
   k: number;
-  /** Trimmed-mean quantiles (numeric; epoch-days for date questions). */
+  /** Combined quantiles, dilated for calibration (numeric; epoch-days for date questions). */
   quantiles?: Quantiles;
+  /** The combined quantiles BEFORE interval dilation — the value future dilation refits on (never circular). */
+  predilationQuantiles?: Quantiles;
+  /** The interval dilation actually applied to the quantiles, and where the factor came from. */
+  dilation?: { d: number; source: "default" | "learned"; n: number };
   /** Per-option probabilities, extremized GMO renormalized to sum 1 (mc). */
   optionProbs?: Record<string, number>;
   /** GMO of the panel's P(never by horizon) — date questions. */

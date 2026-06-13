@@ -90,6 +90,10 @@ export interface AggregateForecast {
   gmo?: number;
   k: number;
   quantiles?: Quantiles;
+  /** Combined quantiles before interval dilation (numeric/date). */
+  predilationQuantiles?: Quantiles;
+  /** Interval dilation applied to the quantiles and where the factor came from. */
+  dilation?: { d: number; source: "default" | "learned"; n: number };
   optionProbs?: Record<string, number>;
   pNever?: number;
   logSpace?: boolean;

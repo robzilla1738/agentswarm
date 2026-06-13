@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.15.0
+
+Calibrated interval forecasts, a fix for the spurious multiple-choice "Other", and charts that render in the app. No breaking changes.
+
+### Multiple-choice correctness
+- **The "Other" inflation bug**: `normalizeOptionProbs` rescaled per-value (`if (n > 1) n /= 100`), so an option a panelist submitted as the integer `1` (meaning 1%) survived as `1.0` and, after renormalizing against its already-scaled neighbours, ballooned to ~50% — every mc forecast with such a value was corrupted (a two-team game showed a 30% "Other"). Normalization is now **scale-invariant**: values are divided by the sum of the listed options, so `{90,9,1}`, `{0.9,0.09,0.01}`, and `{60,30,10}` all map to the same distribution.
+- **No more spurious "Other" on closed sets**: the sharpener/planner now add a catch-all option only when the named candidates genuinely leave outcomes uncovered. A head-to-head ("which team wins, A vs B?") lists only the named options and routes a not-played game to a void clause in the resolution criteria, instead of inventing an "Other" that can't happen.
+- **`aggregateMc` hardening**: near-uniform "I don't know" panels are dropped (they only drag the aggregate toward uniform), and per-option outliers are winsorized once the panel is large enough — so a single mis-scaled ballot can't dominate an option.
+
+### Calibrated numeric & date intervals
+- **Robust linear opinion pool**: numeric/date panels now combine as a mixture of the forecasters' predictive CDFs, so genuine disagreement about location widens the interval instead of being averaged into false confidence (the old per-quantile median hid it). Winsorized and recentered on the robust median, so one wild panelist still cannot drag the center.
+- **Interval dilation — the calibration loop intervals never had**: LLM predictive intervals are reliably too narrow. A conservative dilation widens the band out of the box (×1.15), and once ≥25 numeric/date forecasts resolve the factor is **re-learned from your own p10–p90 coverage** by pinball minimization (regularized toward identity), the numeric analogue of the binary recalibration layer. The pre-dilation quantiles are stored so the fit is never circular.
+- **`swarm backtest` now replays interval forecasts**: a dedicated numeric/date table scores Vincentization vs the linear-opinion-pool vs default/learned dilation by pinball, interval score, and coverage — same out-of-fold + bootstrap-CI discipline as the binary path, and labelled when learned still equals the default.
+
+### Market double-counting
+- Forecasters consult `market_odds` (the market-anchored lens is told to), so the panel already reflects the market — then the engine blended the same market in again. The mechanical blend now adds only the **residual** weight (`max(0, w − 1/n)`), applied consistently live and in the re-learned weight, so a market the panel consulted is no longer counted twice. The market-anchored lens is asked to cite its market URL.
+
+### Free-form question input
+- The web composer no longer reads as if a resolution date is required: the date field is labelled optional and the placeholder says the horizon is inferred when blank. When the engine infers the date, the forecast headline tags it "· inferred" so you can sanity-check it.
+
+### Charts render in the app
+- `` ```chart `` blocks (line/bar/donut/stat) now render as charts **in the web UI's in-app report and task views**, not just the exported `.html`. Previously the in-app markdown renderer showed the raw `{"type":"stat",…}` JSON as a code block. A new dependency-free `ChartBlock` mirrors the server-side renderer (`src/charts.ts`); a malformed spec degrades to a quiet contained block, never a raw dump.
+
 ## 0.14.0
 
 Open-ended forecasting: ask broad predictive questions, not just yes/no ones.

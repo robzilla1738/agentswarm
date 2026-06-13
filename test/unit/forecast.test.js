@@ -49,13 +49,18 @@ const {
   normalizeOptionProbs,
   isoToDays,
   daysToIso,
+  applyQuantileDilation,
+  fitQuantileCalibration,
+  backtestNumeric,
   MIN_CALIBRATION_N,
   MIN_ADAPTIVE_N,
   MIN_MARKET_WEIGHT_N,
   MIN_METHOD_WEIGHT_N,
   MIN_RECALIBRATION_N,
+  MIN_QCAL_N,
   DEFAULT_EXTREMIZE_K,
   DEFAULT_MARKET_WEIGHT,
+  DEFAULT_QUANTILE_DILATION,
 } = require("../../dist/forecast.js");
 const { coerceConfigValue } = require("../../dist/config.js");
 
@@ -121,27 +126,70 @@ test("trimmedMean trims floor(n·frac) from each end", () => {
   assert.equal(trimmedMean([1, 2, 3], 0.1), 2); // floor(0.3)=0 → plain mean
 });
 
-test("aggregateQuantiles: small panels take the median per quantile, stay monotonic, spread is relative", () => {
+test("aggregateQuantiles (LOP): median location is the robust center, width is monotone, spread is relative", () => {
   const a = aggregateQuantiles([
     { p10: 10, p50: 20, p90: 30 },
     { p10: 12, p50: 24, p90: 40 },
     { p10: 8, p50: 16, p90: 28 },
   ]);
   assert.equal(a.n, 3);
-  near(a.quantiles.p10, 10, 1e-9);
+  // The pool is recentered on the robust median of p50s (median of 20/24/16 = 20).
   near(a.quantiles.p50, 20, 1e-9);
-  near(a.quantiles.p90, 30, 1e-9); // median of 30/40/28 — a mean would let 40 drag it
   assert.ok(a.quantiles.p10 <= a.quantiles.p50 && a.quantiles.p50 <= a.quantiles.p90);
-  near(a.spread, (24 - 16) / 20, 1e-9);
+  // The pool captures between-forecaster disagreement: the band is at least as
+  // wide as the Vincentized one (which would be exactly 10..30).
+  const v = aggregateQuantiles(
+    [
+      { p10: 10, p50: 20, p90: 30 },
+      { p10: 12, p50: 24, p90: 40 },
+      { p10: 8, p50: 16, p90: 28 },
+    ],
+    DEFAULT_EXTREMIZE_K,
+    { combine: "vincent" }
+  );
+  assert.ok(a.quantiles.p90 - a.quantiles.p10 >= v.quantiles.p90 - v.quantiles.p10 - 1e-9);
+  near(a.spread, (24 - 16) / 20, 1e-9); // spread is still the raw relative p50 disagreement
 });
 
-test("aggregateQuantiles: one wild panelist cannot drag a small panel", () => {
+test("aggregateQuantiles: one wild panelist cannot drag the center (winsorize + recenter)", () => {
   const a = aggregateQuantiles([
     { p10: 10, p50: 20, p90: 30 },
     { p10: 11, p50: 21, p90: 31 },
     { p10: 100, p50: 200, p90: 300 },
   ]);
-  near(a.quantiles.p50, 21, 1e-9, "median holds the center; a mean would say ~80");
+  // Recentering pins p50 to the robust median of p50s (median of 20/21/200 = 21);
+  // a CDF mixture without robustification would be dragged far above.
+  near(a.quantiles.p50, 21, 1e-9, "robust median holds the center; raw pooling would say ~80+");
+  assert.ok(a.quantiles.p90 < 100, "winsorization keeps the rogue's 300 from blowing out the upper tail");
+});
+
+test("aggregateQuantiles (LOP): an agreeing panel barely widens vs Vincent; disagreement widens more", () => {
+  const tight = [
+    { p10: 18, p50: 20, p90: 22 },
+    { p10: 18, p50: 20, p90: 22 },
+    { p10: 19, p50: 20, p90: 21 },
+  ];
+  const loose = [
+    { p10: 5, p50: 20, p90: 35 },
+    { p10: 18, p50: 20, p90: 22 },
+    { p10: 30, p50: 40, p90: 50 },
+  ];
+  const wTight = (() => {
+    const a = aggregateQuantiles(tight);
+    return a.quantiles.p90 - a.quantiles.p10;
+  })();
+  const wLoose = (() => {
+    const a = aggregateQuantiles(loose);
+    return a.quantiles.p90 - a.quantiles.p10;
+  })();
+  assert.ok(wLoose > wTight, "a disagreeing panel produces a genuinely wider band");
+});
+
+test("aggregateQuantiles (LOP): a panel of one passes through unchanged", () => {
+  const a = aggregateQuantiles([{ p10: 10, p50: 20, p90: 30 }]);
+  near(a.quantiles.p10, 10, 1e-9);
+  near(a.quantiles.p50, 20, 1e-9);
+  near(a.quantiles.p90, 30, 1e-9);
 });
 
 test("scoring: brier, log, interval fixtures", () => {
@@ -835,6 +883,51 @@ test("pinballLoss: hand-computed values, zero at a point mass", () => {
   assert.ok(sharp < vague);
 });
 
+test("applyQuantileDilation widens around p50, is identity at d=1, stays monotone, log-space proportional", () => {
+  const q = { p10: 10, p50: 20, p90: 30 };
+  const wide = applyQuantileDilation(q, 2, false);
+  near(wide.p50, 20, 1e-9); // center fixed
+  near(wide.p10, 0, 1e-9); // 20 + 2·(10−20)
+  near(wide.p90, 40, 1e-9); // 20 + 2·(30−20)
+  assert.deepEqual(applyQuantileDilation(q, 1, false), { p10: 10, p50: 20, p90: 30 });
+  // monotonicity preserved across the full spine for any d>0
+  const w = applyQuantileDilation({ p5: 5, p10: 10, p25: 15, p50: 20, p75: 25, p90: 30, p95: 35 }, 1.5, false);
+  assert.ok(w.p5 <= w.p10 && w.p10 <= w.p25 && w.p25 <= w.p50 && w.p50 <= w.p90 && w.p90 <= w.p95);
+  // log space: the stretch is multiplicative around p50, so ratios square at d=2
+  const lg = applyQuantileDilation({ p10: 50, p50: 100, p90: 200 }, 2, true);
+  near(lg.p50, 100, 1e-9);
+  near(lg.p90, 400, 1e-6); // (200/100)² · 100
+  near(lg.p10, 25, 1e-6); // (50/100)² · 100
+});
+
+test("fitQuantileCalibration widens systematically over-narrow intervals, falls back below MIN, doesn't widen well-covered ones", () => {
+  const mk = (outcome) => ({
+    v: 1,
+    id: "q",
+    runId: "r",
+    t: 0,
+    question: { ...QUESTION, kind: "numeric" },
+    aggregate: { k: 2.5, n: 3, spread: 0.1, predilationQuantiles: { p10: 18, p50: 20, p90: 22 } },
+    panel: [],
+    resolution: { v: 1, rec: "resolved", id: "q", t: 1, outcome, evidence: "", sources: [], resolvedBy: "operator" },
+  });
+  // Below MIN_QCAL_N → the default, untouched.
+  const few = [5, 12, 20, 28, 35].map(mk);
+  const cal0 = fitQuantileCalibration(few, DEFAULT_QUANTILE_DILATION);
+  assert.equal(cal0.source, "default");
+  near(cal0.d, DEFAULT_QUANTILE_DILATION, 1e-9);
+  // Outcomes scattered far wider than the stated ±2 band → learn to widen.
+  const wideOutcomes = Array.from({ length: 30 }, (_, i) => mk(5 + (i % 11) * 3));
+  const cal = fitQuantileCalibration(wideOutcomes, DEFAULT_QUANTILE_DILATION);
+  assert.equal(cal.source, "learned");
+  assert.equal(cal.n, 30);
+  assert.ok(cal.d > 1, `over-narrow intervals should learn a widening factor, got ${cal.d}`);
+  // Outcomes that sit inside the band → no need to widen (d not pushed up).
+  const tightOutcomes = Array.from({ length: 30 }, (_, i) => mk(19 + (i % 3)));
+  const calTight = fitQuantileCalibration(tightOutcomes, DEFAULT_QUANTILE_DILATION);
+  assert.ok(calTight.d <= 1.2, `well-covered intervals shouldn't be widened, got ${calTight.d}`);
+});
+
 // ---------------------------------------------------------------- mc questions
 
 test("normalizeOptionProbs tolerates percentages, fills gaps, renormalizes", () => {
@@ -880,6 +973,47 @@ test("aggregateMc: per-option GMO, extremized, renormalized to sum 1", () => {
   const single = aggregateMc([{ A: 0.6, B: 0.3, C: 0.1 }], opts, 2.5);
   assert.equal(single.k, 1);
   near(single.optionProbs["A"], 0.6, 1e-2);
+});
+
+test("normalizeOptionProbs: an option submitted as integer 1 (=1%) is not inflated to ~50% (regression)", () => {
+  const opts = ["New York Knicks", "San Antonio Spurs", "Other"];
+  // The bug: `if (n > 1) n /= 100` left a bare `1` as 1.0 (=100%), so after
+  // renormalizing it became 1/(0.9+0.09+1.0) ≈ 0.50. It must read as ~1%.
+  const p = normalizeOptionProbs({ "New York Knicks": 90, "San Antonio Spurs": 9, Other: 1 }, opts);
+  assert.ok(p["Other"] < 0.03, `Other should be ~1%, got ${p["Other"]}`);
+  assert.ok(p["New York Knicks"] > 0.8, "the leading option keeps its mass");
+  near(p["New York Knicks"] + p["San Antonio Spurs"] + p["Other"], 1, 1e-9);
+});
+
+test("normalizeOptionProbs is scale-invariant: percentages and fractions agree", () => {
+  const opts = ["A", "B", "C"];
+  const pct = normalizeOptionProbs({ A: 90, B: 9, C: 1 }, opts);
+  const frac = normalizeOptionProbs({ A: 0.9, B: 0.09, C: 0.01 }, opts);
+  for (const o of opts) near(pct[o], frac[o], 1e-9);
+});
+
+test("aggregateMc: a lone rogue/mis-scaled panel can't dominate an option (winsorize, n≥5)", () => {
+  const opts = ["A", "B"];
+  // Five panelists are confident in A; one rogue insists on B at the floor.
+  const consensus = { A: 0.9, B: 0.1 };
+  const rogue = { A: 0.02, B: 0.98 };
+  const panels = [consensus, consensus, consensus, consensus, consensus, rogue];
+  const agg = aggregateMc(panels, opts, 2.5);
+  assert.ok(agg.optionProbs["A"] > 0.85, `winsorized aggregate should still favor A strongly, got ${agg.optionProbs["A"]}`);
+  near(agg.optionProbs["A"] + agg.optionProbs["B"], 1, 1e-9);
+});
+
+test("aggregateMc: a near-uniform 'I don't know' panel is excluded as non-informative", () => {
+  const opts = ["A", "B", "C"];
+  const informative = { A: 0.7, B: 0.2, C: 0.1 };
+  const flat = { A: 0.34, B: 0.33, C: 0.33 };
+  const withFlat = aggregateMc([informative, informative, flat], opts, 2.5);
+  const without = aggregateMc([informative, informative], opts, 2.5);
+  assert.equal(withFlat.n, 2, "the flat panel is dropped from the count");
+  near(withFlat.optionProbs["A"], without.optionProbs["A"], 1e-9);
+  // …but if EVERY panel is flat we keep them rather than aggregate nothing.
+  const allFlat = aggregateMc([flat, flat], opts, 2.5);
+  assert.equal(allFlat.n, 2);
 });
 
 test("mc scoring: multiclass Brier and log score", () => {
@@ -1050,6 +1184,45 @@ test("backtest degrades to empty on a ledger with nothing replayable", () => {
   const r = backtest(numericOnly);
   assert.equal(r.rows.length, 0);
   assert.equal(r.skipped.nonBinary, 1);
+});
+
+test("backtestNumeric replays interval forecasts, scores coverage, and credits dilation when intervals run narrow", () => {
+  const mkNum = (panelQ, outcome, kind = "numeric") => ({
+    v: 1,
+    id: "n",
+    runId: "r",
+    t: 0,
+    question: { ...QUESTION, kind },
+    aggregate: { k: 2.5, n: panelQ.length, spread: 0.1 },
+    panel: panelQ.map((q, j) => ({ taskId: `T${j}`, method: "trend", quantiles: q })),
+    resolution: { v: 1, rec: "resolved", id: "n", t: 1, outcome, evidence: "", sources: [], resolvedBy: "operator" },
+  });
+  // Agreeing, narrow panels with the outcome just outside the band: the LOP
+  // can't widen (no disagreement), but the default dilation can — so coverage
+  // and pinball both improve from "LOP, no dilation" to "+ default dilation".
+  const entries = Array.from({ length: 12 }, (_, i) => {
+    const center = 100 + i * 5;
+    const q = { p10: center - 5, p50: center, p90: center + 5 };
+    return mkNum([q, { ...q }], center + 5.5);
+  });
+  const r = backtestNumeric(entries);
+  assert.equal(r.rows.length, 4);
+  for (const row of r.rows) {
+    assert.equal(row.n, 12);
+    assert.ok(row.coverage >= 0 && row.coverage <= 1);
+    assert.ok(row.pinballLo <= row.pinballMean && row.pinballMean <= row.pinballHi, "CI brackets the mean");
+  }
+  const lopNo = r.rows.find((x) => x.config === "LOP, no dilation");
+  const lopDef = r.rows.find((x) => /default dilation/.test(x.config));
+  assert.equal(lopNo.coverage, 0, "the ±5 band misses the +5.5 outcome");
+  assert.equal(lopDef.coverage, 1, "the ×1.15 default band reaches it");
+  assert.ok(lopDef.pinballMean < lopNo.pinballMean, "widening a too-narrow interval lowers pinball");
+  // Only 12 resolved (< MIN_QCAL_N) → the learned row is flagged as default-equal.
+  const learned = r.rows.find((x) => /learned/.test(x.config));
+  assert.equal(learned.learnedEqualsDefault, true);
+  // Nothing replayable → empty, with a reason.
+  assert.equal(backtestNumeric([]).rows.length, 0);
+  assert.equal(backtestNumeric([]).skipped.unresolved, 0);
 });
 
 // ---------------------------------------------------------------- supersede chains
