@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.13.0
+
+A correctness, calibration-quality, and data-coverage release. No breaking changes; new tools and time-series sources are additive and keyless.
+
+### Correctness fixes
+- **Bootstrap CI off-by-one**: backtest confidence intervals used the wrong percentile indices (25/975 of 1000 instead of 24/974). Fixed to `round(b·α)−1`.
+- **Market-weight grid never reached w=1.0**: `chooseMarketWeight` stopped at 0.9, so the system could never learn to fully defer to a consistently-right market. The grid now includes 1.0.
+- **`fetch_url` double-truncation**: pages were truncated to 60K and then middle-cut *again* to the 20K tool-result cap, silently dropping the middle of every long document. Now a single truncation to `maxToolResultChars`, whose default is raised 20K → 50K.
+- **Synthesizer could not recover clipped reports**: task reports are excerpted to 1600 chars in the synth prompt, but the synthesizer had no `read_report` tool — the rest was unreachable. It now has `read_report`, clipped excerpts are marked, and the prompt directs it to pull full text before writing dependent sections.
+- **Dead `"primary"` source class revived**: `classifySource` never returned `"primary"`, so its +5 ranking bonus was unreachable. Authoritative publishers (WHO, IMF, World Bank, OECD, europa.eu, clinicaltrials.gov, SEC, …) now classify as primary, and non-US government TLDs (`.gov.uk`, `.gov.au`, `.gc.ca`, `.go.jp`, `.gouv.fr`) as government.
+
+### Forecasting math
+- **Golden-section adaptive k**: the extremization constant is now found by a coarse bracketing scan + golden-section refinement over [1, 6], replacing a 13-point grid that capped at 4.0 and could miss the optimum by 0.125.
+- **Recalibration can deflate severe overconfidence**: the logistic fit's slope range widened to `a ∈ [0.1, 2.0]`, `b ∈ [−2, 2]` — the old 0.5 slope floor made strong LLM overconfidence uncorrectable.
+- **Extremized `pNever`**: date-question never-mass now gets the same overlap-scaled extremized GMO as a binary panel (it *is* a binary forecast), instead of a raw GMO.
+- **Real OLS prediction intervals**: `time_series project_to` now reports `t(n−2)·σ·√(1 + 1/n + (x−x̄)²/Sxx)` — a band that widens with extrapolation distance — instead of a flat ±1.28σ residual band that ignored parameter uncertainty.
+- **Manifold play-money discount**: mana volume is discounted 50× to a real-money-equivalent before the liquidity floor and anchor weight, so a 10K-mana market no longer anchors like a $10K Polymarket book. The discounted volume is stored, so the learned weight refits consistently.
+- **Median small-panel quantiles**: numeric panels below 10 forecasters aggregate each quantile by median (the old 10% trim removed nothing at real panel sizes and let one outlier drag the center); 10+ still trims.
+- **Blended evidence overlap**: pairwise source overlap is now `0.7·Jaccard(URLs) + 0.3·Jaccard(domains)` — exact-URL matching alone under-detected shared sourcing and left k too high.
+- **Separate MC calibration bins**: multiple-choice option probabilities no longer contaminate the binary reliability bins shown to future panels; the CLI renders both.
+
+### Research orchestration
+- **Faithfulness check in default mode**: the synthesis-vs-task-reports check now also runs under `verification: "normal"` for runs of ≥5 tasks (was strict-only).
+- **Map-reduce synthesis for large runs**: at ≥40 tasks the synthesizer reads parallel cheap-model digests of role-grouped tasks instead of a middle-truncated 300K-char blob; full text stays one `read_report` away.
+- **Research contradiction pass**: the conductor doctrine now prescribes a cross-task reviewer before synthesis — contradictions between scouts, single-source claims, stale data, irreconcilable numbers.
+- **Strict verification fails closed**: a verdict that passes twice with zero tool-gathered evidence now fails the task back to the worker instead of being accepted with a warning.
+- **Sources reach the bibliography**: URLs posted via `note(url=…)` now merge into the task's sources at report intake, the per-task source cap is raised 40 → 80, and a researcher that reports with no sources is flagged in the journal.
+- **Re-forecasts respect panel size**: trigger-driven re-forecasts use the configured `forecastPanelSize` (capped at 5) instead of a hardcoded 3.
+
+### New keyless data sources
+- **`academic_search`** adds Semantic Scholar (with citation counts) and, for biomedical queries, PubMed — alongside arXiv and Crossref. Deep `web_search` sweeps the same engines.
+- **`web_search` with `freshness`** also queries GDELT's DOC 2.0 article index — direct, mostly paywall-light news links — where scraped-engine date filters run thin.
+- **`market_odds`** adds PredictIt (keyless real-money US politics; per-contract hits for multi-contract markets). It informs panels but is not used as a mechanical anchor (no published volume).
+- **`time_series`** adds a `wikipageviews` source: daily Wikipedia pageviews as a public-attention leading indicator (clearly labeled attention, not probability).
+- **`wiki_summary(title)`**: a new tool returning the Wikipedia REST summary for fast entity grounding without a scrape round-trip.
+- **Wayback recovery**: `fetch_url` recovers the closest Internet Archive snapshot when a source returns an HTTP error, clearly labeled as archived.
+- **Run-scoped fetch/search cache**: identical `fetch_url`/`web_search` calls across agents in a run coalesce into one network call (failures evicted so they retry) — a large win for wide swarms.
+
 ## 0.12.0
 
 ### Tournament mode: ledger velocity
