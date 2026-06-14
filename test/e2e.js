@@ -1229,6 +1229,36 @@ async function phaseForecastMulti() {
   }
   ok("ledger holds 3 grouped sub-forecast records (shared setId + brief, overlap 0)");
 
+  // Scenario simulation auto-triggered on the decomposed question: the engine
+  // built a grounded catalog from the sibling sub-forecasts, ran the Monte
+  // Carlo, and recorded the cross-check WITHOUT moving the headline (weight 0).
+  const sims = byType("forecast.simulated");
+  if (sims.length !== 1) fail(`expected exactly one forecast.simulated event, got ${sims.length}`);
+  const sim = sims[0];
+  if (sim.questionId !== "sf1") fail(`simulation should target the first sub-forecast sf1, got ${sim.questionId}`);
+  if (!Array.isArray(sim.scenarios) || !sim.scenarios.length) fail("simulation produced no scenarios");
+  if (sim.weight !== 0) fail(`phase-1 simulation must not influence the headline (weight 0), got ${sim.weight}`);
+  if (!Array.isArray(sim.sensitivity) || sim.sensitivity.length !== 2) fail("expected a 2-driver tornado");
+  // Crash-safety: the base "created" record is durable and still pre-sim; the
+  // simulation appends a separate "updated" patch (no extra "created" record,
+  // so the 3-sub-forecast count is preserved).
+  const updated = ledgerLines.filter((r) => r.rec === "updated");
+  if (created.length !== 3) fail(`base "created" count must stay 3, got ${created.length}`);
+  if (updated.length !== 1) fail(`exactly one "updated" (sim) patch expected, got ${updated.length}`);
+  const sf1Agg = aggs.find((a) => a.questionId === "sf1");
+  const sf1Created = created.find((r) => r.question.id === "sf1");
+  const sf1Updated = updated.find((r) => r.id === sf1Created.id);
+  if (!sf1Updated) fail("the sim patch should key to the sf1 base record's id");
+  if (!sf1Updated.simulationRan) fail("the sim patch should be flagged simulationRan");
+  if (typeof sf1Updated.aggregate.components.simulated !== "number") fail("the sim patch should store the simulated cross-check probability");
+  if (sf1Updated.aggregate.components.simBlendWeight !== 0) fail("sf1 sim blend weight should be 0 in phase 1");
+  // Headline untouched at weight 0: the patched aggregate's probability equals
+  // the pre-sim aggregate exactly.
+  if (sf1Updated.aggregate.probability !== sf1Agg.aggregate.probability) {
+    fail(`headline moved despite weight 0: ${sf1Agg.aggregate.probability} → ${sf1Updated.aggregate.probability}`);
+  }
+  ok("scenario simulation ran as a durable cross-check (base record inline + 'updated' patch, 2-driver tornado) without moving the headline (weight 0)");
+
   // The synthesizer received all 3 aggregate blocks + the brief.
   const report = fs.readFileSync(path.join(runDir, "artifacts", "final-report.md"), "utf8");
   if (!/SUBFORECAST-BLOCKS: 3/.test(report) || !/BRIEF-PINNED: true/.test(report)) {

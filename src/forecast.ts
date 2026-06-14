@@ -2,7 +2,18 @@ import * as path from "path";
 import * as fs from "fs";
 import { home } from "./config";
 import { canonicalizeUrl } from "./searchcore";
-import { AggregateForecast, Forecast, ForecastKind, ForecastOrigin, ForecastQuestion, Quantiles } from "./types";
+import {
+  AggregateForecast,
+  CombinerNode,
+  CombinerSpec,
+  DriverCorrelation,
+  Forecast,
+  ForecastKind,
+  ForecastOrigin,
+  ForecastQuestion,
+  Quantiles,
+  SimDriver,
+} from "./types";
 import { ensureDir, errMsg } from "./util";
 
 /**
@@ -748,6 +759,254 @@ export function fitQuantileCalibration(
   return { d: Number(bestD.toFixed(2)), n: pts.length, source: "learned" };
 }
 
+// ---------------------------------------------------------------- scenario simulation
+
+/**
+ * The structure the LLM proposes for a scenario simulation — shape only, never
+ * numbers. `drivers` selects from the engine-built grounded catalog by handle;
+ * `combiner` is the closed DSL tree; `dependencies` are pairwise correlations.
+ */
+export interface SimStructure {
+  drivers: string[];
+  combiner: CombinerNode;
+  dependencies: DriverCorrelation[];
+  rationale: string;
+}
+
+/** Parse the structure model's reply into a SimStructure, tolerating fences/prose (mirrors parseForecastPlan). */
+export function parseSimStructure(raw: string): SimStructure | null {
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  let obj: Record<string, unknown>;
+  try {
+    obj = JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+  if (!obj || typeof obj !== "object" || !obj.combiner || typeof obj.combiner !== "object") return null;
+  const drivers = Array.isArray(obj.drivers) ? obj.drivers.map((d) => String(d)) : [];
+  const dependencies = Array.isArray(obj.dependencies)
+    ? obj.dependencies
+        .map((d) => d as Record<string, unknown>)
+        .filter((d) => d && typeof d === "object" && "id1" in d && "id2" in d && Number.isFinite(Number(d.rho)))
+        .map((d) => ({ id1: String(d.id1), id2: String(d.id2), rho: Number(d.rho) }))
+    : [];
+  return { drivers, combiner: obj.combiner as CombinerNode, dependencies, rationale: String(obj.rationale ?? "").slice(0, 600) };
+}
+
+const COMBINER_OPS = new Set(["driver", "and", "or", "threshold", "sum", "weighted_sum", "max", "min", "argmax", "conditional_table"]);
+
+/**
+ * Recursively validate a raw combiner tree against the grounded driver ids:
+ * unknown ops, malformed children, or any leaf referencing a non-grounded
+ * driver collapse the whole tree to null (the simulation is then dropped). A
+ * pruned tree would silently change the structure's meaning, so reject instead.
+ * `binaryIds` is the subset of grounded drivers with a binary marginal — a
+ * conditional_table's branch driver must be one of these, so the 0/1 branch is
+ * exact (a continuous driver's raw value vs 0.5 would be a silent miscompare).
+ */
+function sanitizeCombiner(node: unknown, validIds: Set<string>, binaryIds: Set<string>): CombinerNode | null {
+  if (!node || typeof node !== "object") return null;
+  const n = node as Record<string, unknown>;
+  const op = String(n.op ?? "");
+  if (!COMBINER_OPS.has(op)) return null;
+  if (op === "driver") return validIds.has(String(n.id)) ? { op, id: String(n.id) } : null;
+  if (op === "threshold") {
+    const child = sanitizeCombiner(n.child, validIds, binaryIds);
+    return child && Number.isFinite(Number(n.above)) ? { op, child, above: Number(n.above) } : null;
+  }
+  if (op === "conditional_table") {
+    if (!binaryIds.has(String(n.conditionDriver))) return null; // branch must be a binary driver
+    const ifTrue = sanitizeCombiner(n.ifTrue, validIds, binaryIds);
+    const ifFalse = sanitizeCombiner(n.ifFalse, validIds, binaryIds);
+    return ifTrue && ifFalse ? { op, conditionDriver: String(n.conditionDriver), ifTrue, ifFalse } : null;
+  }
+  // and / or / sum / max / min / argmax / weighted_sum — children arrays
+  if (!Array.isArray(n.children) || !n.children.length) return null;
+  const children = n.children.map((c) => sanitizeCombiner(c, validIds, binaryIds));
+  if (children.some((c) => c === null)) return null;
+  const kids = children as CombinerNode[];
+  if (op === "weighted_sum") {
+    const weights = Array.isArray(n.weights) ? n.weights.map((w) => Number(w)) : kids.map(() => 1);
+    if (weights.length !== kids.length || weights.some((w) => !Number.isFinite(w))) return null;
+    return { op, children: kids, weights };
+  }
+  return { op: op as "and" | "or" | "sum" | "max" | "min" | "argmax", children: kids };
+}
+
+export interface SimStructureValidation {
+  ok: boolean;
+  drivers: SimDriver[];
+  spec?: CombinerSpec;
+  deps: DriverCorrelation[];
+  /** Driver handles the LLM named that aren't in the grounded catalog. */
+  dropped: string[];
+  reason?: string;
+}
+
+/**
+ * The grounding gate: keep only drivers that exist in the engine-built catalog,
+ * validate the combiner against that grounded set, and drop dependency edges
+ * that touch a non-grounded driver. The LLM cannot smuggle in a bare number —
+ * every driver's marginal is taken from the catalog, never the proposal.
+ * Requires ≥2 grounded drivers and a combiner that resolves entirely within
+ * them, or the simulation is rejected (headline untouched).
+ */
+export function validateSimStructure(
+  proposal: SimStructure,
+  catalog: SimDriver[],
+  kind: ForecastKind,
+  mcOptions?: string[]
+): SimStructureValidation {
+  const byId = new Map(catalog.map((d) => [d.id, d]));
+  const groundedIds = new Set(proposal.drivers.filter((id) => byId.has(id)));
+  const dropped = proposal.drivers.filter((id) => !byId.has(id));
+  const drivers = [...groundedIds].map((id) => byId.get(id)!);
+  if (drivers.length < 2) return { ok: false, drivers, deps: [], dropped, reason: "fewer than 2 grounded drivers survived" };
+  const binaryIds = new Set(drivers.filter((d) => d.marginal.kind === "binary").map((d) => d.id));
+  const root = sanitizeCombiner(proposal.combiner, groundedIds, binaryIds);
+  if (!root) return { ok: false, drivers, deps: [], dropped, reason: "combiner referenced ungrounded drivers or was malformed" };
+  const deps = proposal.dependencies.filter(
+    (d) => groundedIds.has(d.id1) && groundedIds.has(d.id2) && d.id1 !== d.id2 && Number.isFinite(d.rho)
+  );
+  return { ok: true, drivers, spec: { kind, root, ...(mcOptions ? { mcOptions } : {}) }, deps, dropped };
+}
+
+/** Weighted per-quantile blend of two distributions (Vincent-style), kept monotone. w=0 → a, w=1 → b. */
+export function blendQuantiles(a: Quantiles, b: Quantiles, w: number): Quantiles {
+  const wc = Math.min(1, Math.max(0, w));
+  const out: Partial<Record<keyof Quantiles, number>> = { ...a };
+  for (const { key } of QUANTILE_TAUS) {
+    const av = a[key];
+    const bv = b[key];
+    if (typeof av === "number" && typeof bv === "number") out[key] = (1 - wc) * av + wc * bv;
+  }
+  return monotoneQuantiles(out) ?? a;
+}
+
+/** Per-option log-odds blend of two mc distributions, renormalized to the simplex. w=0 → a, w=1 → b. */
+export function blendOptionProbs(a: Record<string, number>, b: Record<string, number>, w: number): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const opt of Object.keys(a)) out[opt] = blendWithMarket(clampProb(a[opt] ?? 0.01), clampProb(b[opt] ?? 0.01), w);
+  const sum = Object.values(out).reduce((s, v) => s + v, 0) || 1;
+  for (const opt of Object.keys(out)) out[opt] = out[opt] / sum;
+  return out;
+}
+
+/** Simulation starts with ZERO headline influence — pure cross-check until the ledger earns it trust. */
+export const DEFAULT_SIM_WEIGHT = 0;
+/** A newer, less-tested signal than the market anchor (20) — demand more resolved evidence before any blend. */
+export const MIN_SIM_WEIGHT_N = 30;
+/** The simulation never dominates the panel: its blend weight is capped. */
+export const SIM_WEIGHT_CAP = 0.3;
+
+/**
+ * Fit the simulation blend weight on the resolved track record, per kind — the
+ * w that would have minimized the proper score re-blending each entry's stored
+ * pre-sim headline with its stored simulated value. Mirrors chooseMarketWeight.
+ * Falls back to 0 (no influence) below MIN_SIM_WEIGHT_N — the simulation earns
+ * its seat exactly the way the market anchor and recalibration do.
+ */
+export function chooseSimulationWeight(entries = loadLedger(), kind: ForecastKind = "binary", fallback = DEFAULT_SIM_WEIGHT): number {
+  const grid = (score: (w: number) => number): number => {
+    let bestW = fallback;
+    let bestLoss = Infinity;
+    for (let i = 0; i <= 6; i++) {
+      const w = (i / 6) * SIM_WEIGHT_CAP; // 0 .. SIM_WEIGHT_CAP in 7 steps
+      const loss = score(w);
+      if (loss < bestLoss - 1e-12) {
+        bestLoss = loss;
+        bestW = Number(w.toFixed(3));
+      }
+    }
+    return bestW;
+  };
+  if (kind === "binary") {
+    // No !simBlendWeight guard needed here (unlike numeric/mc): the binary
+    // pre-sim headline is preserved in the components chain (extremized →
+    // blended → recalibrated), which the simulation blend never mutates — it
+    // only overwrites agg.probability. So `pre` below is always the honest
+    // pre-sim value even on entries that were later blended; the fit is not
+    // circular, and including those entries gives the fit more data.
+    const usable = entries.filter(
+      (e) =>
+        e.question.kind === "binary" &&
+        e.resolution &&
+        (e.resolution.outcome === 0 || e.resolution.outcome === 1) &&
+        typeof e.aggregate.components?.simulated === "number"
+    );
+    if (usable.length < MIN_SIM_WEIGHT_N) return fallback;
+    return grid((w) =>
+      usable.reduce((s, e) => {
+        const c = e.aggregate.components!;
+        const pre = c.recalibrated ?? c.blended ?? c.extremized ?? e.aggregate.probability ?? 0.5;
+        return s - logScore(blendWithMarket(pre, c.simulated!, w), e.resolution!.outcome as 0 | 1);
+      }, 0) / usable.length
+    );
+  }
+  if (kind === "numeric" || kind === "date") {
+    const usable = entries.filter(
+      (e) =>
+        (e.question.kind === "numeric" || e.question.kind === "date") &&
+        e.resolution &&
+        typeof e.resolution.outcome === "number" &&
+        e.aggregate.components?.simulatedQ &&
+        e.aggregate.quantiles &&
+        !e.aggregate.components?.simBlendWeight // only entries whose stored headline is pre-sim
+    );
+    if (usable.length < MIN_SIM_WEIGHT_N) return fallback;
+    return grid((w) =>
+      usable.reduce(
+        (s, e) => s + pinballLoss(blendQuantiles(e.aggregate.quantiles!, e.aggregate.components!.simulatedQ!, w), e.resolution!.outcome as number),
+        0
+      ) / usable.length
+    );
+  }
+  // mc
+  const usable = entries.filter(
+    (e) =>
+      e.question.kind === "mc" &&
+      e.resolution &&
+      typeof e.resolution.outcome === "string" &&
+      e.resolution.outcome !== "void" &&
+      e.aggregate.components?.simulatedOptionProbs &&
+      e.aggregate.optionProbs &&
+      !e.aggregate.components?.simBlendWeight
+  );
+  if (usable.length < MIN_SIM_WEIGHT_N) return fallback;
+  return grid((w) =>
+    usable.reduce(
+      (s, e) => s - mcLogScore(blendOptionProbs(e.aggregate.optionProbs!, e.aggregate.components!.simulatedOptionProbs!, w), e.resolution!.outcome as string),
+      0
+    ) / usable.length
+  );
+}
+
+/** Sim-on vs sim-off split of the resolved ledger for the backtest readout (descriptive — questions vary in difficulty). */
+export interface SimulationLedgerSummary {
+  onN: number;
+  offN: number;
+  /** Mean Brier of the published binary headline, by group (null when a group is empty). */
+  onBrier: number | null;
+  offBrier: number | null;
+}
+
+export function simulationLedgerSummary(entries = loadLedger()): SimulationLedgerSummary {
+  const on: number[] = [];
+  const off: number[] = [];
+  for (const e of entries) {
+    if (e.question.kind !== "binary" || !e.resolution) continue;
+    const o = e.resolution.outcome;
+    if (o !== 0 && o !== 1) continue;
+    const p = e.aggregate.probability;
+    if (typeof p !== "number") continue;
+    (e.simulationRan ? on : off).push(brierScore(p, o));
+  }
+  const mean = (xs: number[]) => (xs.length ? xs.reduce((s, v) => s + v, 0) / xs.length : null);
+  return { onN: on.length, offN: off.length, onBrier: mean(on), offBrier: mean(off) };
+}
+
 // ---------------------------------------------------------------- analytical gate
 
 /**
@@ -1035,6 +1294,8 @@ export interface LedgerCreated {
    */
   setId?: string;
   brief?: string;
+  /** The scenario-simulation stage ran for this forecast — lets backtests stratify sim-on vs sim-off. */
+  simulationRan?: boolean;
   /**
    * The ledger id this forecast supersedes (a trigger-driven re-forecast of
    * the same question). Both ends of the chain still resolve and score — that
@@ -1060,6 +1321,23 @@ export interface LedgerResolved {
   pinball?: number;
 }
 
+/**
+ * A patch to an already-created entry, keyed by the same id. Lets the engine
+ * write the base forecast record durably (inline, at aggregation) and then,
+ * after the best-effort scenario-simulation stage, append the sim-augmented
+ * aggregate without a second "created" record (which would double-count) and
+ * without widening the crash window — a crash before this patch simply leaves
+ * the clean, sim-less base record intact.
+ */
+export interface LedgerUpdated {
+  v: 1;
+  rec: "updated";
+  id: string;
+  t: number;
+  aggregate: AggregateForecast;
+  simulationRan?: boolean;
+}
+
 export interface LedgerEntry extends Omit<LedgerCreated, "rec"> {
   resolution?: LedgerResolved;
 }
@@ -1072,7 +1350,7 @@ export function ledgerPath(): string {
   return path.join(forecastsDir(), "ledger.jsonl");
 }
 
-export function appendLedger(rec: LedgerCreated | LedgerResolved): void {
+export function appendLedger(rec: LedgerCreated | LedgerResolved | LedgerUpdated): void {
   ensureDir(forecastsDir());
   fs.appendFileSync(ledgerPath(), JSON.stringify(rec) + "\n", "utf8");
 }
@@ -1093,7 +1371,7 @@ export function loadLedger(): LedgerEntry[] {
   const entries = new Map<string, LedgerEntry>();
   for (const line of raw.split("\n")) {
     if (!line.trim()) continue;
-    let rec: LedgerCreated | LedgerResolved;
+    let rec: LedgerCreated | LedgerResolved | LedgerUpdated;
     try {
       rec = JSON.parse(line);
     } catch {
@@ -1103,6 +1381,13 @@ export function loadLedger(): LedgerEntry[] {
     if (rec.rec === "created" && rec.question && rec.aggregate) {
       const { rec: _omit, ...rest } = rec;
       entries.set(rec.id, { ...rest, panel: Array.isArray(rec.panel) ? rec.panel : [] });
+    } else if (rec.rec === "updated") {
+      // Patch the base entry with the sim-augmented aggregate (best-effort).
+      const entry = entries.get(rec.id);
+      if (entry && rec.aggregate) {
+        entry.aggregate = rec.aggregate;
+        if (rec.simulationRan) entry.simulationRan = true;
+      }
     } else if (rec.rec === "resolved") {
       const entry = entries.get(rec.id);
       if (entry) entry.resolution = rec;
@@ -1416,8 +1701,8 @@ export interface BacktestReport {
   skipped: { nonBinary: number; noPanel: number };
 }
 
-/** Deterministic PRNG (mulberry32) so bootstrap CIs are reproducible. */
-function mulberry32(seed: number): () => number {
+/** Deterministic PRNG (mulberry32) so bootstrap CIs — and the scenario simulation — are reproducible. */
+export function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
   return () => {
     a |= 0;

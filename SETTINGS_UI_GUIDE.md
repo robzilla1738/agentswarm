@@ -178,6 +178,7 @@ Forecast runs (`swarm forecast`) put an independent forecaster panel behind ever
 - **Max sub-forecasts**: 1-8 (default 6) — cap when an open-ended question decomposes
 - **Coherence probe** (toggle, default on) — engine re-asks the question inverted and folds the flipped answer into the panel (counters affirmative-framing bias)
 - **Decompose open questions** (toggle, default on) — fan an open-ended question into several resolvable sub-forecasts; `swarm forecast --single` overrides per run
+- **Scenario simulation** (toggle, default off; auto-on for decomposed questions) — grounded Monte Carlo over the sub-forecasts as correlated drivers: ranked scenarios + a driver tornado, a bottom-up cross-check that earns headline weight only once 30 simulated forecasts resolve. `swarm forecast --simulate` forces it per run
 
 ### API keys (all optional, free):
 - **FRED API key** — economic time series (`time_series` tool) · fred.stlouisfed.org

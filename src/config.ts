@@ -56,6 +56,13 @@ export interface SwarmConfig {
   /** Forecast mode: engine-run inverted-framing probe joins the panel (de-biases affirmative framing). */
   forecastCoherenceProbe: boolean;
   /**
+   * Forecast mode: run the grounded scenario simulation (forward Monte Carlo
+   * over the sub-forecasts/markets/base-rates) as a cross-check. Auto-runs on
+   * decomposed questions regardless; this forces it on single questions too.
+   * `--simulate` overrides per run.
+   */
+  forecastSimulate: boolean;
+  /**
    * Forecast mode: base weight of the mechanical market anchor — the engine
    * blends the panel aggregate toward a verified matching market price in
    * log-odds space, scaled by the market's liquidity. 0 disables anchoring.
@@ -170,6 +177,7 @@ export const DEFAULTS: SwarmConfig = {
   forecastPanelSize: 5,
   forecastExtremizeK: 2.5,
   forecastCoherenceProbe: true,
+  forecastSimulate: false,
   forecastMarketWeight: 0.4,
   forecastDecompose: true,
   forecastMaxSubQuestions: 6,
@@ -381,6 +389,7 @@ export const SETTABLE_KEYS: (keyof SwarmConfig)[] = [
   "forecastPanelSize",
   "forecastExtremizeK",
   "forecastCoherenceProbe",
+  "forecastSimulate",
   "forecastMarketWeight",
   "forecastDecompose",
   "forecastMaxSubQuestions",
@@ -451,7 +460,7 @@ export function coerceConfigValue(key: keyof SwarmConfig, raw: unknown): unknown
     if (!Number.isFinite(n)) throw new Error(`${key} must be a number`);
     return Math.min(floatRange[1], Math.max(floatRange[0], n));
   }
-  if (key === "thinking" || key === "safeMode" || key === "forecastCoherenceProbe" || key === "forecastDecompose") {
+  if (key === "thinking" || key === "safeMode" || key === "forecastCoherenceProbe" || key === "forecastSimulate" || key === "forecastDecompose") {
     if (typeof raw === "boolean") return raw;
     return raw === "true" || raw === "1" || raw === "on";
   }

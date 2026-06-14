@@ -321,6 +321,20 @@ export class RunState {
         }
         break;
       }
+      case "forecast.simulated": {
+        // Restore the post-simulation aggregate (carries simulationResult and
+        // any earned headline blend). On resume this lets the executor's
+        // idempotence gate skip re-running the simulation, and feeds the
+        // synthesizer the scenario block.
+        const agg = ev.aggregate as AggregateForecast | undefined;
+        const qid = typeof ev.questionId === "string" ? ev.questionId : (this.questions[0]?.id ?? "sf1");
+        const existing = this.aggregates.findIndex((a) => a.questionId === qid);
+        if (agg && existing >= 0) {
+          this.aggregates[existing] = { ...this.aggregates[existing], aggregate: agg };
+          if (existing === 0) this.aggregate = agg;
+        }
+        break;
+      }
       case "run.final":
         this.finalSummary = ev.summary as string;
         this.finalReportPath = ev.reportPath as string | undefined;

@@ -621,6 +621,19 @@ const server = http.createServer((req, res) => {
           { usage: { prompt_tokens: 60, completion_tokens: 80 } },
         ]);
       }
+      // Scenario simulation: propose a grounded structure over the OTHER
+      // sub-forecasts (sf_sf2, sf_sf3 are the catalog handles when targeting sf1).
+      if (/designing the STRUCTURE of a Monte Carlo scenario simulation/.test(lu) && SCENARIO === "forecast-multi") {
+        return sse(res, [
+          textChunk(JSON.stringify({
+            drivers: ["sf_sf2", "sf_sf3"],
+            combiner: { op: "and", children: [{ op: "driver", id: "sf_sf2" }, { op: "driver", id: "sf_sf3" }] },
+            dependencies: [{ id1: "sf_sf2", id2: "sf_sf3", rho: 0.3 }],
+            rationale: "A requires both B and C in the test domain.",
+          })),
+          { usage: { prompt_tokens: 50, completion_tokens: 40 } },
+        ]);
+      }
       if (/sharpening a forecasting question/.test(lu)) {
         return sse(res, [
           textChunk(JSON.stringify({

@@ -572,6 +572,7 @@ export function publicConfig(cfg: SwarmConfig) {
     forecastMarketWeight: cfg.forecastMarketWeight,
     forecastDecompose: cfg.forecastDecompose,
     forecastMaxSubQuestions: cfg.forecastMaxSubQuestions,
+    forecastSimulate: cfg.forecastSimulate,
     knownModels,
     pricing: cfg.pricing,
   };

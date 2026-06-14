@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.16.0
+
+Grounded scenario simulation: a forward Monte Carlo that turns a decomposed forecast's sub-forecasts into correlated drivers, ranks the scenarios, and cross-checks the headline — earning weight only on the resolved ledger. No breaking changes; the headline never moves until the ledger proves the simulation helps.
+
+### What it does
+- **`swarm forecast … --simulate`** (automatic on decomposed questions) runs a new engine-owned stage after aggregation. It treats each grounded signal — a sub-forecast's aggregated distribution, the verified market price, and (only as a single-question fallback) panel base rates — as a random variable whose marginal is *already computed*. The model proposes the **structure only**; the engine does the math.
+- **The model never supplies a number.** It returns a closed JSON combiner tree (`and`/`or`/`threshold`/`sum`/`weighted_sum`/`max`/`min`/`argmax`/`conditional_table`) over driver *handles* plus pairwise correlations. A **grounding gate** (`validateSimStructure`) drops any driver or combiner leaf that points outside the engine-built catalog and rejects the whole simulation below two grounded drivers — so a bare probability cannot be smuggled in.
+- **Ranked scenarios + a driver tornado** fall out of one sample: worlds are clustered by their driver-fired pattern (the modal world is "the winning scenario"), and first-order sensitivity is the **correlation ratio η²** over quantile bins (exact for binary drivers, nonlinear-aware for continuous). A bottom-up/top-down **coherence check** flags when the simulation diverges from the panel. The report renders a "Scenario analysis" section with both charts.
+- **Earns the headline like every other layer.** The blend weight defaults to **zero** — a pure cross-check — and is fitted on the resolved ledger (per kind: log score for binary/mc, pinball for numeric/date) only once **30** resolved simulated forecasts exist, capped at **0.30** so the simulation never dominates the panel. `swarm backtest` stratifies sim-on vs sim-off.
+
+### Math & correctness
+- **Gaussian copula** over the driver marginals: an LLM-proposed correlation matrix is clamped, repaired to positive-definite by diagonal loading when inconsistent, Cholesky-factored once, and applied to Box-Muller normals. Marginals are inverted from each driver's existing piecewise-linear quantile function (`normInv` + single-quantile CDF inversion), in log space for right-skewed positives.
+- **Sign consistency across mixed driver kinds**: every marginal maps high latent *z* → high value, so a binary driver fires on high *z* (not low) like a numeric value rises with *z*. A positive specified correlation between a binary and a numeric driver now realizes as positive co-movement, as the prompt promises — not its negation. (Regression-tested through the copula.)
+- **Multiple-choice is modeled by a random-utility `argmax`** (the top-scoring option wins each world), and out-of-range draws are clamped into the option set so none is silently dropped against a fixed denominator.
+- **Coherence scales by the panel's own spread** (p10–p90 width), not |p50|, so a zero-centered quantity (anomalies, net change, margins) no longer reads as infinitely divergent.
+
+### Durability
+- The base ledger record is still written **inline** before the simulation's model call (crash-safe), and the simulation appends an **`updated` patch** that `loadLedger` merges — a crash mid-simulation leaves a clean, sim-less forecast rather than nothing. The post-sim aggregate is journaled (`forecast.simulated`) and restored by the state reducer, with a stage-level idempotence guard so a resumed run never starts a second simulation.
+
 ## 0.15.0
 
 Calibrated interval forecasts, a fix for the spurious multiple-choice "Other", and charts that render in the app. No breaking changes.

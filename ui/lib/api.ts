@@ -107,6 +107,7 @@ export interface PublicConfig {
   forecastMarketWeight: number;
   forecastDecompose: boolean;
   forecastMaxSubQuestions: number;
+  forecastSimulate: boolean;
   knownModels: string[];
   pricing: Record<string, { inMiss: number; inHit: number; out: number }>;
 }

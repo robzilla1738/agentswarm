@@ -128,6 +128,16 @@ export interface AggregateComponents {
   blended?: number;
   /** After ledger-fitted recalibration — when present, this is the headline. */
   recalibrated?: number;
+  /** Scenario-simulation bottom-up headline (binary/mc) — a cross-check, blended only once it earns weight. */
+  simulated?: number;
+  /** Scenario-simulation bottom-up quantiles (numeric/date) — the interval cross-check. */
+  simulatedQ?: Quantiles;
+  /** Scenario-simulation bottom-up per-option probabilities (mc) — the cross-check. */
+  simulatedOptionProbs?: Record<string, number>;
+  /** Divergence between the simulation and the panel headline (log-odds distance for binary; relative for numeric). */
+  simDivergence?: number;
+  /** The simulation blend weight actually applied to the headline (0 until the ledger earns it trust). */
+  simBlendWeight?: number;
 }
 
 /** Deterministic combination of the panel (computed in code, never by an LLM). */
@@ -163,6 +173,122 @@ export interface AggregateForecast {
   evidenceOverlap?: number;
   /** The aggregation chain layer by layer (binary questions). */
   components?: AggregateComponents;
+  /** Scenario-simulation output (scenarios + tornado + coherence), when the simulation stage ran. */
+  simulationResult?: SimulationResult;
+}
+
+// ---------------------------------------------------------------- scenario simulation
+
+/**
+ * Where a simulation driver's marginal distribution comes from — every option
+ * is a deterministic-math output, never a number the LLM invented. The engine
+ * builds the catalog; the LLM may only reference it.
+ */
+export type DriverSourceKind = "sub-forecast" | "market" | "base-rate" | "ols-trend";
+
+/** Provenance receipt for one driver's marginal — what grounds it. */
+export interface DriverProvenance {
+  kind: DriverSourceKind;
+  /** sub-forecast → the question id; market → the URL; base-rate → the source text; ols-trend → the series. */
+  ref: string;
+  /** Human-readable label for display. */
+  label: string;
+}
+
+/** A driver's marginal distribution and how it is sampled. */
+export type DriverMarginal =
+  | { kind: "binary"; probability: number }
+  | { kind: "quantiles"; quantiles: Quantiles; logSpace?: boolean }
+  | { kind: "trend"; lo: number; projected: number; hi: number };
+
+/** One grounded simulation driver (a random variable in the Monte Carlo). */
+export interface SimDriver {
+  /** Stable handle the combiner and dependency edges reference (e.g. "sf_sf1", "mkt_0"). */
+  id: string;
+  label: string;
+  marginal: DriverMarginal;
+  provenance: DriverProvenance;
+  /** Numeric/trend drivers: the value above which the driver "fires" for scenario clustering. */
+  threshold?: number;
+}
+
+/**
+ * The combiner DSL: a closed node set the LLM proposes (shape only) and
+ * `evalCombiner` executes (the math). No free code — every leaf is a driver id.
+ */
+export type CombinerNode =
+  | { op: "driver"; id: string }
+  | { op: "and"; children: CombinerNode[] }
+  | { op: "or"; children: CombinerNode[] }
+  | { op: "threshold"; child: CombinerNode; above: number }
+  | { op: "sum"; children: CombinerNode[] }
+  | { op: "weighted_sum"; children: CombinerNode[]; weights: number[] }
+  | { op: "max"; children: CombinerNode[] }
+  | { op: "min"; children: CombinerNode[] }
+  // Random-utility categorical selection (mc): returns the index of the
+  // highest-scoring child — one child per option, in option order.
+  | { op: "argmax"; children: CombinerNode[] }
+  | { op: "conditional_table"; conditionDriver: string; ifTrue: CombinerNode; ifFalse: CombinerNode };
+
+/** Top-level combiner spec: the tree plus how its output reads into the outcome space. */
+export interface CombinerSpec {
+  kind: ForecastKind;
+  root: CombinerNode;
+  /** mc only: option labels in order (the root yields an option index per draw). */
+  mcOptions?: string[];
+}
+
+/** A pairwise correlation between two drivers in standard-normal (Gaussian-copula) space. */
+export interface DriverCorrelation {
+  id1: string;
+  id2: string;
+  /** Pearson correlation in Z-space, clamped to [-1, 1]; positive = they tend to fire together. */
+  rho: number;
+}
+
+/** One scenario cluster — a distinct pattern of which drivers fired, and its conditional outcome. */
+export interface ScenarioRow {
+  /** Driver-fired pattern key, e.g. "sf_sf1=1,sf_sf2=0". */
+  key: string;
+  /** Fraction of draws in this cluster [0,1]. */
+  frequency: number;
+  /** The conditional outcome distribution for draws in this cluster (canonical form). */
+  outcome: AggregateForecast;
+  /** Human-readable description built from driver labels. */
+  description: string;
+}
+
+/** First-order sensitivity of the outcome to one driver (tornado input). */
+export interface SensitivityIndex {
+  driverId: string;
+  driverLabel: string;
+  /**
+   * First-order correlation ratio η² in [0,1]: the share of outcome variance
+   * explained by the driver alone, estimated over quantile bins (exact for a
+   * binary driver; a proper first-order index — not a full Sobol decomposition,
+   * which would also attribute interaction variance).
+   */
+  varianceContribution: number;
+  /** |Pearson(driver value, outcome)| — a linear cross-check on the same sample. */
+  linearCorrelation: number;
+}
+
+/** The full output of one Monte Carlo scenario simulation. */
+export interface SimulationResult {
+  /** Bottom-up outcome aggregate in canonical form (binary prob / quantiles / optionProbs). */
+  simulatedAggregate: AggregateForecast;
+  N: number;
+  seed: number;
+  /** Top scenarios by frequency (modal first). */
+  scenarios: ScenarioRow[];
+  /** The most frequent scenario — "the winning one". */
+  modalScenario: ScenarioRow;
+  /** Drivers ranked by variance contribution (tornado order). */
+  sensitivity: SensitivityIndex[];
+  /** Divergence between the bottom-up simulation and the top-down panel aggregate. */
+  coherence: { divergence: number; verdict: "ok" | "moderate" | "high" };
+  /** The grounded drivers used, for display/provenance. */
+  drivers: { id: string; label: string; provenance: DriverProvenance }[];
 }
 
 /** Internal effort scale; mapped per provider at request time. */
@@ -195,6 +321,8 @@ export interface RunOptions {
   supersedes?: string;
   /** Forecast mode: force a single forecast (skip open-ended decomposition into sub-forecasts). */
   forecastSingle?: boolean;
+  /** Forecast mode: force the scenario-simulation stage on (it also auto-triggers on decomposable questions). */
+  forecastSimulate?: boolean;
   verification: Verification;
   thinking: boolean;
   reasoningEffort: ReasoningEffort;

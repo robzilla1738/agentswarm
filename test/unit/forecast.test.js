@@ -353,6 +353,28 @@ test("ledger: created→resolved reduction, latest resolution wins, malformed li
   assert.equal(b.resolution, undefined);
 });
 
+test("ledger: an 'updated' patch merges the sim-augmented aggregate onto the base entry", () => {
+  clearLedger();
+  const base = createdRec("f_sim");
+  appendLedger(base); // durable base record, pre-simulation (no sim fields)
+  // The simulation stage appends an 'updated' patch keyed to the same id.
+  const patched = {
+    ...base.aggregate,
+    components: { ...(base.aggregate.components ?? {}), simulated: 0.42, simBlendWeight: 0 },
+  };
+  appendLedger({ v: 1, rec: "updated", id: "f_sim", t: Date.now() + 1, aggregate: patched, simulationRan: true });
+
+  const entries = loadLedger();
+  // Still exactly ONE entry (no double-count from a second 'created').
+  assert.equal(entries.filter((e) => e.id === "f_sim").length, 1);
+  const e = entries.find((x) => x.id === "f_sim");
+  assert.equal(e.simulationRan, true);
+  assert.equal(e.aggregate.components.simulated, 0.42);
+  // An 'updated' for an unknown id is ignored, never crashes.
+  appendLedger({ v: 1, rec: "updated", id: "f_ghost", t: Date.now(), aggregate: patched, simulationRan: true });
+  assert.equal(loadLedger().some((x) => x.id === "f_ghost"), false);
+});
+
 test("dueForecasts: open entries past their resolution day (end of day UTC)", () => {
   clearLedger();
   appendLedger(createdRec("f_due", { question: { ...QUESTION, resolutionDate: "2020-01-01" } }));

@@ -1,6 +1,6 @@
 import * as os from "os";
 import { daysToIso } from "./forecast";
-import { AggregateForecast, ForecastQuestion, RunMeta, Task } from "./types";
+import { AggregateForecast, ForecastQuestion, RunMeta, SimDriver, SimulationResult, Task } from "./types";
 import { clip, fmtTokens } from "./util";
 
 // ============================================================ conductor
@@ -439,20 +439,21 @@ ${calibration ? `\n${calibration}\nSteer the panels accordingly.` : ""}`;
  * block carries the exact computed numbers; the synthesizer's job is the
  * prose around them, never the arithmetic.
  */
-export function forecastSynthAddendum(aggregateBlock: string, count = 1, brief = ""): string {
+export function forecastSynthAddendum(aggregateBlock: string, count = 1, brief = "", simBlock = ""): string {
+  const sim = simBlock ? `\n${simBlock}\n` : "";
   if (count > 1) {
     return `
 FORECAST DELIVERABLE (${count} SUB-FORECASTS)
 This open-ended mission was decomposed into ${count} independently-resolvable sub-forecasts. The engine already aggregated each panel mechanically. THESE NUMBERS ARE FINAL — use them exactly as given (no recomputing, re-rounding, or averaging):
 
 ${aggregateBlock}
-
+${sim}
 Structure report_markdown:
 1. # <the operator's original question>
 2. ${brief ? `Open with the brief: "${brief}". Then a` : "A"} \`\`\`chart stat block summarizing the sub-forecasts (one item per sub-forecast with its headline number), then one or two sentences answering the overall question by weaving the sub-forecasts together — what they jointly imply.
 3. A "## <sub-forecast question>" section for EACH sub-forecast: its headline number, resolution criteria + date verbatim, a one-line panel table (method | forecast | rationale), and key drivers / what would change it. Keep every number exactly as the engine gave it.
-4. ## How these fit together — the integrated picture, tensions between sub-forecasts, and what to watch.
-5. ## Sources — as usual.
+4. ## How these fit together — the integrated picture, tensions between sub-forecasts, and what to watch.${simBlock ? "\n5. ## Scenario analysis — render the scenario simulation: a ```chart bar block of the top scenarios (label → P(YES|scenario) or conditional value), a ```chart bar tornado of driver sensitivity, and a paragraph reading the dominant scenario. The simulation EXPLAINS the headline; never let it override the engine numbers above." : ""}
+${simBlock ? "6" : "5"}. ## Sources — as usual.
 Where the red-team found problems, say honestly how they were (or weren't) addressed.`;
   }
   return `
@@ -460,18 +461,126 @@ FORECAST DELIVERABLE
 This was a forecast mission. The engine already aggregated the panel mechanically. THESE NUMBERS ARE FINAL — use them exactly as given (no recomputing, re-rounding, or averaging):
 
 ${aggregateBlock}
-
+${sim}
 Structure report_markdown for a forecast:
 1. # <the question>
 2. Open with a \`\`\`chart stat block headlining the forecast (e.g. {"type":"stat","items":[{"label":"P(YES) — ensemble","value":"68%"},{"label":"Panel median","value":"70%"},{"label":"Panel","value":"5 forecasters"}]}), then state the forecast in one plain-language sentence.
 3. ## Resolution criteria — the criteria and date, verbatim.
 4. ## The panel — a markdown table: method | forecast | core rationale (one line each). Note the spread and what disagreement, if any, was about.
 5. ## Key drivers — the factors the forecast is most sensitive to.
-6. ## Scenarios — a table of the main ways the question resolves each way, with rough likelihood bands consistent with the headline number.
+6. ## Scenarios — ${simBlock ? "render the scenario simulation: a ```chart bar block of the top scenarios (each scenario label → its conditional outcome) and a ```chart bar tornado of driver sensitivity (which condition moves the outcome most), then read the dominant ('winning') scenario in prose. Keep the headline number exactly as the engine gave it — the simulation explains it." : "a table of the main ways the question resolves each way, with rough likelihood bands consistent with the headline number."}
 7. ## What would change this forecast — the panel's update triggers: concrete, observable, with direction.
 8. ## Market comparison — what the prediction markets/crowds say vs the ensemble, and why they differ (if they do).
 9. ## Sources — as usual.
 Where the red-team found problems, say honestly how they were (or weren't) addressed.`;
+}
+
+/** Render one driver's grounded marginal headline for the structure prompt / display. */
+function driverHeadline(d: SimDriver): string {
+  const pct = (p: number) => `${Math.round(p * 100)}%`;
+  if (d.marginal.kind === "binary") return `P=${pct(d.marginal.probability)}`;
+  if (d.marginal.kind === "quantiles") {
+    const q = d.marginal.quantiles;
+    return `p10/p50/p90 = ${round3(q.p10)} / ${round3(q.p50)} / ${round3(q.p90)}`;
+  }
+  return `~${round3(d.marginal.projected)} (80% ${round3(d.marginal.lo)}–${round3(d.marginal.hi)})`;
+}
+
+function round3(v: number): number | string {
+  if (!Number.isFinite(v)) return v;
+  const a = Math.abs(v);
+  return a >= 1000 || a === 0 ? Math.round(v) : Number(v.toPrecision(3));
+}
+
+/**
+ * Elicit the simulation STRUCTURE from the model — drivers, a combiner DSL
+ * tree, and pairwise dependencies. The model supplies SHAPE ONLY: every driver
+ * marginal is taken from the grounded catalog below (never the model's
+ * numbers), and the engine runs the Monte Carlo deterministically.
+ */
+export function simStructurePrompt(q: ForecastQuestion, drivers: SimDriver[], evidence: string): string {
+  const catalog = drivers.map((d) => `  "${d.id}" — ${d.label} [${d.provenance.kind}] · headline ${driverHeadline(d)}`).join("\n");
+  const optionLeaf =
+    q.kind === "mc"
+      ? `\nFor this MULTIPLE-CHOICE question the combiner picks ONE option per world. Prefer {"op":"argmax","children":[<score for option 0>, <score for option 1>, ...]} — one score sub-tree per option, IN THE ORDER ${JSON.stringify(q.options ?? [])}; the highest-scoring option wins that world. (You may also build a conditional_table/threshold tree that evaluates to the 0-based option index.)`
+      : q.kind === "binary"
+        ? `\nFor this BINARY question the combiner must evaluate to YES(1)/NO(0): use and / or / threshold nodes.`
+        : `\nFor this NUMERIC/DATE question the combiner must evaluate to the OUTCOME VALUE: use sum / weighted_sum / conditional_table over the driver values.`;
+  return `You are designing the STRUCTURE of a Monte Carlo scenario simulation. You supply the shape only — NOT any probabilities or values. The engine already computed each driver's grounded distribution (shown below) and will run tens of thousands of correlated draws itself.
+
+${questionBlock(q)}
+
+GROUNDED DRIVER CATALOG — the ONLY valid driver handles (each marginal is fixed by the engine; you may not invent drivers or numbers):
+${catalog}
+
+EVIDENCE GATHERED BY THE PANEL (context only):
+${evidence || "(none)"}
+
+Reply with ONLY a JSON object (no prose, no fence):
+{
+  "drivers": ["<handles from the catalog you want in the simulation>"],
+  "combiner": <a DSL node: how the drivers combine into the outcome>,
+  "dependencies": [{"id1":"<handle>","id2":"<handle>","rho":<-1..1>}],
+  "rationale": "one sentence on the structure"
+}
+
+COMBINER DSL (a JSON tree; every leaf is {"op":"driver","id":"<handle>"}):
+- {"op":"and","children":[...]} / {"op":"or","children":[...]}  — all / any of the (binary) children fire
+- {"op":"threshold","child":<node>,"above":<number>}            — 1 if the child's value exceeds the threshold, else 0
+- {"op":"sum","children":[...]} / {"op":"weighted_sum","children":[...],"weights":[...]}
+- {"op":"max","children":[...]} / {"op":"min","children":[...]} / {"op":"argmax","children":[...]}
+- {"op":"conditional_table","conditionDriver":"<BINARY handle>","ifTrue":<node>,"ifFalse":<node>}  (conditionDriver MUST be a binary driver)
+${optionLeaf}
+
+RULES
+- Reference ONLY catalog handles — exact spelling. Use at least 2 drivers.
+- dependencies: list pairs of drivers that genuinely move together (rho>0) or oppose (rho<0); omit independent pairs. rho is a LATENT correlation in the copula's normal space — for binary drivers the realized co-occurrence is attenuated, so lean toward stronger values (±0.5 … ±0.9) when two events are tightly linked.
+- The structure must reflect the real causal/logical relationship the evidence supports — this is the part you contribute; the numbers are the engine's.`;
+}
+
+/**
+ * The simulation cross-check block handed to the synthesizer: the bottom-up
+ * headline, divergence flag, the modal ("winning") scenario, the top scenarios,
+ * and the tornado. Whether it influenced the headline depends on the weight.
+ */
+export function simulationBlock(q: ForecastQuestion, result: SimulationResult, weight: number): string {
+  const pct = (p: number) => `${Math.round(p * 100)}%`;
+  const sa = result.simulatedAggregate;
+  const headline =
+    q.kind === "binary"
+      ? `P(YES) = ${pct(sa.probability ?? 0.5)}`
+      : q.kind === "mc"
+        ? Object.entries(sa.optionProbs ?? {}).map(([o, p]) => `${o} ${pct(p)}`).join(", ")
+        : sa.quantiles
+          ? `p10/p50/p90 = ${round3(sa.quantiles.p10)} / ${round3(sa.quantiles.p50)} / ${round3(sa.quantiles.p90)}`
+          : "(no distribution)";
+  const lines = [
+    `SCENARIO SIMULATION (${result.N.toLocaleString()} grounded Monte Carlo draws, seed ${result.seed}) — ${
+      weight > 0 ? `blended into the headline at weight ${weight.toFixed(2)}` : "ZERO weight: a cross-check only, it did NOT change the headline"
+    }`,
+    `Bottom-up simulated outcome: ${headline}`,
+    `Coherence vs the panel: ${result.coherence.verdict} (divergence ${result.coherence.divergence.toFixed(3)})${
+      result.coherence.verdict === "high" ? " — ⚠ the simulation's structure disagrees materially with the panel; explain why" : ""
+    }`,
+  ];
+  if (result.modalScenario) {
+    lines.push(`Most likely scenario (${pct(result.modalScenario.frequency)} of worlds): ${result.modalScenario.description}`);
+  }
+  lines.push("Top scenarios by likelihood:");
+  for (const s of result.scenarios.slice(0, 5)) {
+    const out =
+      q.kind === "binary"
+        ? `P(YES|scenario)=${pct(s.outcome.probability ?? 0.5)}`
+        : q.kind === "mc"
+          ? Object.entries(s.outcome.optionProbs ?? {}).sort((a, b) => b[1] - a[1])[0]?.[0] ?? "?"
+          : `p50=${round3(s.outcome.quantiles?.p50 ?? NaN)}`;
+    lines.push(`  - [${pct(s.frequency)}] ${s.description} → ${out}`);
+  }
+  lines.push("Driver sensitivity (tornado — share of outcome variance):");
+  for (const s of result.sensitivity.slice(0, 5)) {
+    lines.push(`  - ${s.driverLabel}: ${pct(s.varianceContribution)}`);
+  }
+  return lines.join("\n");
 }
 
 /** One-shot question sharpener (forecast mode pre-step). Strict JSON out. */

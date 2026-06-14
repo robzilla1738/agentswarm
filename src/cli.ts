@@ -42,6 +42,7 @@ import {
   isoToDays,
   loadLedger,
   resolveLedgerEntry,
+  simulationLedgerSummary,
   supersededIds,
 } from "./forecast";
 import { TOURNAMENT_SOURCES, TournamentSource, listClosingQuestions } from "./datatools";
@@ -58,7 +59,7 @@ interface Args {
 
 /** Flags that never take a value — they must not swallow the next positional
  *  (`swarm run --fg "mission"` would otherwise eat the mission). */
-const BOOL_FLAGS = new Set(["fg", "open", "resume", "auto", "dry-run", "reforecast", "single"]);
+const BOOL_FLAGS = new Set(["fg", "open", "resume", "auto", "dry-run", "reforecast", "single", "simulate"]);
 
 function parseArgs(argv: string[]): Args {
   const _: string[] = [];
@@ -217,6 +218,9 @@ export function optionOverrides(flags: Args["flags"], cfg: SwarmConfig): Partial
   if (flags.panel) o.panelSize = numFlag("panel", "forecastPanelSize");
   // Forecast: --single forces one forecast (skip open-ended decomposition).
   if (flags.single === true || flags.single === "true") o.forecastSingle = true;
+  // Forecast: --simulate forces the grounded scenario simulation on (it also
+  // auto-runs on decomposed questions).
+  if (flags.simulate === true || flags.simulate === "true") o.forecastSimulate = true;
   if (typeof flags.sandbox === "string") {
     const v = flags.sandbox;
     if (v !== "auto" && !SANDBOX_KINDS.includes(v as SandboxKind)) {
@@ -968,6 +972,20 @@ function cmdBacktest(): void {
       ansi.gray(`\n  numeric/date: none resolved yet (${num.skipped.unresolved} unresolved) — interval tuning needs swarm resolve`)
     );
   }
+
+  // Scenario-simulation coverage: did binary forecasts that ran the simulation
+  // score differently from those that didn't? Descriptive only — questions vary
+  // in difficulty, so this is not a causal sim-on/sim-off comparison.
+  const sim = simulationLedgerSummary(ledger);
+  if (sim.onN) {
+    const fmt = (b: number | null) => (b === null ? "—" : b.toFixed(4));
+    console.log(
+      "\n" +
+        ansi.bold("scenario simulation") +
+        ansi.gray(`  (binary forecasts; sim-on=${sim.onN}, sim-off=${sim.offN} — descriptive, not causal)`)
+    );
+    console.log(`  sim-on  mean Brier: ${fmt(sim.onBrier)}   sim-off mean Brier: ${fmt(sim.offBrier)}`);
+  }
 }
 
 // ---------------------------------------------------------------- config / models
@@ -1129,11 +1147,13 @@ function printHelp(): void {
 
 ${b("USAGE")}
   swarm run "<mission>" [options]     decompose & execute a mission with a parallel swarm
-  swarm forecast "<question>" [--by YYYY-MM-DD] [--panel N] [--single]
+  swarm forecast "<question>" [--by YYYY-MM-DD] [--panel N] [--single] [--simulate]
                                       forecast an event: research waves + an independent
                                       forecaster panel, aggregated into a calibrated probability.
                                       open-ended questions ("what will happen with X?") fan out
-                                      into several resolvable sub-forecasts; --single forces one
+                                      into several resolvable sub-forecasts; --single forces one.
+                                      --simulate runs a grounded scenario Monte Carlo (auto on
+                                      decomposed questions): ranked scenarios + a driver tornado
   swarm serve [--port 7777] [--open]  start the mission-control web UI + API
   swarm watch <id>                    attach a live dashboard to a run
   swarm resume <id> [--fg]            resume an interrupted run (done tasks keep their results)

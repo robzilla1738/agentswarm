@@ -36,6 +36,8 @@ import {
   questionBlock,
   reportBlock,
   sharpenQuestionPrompt,
+  simStructurePrompt,
+  simulationBlock,
   synthCheckPrompt,
   synthSystem,
   SYNTH_KICKOFF,
@@ -52,11 +54,14 @@ import {
   appendLedger,
   applyQuantileDilation,
   applyRecalibration,
+  blendOptionProbs,
+  blendQuantiles,
   blendWithMarket,
   calibrationBlock,
   canonicalMethodLabel,
   chooseExtremizeK,
   chooseMarketWeight,
+  chooseSimulationWeight,
   clampProb,
   daysToIso,
   evidenceOverlap,
@@ -66,6 +71,7 @@ import {
   fitRecalibration,
   ISO_DATE,
   isoToDays,
+  type LedgerCreated,
   liquidityFactor,
   loadLedger,
   MANIFOLD_VOLUME_DISCOUNT,
@@ -74,16 +80,19 @@ import {
   normalizeOptionProbs,
   parseForecastPlan,
   parseQuestionJson,
+  parseSimStructure,
   scaleK,
   validateForecastAnalytics,
+  validateSimStructure,
 } from "./forecast";
 import { MarketHit, marketOdds } from "./datatools";
+import { runSimulation } from "./simulation";
 import { appendMemory, memoryBlock } from "./memory";
 import { canonicalizeUrl } from "./searchcore";
 import { aggregateSources, renderFinalHtml, sourcesBlock } from "./report";
 import { SandboxRuntime, createSandbox } from "./sandbox";
 import { RunState } from "./state";
-import { AggregateForecast, Forecast, ForecastQuestion, MarketAnchor, RunMeta, RunStatus, SourceRef, Task, TaskSpec, Usage, usageCost } from "./types";
+import { AggregateForecast, Forecast, ForecastQuestion, MarketAnchor, RunMeta, RunStatus, SimDriver, SourceRef, Task, TaskSpec, Usage, usageCost } from "./types";
 import { canonicalArtifactRel, clip, ensureDir, errMsg, oneLine, rid, sleep, truncateMiddle, validateArtifactFormat, withTimeout } from "./util";
 
 
@@ -183,6 +192,13 @@ export class Executor {
   private aggregates = new Map<string, AggregateForecast>();
   /** Forecast mode: panel tasks behind each aggregate (latest per method, per question). */
   private panelTasksByQ = new Map<string, Task[]>();
+  /**
+   * Forecast mode: the base "created" ledger record per sub-forecast (written
+   * inline at aggregation for crash durability). The scenario-simulation stage
+   * later appends an "updated" patch keyed to the same id — so a crash before
+   * the simulation leaves a clean, sim-less record rather than losing it.
+   */
+  private forecastLedgerByQ = new Map<string, LedgerCreated>();
 
   /** The primary (first) sub-forecast — back-compat for readers that only need one. */
   private get question(): ForecastQuestion | null {
@@ -868,6 +884,14 @@ export class Executor {
       if (!q.id || this.aggregates.has(q.id)) continue; // idempotent on resume
       await this.aggregateOne(q, ledger);
     }
+    // Scenario simulation runs AFTER every panel aggregate exists (drivers may
+    // span sub-forecasts). Base ledger records are already durable; the stage
+    // appends an "updated" patch carrying the sim cross-check (best-effort).
+    try {
+      await this.simulationStage(ledger);
+    } catch (e) {
+      this.journal.append("log", { level: "warn", msg: `scenario simulation failed: ${errMsg(e)}` });
+    }
   }
 
   /** Aggregate + ledger one sub-forecast. The math is the v0.13.0 pipeline, scoped to question q. */
@@ -1012,26 +1036,32 @@ export class Executor {
     const origin = this.meta.options.forecastOrigin;
     const supersedes = this.meta.options.supersedes;
     const multi = this.questions.length > 1;
+    const rec: LedgerCreated = {
+      v: 1,
+      rec: "created",
+      id: ledgerId,
+      runId: this.meta.id,
+      t: Date.now(),
+      question: q,
+      aggregate: agg,
+      panel: panelRecs,
+      ...(triggers.length ? { triggers } : {}),
+      ...(q.kind === "binary" || q.kind === "mc" ? { evidenceOverlap: overlap } : {}),
+      ...(origin ? { origin } : {}),
+      ...(supersedes ? { supersedes } : {}),
+      // Sub-forecasts of one open question group by the run id + share the brief.
+      ...(multi ? { setId: this.meta.id, brief: this.forecastBrief } : {}),
+    };
+    // Write the base record durably NOW (JSON.stringify snapshots the pre-sim
+    // aggregate). The simulation stage appends an "updated" patch afterward, so
+    // a crash in between can never lose the forecast — at worst it loses the
+    // sim cross-check, leaving a clean base record.
     try {
-      appendLedger({
-        v: 1,
-        rec: "created",
-        id: ledgerId,
-        runId: this.meta.id,
-        t: Date.now(),
-        question: q,
-        aggregate: agg,
-        panel: panelRecs,
-        ...(triggers.length ? { triggers } : {}),
-        ...(q.kind === "binary" || q.kind === "mc" ? { evidenceOverlap: overlap } : {}),
-        ...(origin ? { origin } : {}),
-        ...(supersedes ? { supersedes } : {}),
-        // Sub-forecasts of one open question group by the run id + share the brief.
-        ...(multi ? { setId: this.meta.id, brief: this.forecastBrief } : {}),
-      });
+      appendLedger(rec);
     } catch (e) {
       this.journal.append("log", { level: "warn", msg: `forecast ledger write failed: ${errMsg(e)}` });
     }
+    if (q.id) this.forecastLedgerByQ.set(q.id, rec);
   }
 
   /**
@@ -1118,6 +1148,235 @@ Same event, same direction (the market's YES means this question's YES), compati
     } finally {
       deadline.dispose();
     }
+  }
+
+  /**
+   * Whether to run the grounded scenario simulation. Forced by the --simulate
+   * flag (or the forecastSimulate config); otherwise auto-triggered when the
+   * mission decomposed into 2+ sub-forecasts — the case where genuine grounded
+   * sub-conditions exist to compose. Never blocks the run.
+   */
+  private shouldRunSimulation(): boolean {
+    if (this.meta.options.forecastSimulate || this.cfg.forecastSimulate) return true;
+    return this.questions.length >= 2;
+  }
+
+  /**
+   * Build the grounded driver catalog for question q — the ONLY legal driver
+   * universe, assembled entirely from deterministic-math outputs. The LLM may
+   * reference these by handle but can neither extend the catalog nor supply a
+   * marginal of its own. Primary drivers are genuine sub-conditions (sibling
+   * sub-forecasts + q's verified market). Reference-class base rates are added
+   * ONLY as a fallback when fewer than two primary drivers exist — using a base
+   * rate of q as a "driver" of q is partly circular, so it is a last resort for
+   * single-question runs, not material on a decomposed question.
+   */
+  private buildDriverCatalog(q: ForecastQuestion): SimDriver[] {
+    const drivers: SimDriver[] = [];
+    // Other sub-forecasts are the cleanest grounded sub-conditions.
+    for (const sf of this.questions) {
+      if (!sf.id || sf.id === q.id) continue;
+      const agg = this.aggregates.get(sf.id);
+      if (!agg) continue;
+      const label = oneLine(sf.text, 80);
+      if (sf.kind === "binary" && typeof agg.probability === "number") {
+        drivers.push({ id: `sf_${sf.id}`, label, marginal: { kind: "binary", probability: clampProb(agg.probability) }, provenance: { kind: "sub-forecast", ref: sf.id, label } });
+      } else if ((sf.kind === "numeric" || sf.kind === "date") && agg.quantiles) {
+        drivers.push({
+          id: `sf_${sf.id}`,
+          label,
+          marginal: { kind: "quantiles", quantiles: agg.quantiles, logSpace: Boolean(agg.logSpace) },
+          threshold: agg.quantiles.p50,
+          provenance: { kind: "sub-forecast", ref: sf.id, label },
+        });
+      }
+      // mc sub-forecasts are not used as copula drivers in this version.
+    }
+    // The verified market anchor on q (binary only) is a grounded signal.
+    const mkt = q.kind === "binary" && q.id ? this.aggregates.get(q.id)?.components?.market : undefined;
+    if (mkt && typeof mkt.probability === "number") {
+      const label = `market: ${oneLine(mkt.title ?? mkt.platform, 70)}`;
+      drivers.push({ id: "mkt_0", label, marginal: { kind: "binary", probability: clampProb(mkt.probability) }, provenance: { kind: "market", ref: mkt.url, label } });
+    }
+    // Fallback only: reference-class base rates committed by the panel (numeric
+    // percentages). Added solely to give an otherwise-driverless single question
+    // something to compose — kept out of the decomposed case where the sibling
+    // sub-forecasts are the clean, non-circular drivers.
+    if (drivers.length < 2) {
+      const panel = (q.id ? this.panelTasksByQ.get(q.id) : null) ?? this.panelFromTasks(q.id);
+      const seen = new Set<number>();
+      let bi = 0;
+      for (const t of panel) {
+        if (bi >= 4) break;
+        for (const br of t.forecast?.baseRates ?? []) {
+          if (bi >= 4) break;
+          const m = /(\d+(?:\.\d+)?)\s*%/.exec(br); // requires an explicit % — avoids the 0.15-vs-15% ambiguity
+          if (!m) continue;
+          const p = Number(m[1]) / 100;
+          if (!(p > 0.01 && p < 0.99)) continue;
+          const bucket = Math.round(p * 100);
+          if (seen.has(bucket)) continue;
+          seen.add(bucket);
+          const label = `base rate: ${oneLine(br, 70)}`;
+          drivers.push({ id: `br_${bi}`, label, marginal: { kind: "binary", probability: clampProb(p) }, provenance: { kind: "base-rate", ref: br.slice(0, 120), label } });
+          bi++;
+        }
+      }
+    }
+    return drivers;
+  }
+
+  /**
+   * Engine-owned scenario simulation: a grounded forward Monte Carlo over the
+   * first sub-forecast that has ≥2 grounded drivers. Best-effort and
+   * conductor-independent (mirrors coherenceProbe). The LLM proposes only the
+   * structure; the engine builds the catalog, runs the deterministic draws, and
+   * blends the result into the headline ONLY at a weight the ledger has earned
+   * (zero until then — a pure cross-check). Never blocks the run.
+   */
+  private async simulationStage(ledger: ReturnType<typeof loadLedger>): Promise<void> {
+    if (!this.forecastMode() || !this.shouldRunSimulation()) return;
+    if (this.ac.signal.aborted || this.finishReason.includes("cancel")) return;
+    // Stage-level idempotence: exactly one simulation runs per run (the headline
+    // outcome). If any question already carries a result — e.g. restored from the
+    // journal on resume — the stage has already run; don't start a second one on
+    // a different question.
+    if (this.questions.some((q) => q.id && this.aggregates.get(q.id)?.simulationResult)) return;
+    const forced = Boolean(this.meta.options.forecastSimulate || this.cfg.forecastSimulate);
+    for (const q of this.questions) {
+      if (!q.id) continue;
+      const agg = this.aggregates.get(q.id);
+      if (!agg || agg.simulationResult) continue; // idempotent across resume
+      const catalog = this.buildDriverCatalog(q);
+      if (catalog.length < 2) continue;
+      if (this.budgetExceeded()) {
+        this.journal.append("log", { level: "info", msg: "scenario simulation skipped — budget is in the synthesis reserve" });
+        return;
+      }
+      await this.simulationStageOne(q, agg, catalog, ledger);
+      return; // one simulation per run (the headline outcome) — bounds cost
+    }
+    // The operator explicitly asked for a simulation but nothing was eligible —
+    // say so rather than silently producing no scenario analysis.
+    if (forced) {
+      this.journal.append("log", {
+        level: "warn",
+        msg: "scenario simulation requested (--simulate) but skipped — fewer than 2 grounded drivers (a single question with no matching market and no parseable base-rate percentages). Decompose the question or widen the panel.",
+      });
+    }
+  }
+
+  /** Elicit structure, run the Monte Carlo, and fold the result into one aggregate. */
+  private async simulationStageOne(q: ForecastQuestion, agg: AggregateForecast, catalog: SimDriver[], ledger: ReturnType<typeof loadLedger>): Promise<void> {
+    const research = this.taskList().filter((t) => t.status === "done" && !t.forecast);
+    const evidence = research.length ? truncateMiddle(research.map(reportBlock).join("\n\n"), 12_000, "chars") : "";
+    const model = this.cfg.cheapModel || this.meta.options.model;
+    let proposal: ReturnType<typeof parseSimStructure> = null;
+    try {
+      const res = await chat(this.cfg, {
+        model,
+        priority: "high",
+        messages: [{ role: "user", content: simStructurePrompt(q, catalog, evidence) }],
+        thinking: false,
+        maxTokens: 1500,
+        signal: this.ac.signal,
+      });
+      this.onUsage(model, res.usage);
+      proposal = parseSimStructure(res.content || "");
+    } catch (e) {
+      const why = this.ac.signal.aborted ? "cancelled" : `structure call failed: ${errMsg(e)}`;
+      this.journal.append("log", { level: "info", msg: `scenario simulation (${q.id}): ${why}` });
+      return;
+    }
+    if (!proposal) {
+      this.journal.append("log", { level: "info", msg: `scenario simulation (${q.id}): structure parse failed — skipped` });
+      return;
+    }
+    const v = validateSimStructure(proposal, catalog, q.kind, q.options);
+    if (!v.ok || !v.spec) {
+      this.journal.append("log", { level: "info", msg: `scenario simulation (${q.id}) rejected: ${v.reason}${v.dropped.length ? ` (dropped ungrounded: ${v.dropped.join(", ")})` : ""}` });
+      return;
+    }
+    const result = runSimulation(v.drivers, v.spec, v.deps, 10_000, 1738, agg);
+    let w = 0;
+    try {
+      w = chooseSimulationWeight(ledger, q.kind);
+    } catch {
+      /* weight stays 0 — pure cross-check */
+    }
+    const c = (agg.components = agg.components ?? {});
+    const sa = result.simulatedAggregate;
+    const pct = (p: number) => Math.round(p * 100);
+    if (q.kind === "binary" && typeof sa.probability === "number") {
+      c.simulated = sa.probability;
+      const pre = c.recalibrated ?? c.blended ?? c.extremized ?? agg.probability ?? 0.5;
+      const lod = (p: number) => Math.log(clampProb(p) / (1 - clampProb(p)));
+      c.simDivergence = Number(Math.abs(lod(sa.probability) - lod(pre)).toFixed(3));
+      c.simBlendWeight = w;
+      if (w > 0) {
+        agg.probability = blendWithMarket(pre, sa.probability, w);
+        this.journal.append("log", { level: "info", msg: `simulation blend (${q.id}): panel ${pct(pre)}% + sim ${pct(sa.probability)}% (w=${w}) → ${pct(agg.probability)}%` });
+      }
+    } else if ((q.kind === "numeric" || q.kind === "date") && sa.quantiles) {
+      c.simulatedQ = sa.quantiles;
+      c.simDivergence = Number(result.coherence.divergence.toFixed(3));
+      c.simBlendWeight = w;
+      if (w > 0 && agg.quantiles) {
+        agg.quantiles = blendQuantiles(agg.quantiles, sa.quantiles, w);
+        this.journal.append("log", { level: "info", msg: `simulation blend (${q.id}): interval blended toward the bottom-up sim at w=${w}` });
+      }
+    } else if (q.kind === "mc" && sa.optionProbs) {
+      c.simulatedOptionProbs = sa.optionProbs;
+      c.simDivergence = Number(result.coherence.divergence.toFixed(3));
+      c.simBlendWeight = w;
+      if (w > 0 && agg.optionProbs) {
+        agg.optionProbs = blendOptionProbs(agg.optionProbs, sa.optionProbs, w);
+        this.journal.append("log", { level: "info", msg: `simulation blend (${q.id}): option probabilities blended toward the sim at w=${w}` });
+      }
+    }
+    agg.simulationResult = result;
+    // Patch the durable base ledger record with the sim-augmented aggregate.
+    // Best-effort: the base record already stands on its own if this fails.
+    // The base id comes from this run's map, or — on a resumed run where the map
+    // is empty — from the already-written ledger record for this question.
+    const baseId =
+      (q.id ? this.forecastLedgerByQ.get(q.id)?.id : undefined) ??
+      ledger.find((e) => e.runId === this.meta.id && e.question.id === q.id)?.id;
+    if (baseId && !this.finishReason.includes("cancel")) {
+      try {
+        appendLedger({ v: 1, rec: "updated", id: baseId, t: Date.now(), aggregate: agg, simulationRan: true });
+      } catch (e) {
+        this.journal.append("log", { level: "warn", msg: `forecast ledger sim-update failed: ${errMsg(e)}` });
+      }
+    }
+    // Carry the post-sim aggregate so a resumed run restores the simulation
+    // (and any blended headline) and the idempotence gate fires — see state.ts.
+    this.journal.append("forecast.simulated", {
+      questionId: q.id,
+      aggregate: agg,
+      simulated: sa,
+      scenarios: result.scenarios,
+      sensitivity: result.sensitivity,
+      coherence: result.coherence,
+      drivers: result.drivers,
+      weight: w,
+      dropped: v.dropped,
+    });
+    const tag = w > 0 ? `blended at w=${w}` : "cross-check only";
+    const div = result.coherence.verdict === "high" ? " — ⚠ diverges from the panel; see scenario analysis" : "";
+    this.journal.append("log", {
+      level: "info",
+      msg: `scenario simulation (${q.id}): ${v.drivers.length} grounded drivers, ${result.scenarios.length} scenarios, modal "${oneLine(result.modalScenario?.description ?? "", 80)}" (${tag})${div}`,
+    });
+  }
+
+  /** The simulation cross-check block for the synthesizer (the first simulated sub-forecast). */
+  private forecastSimBlock(): string {
+    for (const q of this.questions) {
+      const agg = q.id ? this.aggregates.get(q.id) : null;
+      if (agg?.simulationResult) return simulationBlock(q, agg.simulationResult, agg.components?.simBlendWeight ?? 0);
+    }
+    return "";
   }
 
   /**
@@ -2894,7 +3153,7 @@ PROTOCOL
             artifactList,
             reason: this.finishReason || "completed",
             sources: sourcesText,
-          }) + (this.aggregates.size ? `\n${forecastSynthAddendum(this.forecastBlocks(), this.aggregates.size, this.forecastBrief)}` : ""),
+          }) + (this.aggregates.size ? `\n${forecastSynthAddendum(this.forecastBlocks(), this.aggregates.size, this.forecastBrief, this.forecastSimBlock())}` : ""),
         kickoff: SYNTH_KICKOFF,
         tools: synthToolset(),
         terminal: [SUBMIT_FINAL_TOOL],

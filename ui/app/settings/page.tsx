@@ -95,6 +95,7 @@ export default function SettingsPage() {
         forecastMarketWeight: config.forecastMarketWeight,
         forecastDecompose: config.forecastDecompose,
         forecastMaxSubQuestions: config.forecastMaxSubQuestions,
+        forecastSimulate: config.forecastSimulate,
         sandboxRuntime: config.sandboxRuntime,
         sandboxImage: config.sandboxImage,
         e2bTemplate: config.e2bTemplate,
@@ -507,6 +508,13 @@ export default function SettingsPage() {
                 on={!!form.forecastDecompose}
                 onChange={(v) => setForm({ ...form, forecastDecompose: v })}
                 label={form.forecastDecompose ? "on" : "off"}
+              />
+            </Field>
+            <Field label="Scenario simulation" hint="grounded Monte Carlo over the sub-forecasts: ranked scenarios + driver tornado, a cross-check that earns headline weight only on the resolved ledger (auto on decomposed questions; --simulate forces it)">
+              <Toggle
+                on={!!form.forecastSimulate}
+                onChange={(v) => setForm({ ...form, forecastSimulate: v })}
+                label={form.forecastSimulate ? "on" : "off"}
               />
             </Field>
           </div>
