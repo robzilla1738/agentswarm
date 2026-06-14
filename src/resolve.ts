@@ -174,6 +174,58 @@ function verdictsAgree(entry: LedgerEntry, a: ResolutionVerdict, b: ResolutionVe
   return true; // yes/no/never/void agree by outcome equality alone
 }
 
+/**
+ * Map a resolver verdict onto a scoreable ledger outcome, or explain why it
+ * can't be scored. Pure and exported so the kind/outcome safety is testable
+ * without driving a live resolution agent.
+ *
+ * Fail-closed on a kind/outcome mismatch: the verdict's outcome type must fit
+ * the question kind, or it is routed to manual settlement rather than scored.
+ * Without this a non-"yes" verdict on a binary question (e.g. the resolver
+ * answering "never"/"value") fell through to the binary branch and scored as
+ * NO — silently poisoning every parameter the flywheel fits on the record.
+ */
+export function resolveOutcome(
+  entry: LedgerEntry,
+  verdict: Pick<ResolutionVerdict, "outcome" | "value" | "option" | "date">
+): { outcome: LedgerOutcome } | { skip: string } {
+  const kind = entry.question.kind;
+  const kindOk =
+    verdict.outcome === "void" ||
+    (kind === "binary" && (verdict.outcome === "yes" || verdict.outcome === "no")) ||
+    (kind === "numeric" && verdict.outcome === "value") ||
+    (kind === "mc" && verdict.outcome === "option") ||
+    (kind === "date" && (verdict.outcome === "date" || verdict.outcome === "never"));
+  if (!kindOk) {
+    return {
+      skip: `resolver returned a "${verdict.outcome}" verdict for a ${kind} question — settle manually with: swarm resolve set ${entry.id} <outcome>`,
+    };
+  }
+  if (verdict.outcome === "void") return { outcome: "void" };
+  if (kind === "numeric") {
+    return typeof verdict.value === "number" ? { outcome: verdict.value } : { skip: "numeric outcome had no value" };
+  }
+  if (kind === "mc") {
+    // The realized option must match the list exactly (case-insensitive) —
+    // scoring against an option the panel never priced would be garbage.
+    const opt = (entry.question.options ?? []).find(
+      (o) => o.trim().toLowerCase() === String(verdict.option ?? "").trim().toLowerCase()
+    );
+    return opt
+      ? { outcome: opt }
+      : {
+          skip: `verdict option ${JSON.stringify(verdict.option ?? "")} is not in the question's option list — settle manually with: swarm resolve set ${entry.id} <option>`,
+        };
+  }
+  if (kind === "date") {
+    if (verdict.outcome === "never") return { outcome: "never" };
+    const days = verdict.date ? isoToDays(verdict.date) : null;
+    return typeof days === "number" ? { outcome: days } : { skip: "date outcome had no parseable date" };
+  }
+  // binary — kindOk guarantees the outcome is "yes" or "no" here.
+  return { outcome: verdict.outcome === "yes" ? 1 : 0 };
+}
+
 /** Audit trail: every machine resolution is reviewable after the fact. Best-effort. */
 function writeAudit(id: string, payload: Record<string, unknown>): void {
   try {
@@ -320,36 +372,12 @@ export async function resolveDue(
           if (second.confidence === "high") verdict.confidence = "high";
         }
       }
-      let outcome: LedgerOutcome | undefined;
-      const kind = entry.question.kind;
-      if (verdict.outcome === "void") {
-        outcome = "void";
-      } else if (kind === "numeric") {
-        outcome = verdict.value;
-      } else if (kind === "mc") {
-        // The realized option must match the list exactly (case-insensitive) —
-        // scoring against an option the panel never priced would be garbage.
-        outcome = (entry.question.options ?? []).find(
-          (o) => o.trim().toLowerCase() === String(verdict.option ?? "").trim().toLowerCase()
-        );
-      } else if (kind === "date") {
-        outcome = verdict.outcome === "never" ? "never" : verdict.date ? (isoToDays(verdict.date) ?? undefined) : undefined;
-      } else {
-        outcome = verdict.outcome === "yes" ? 1 : 0;
-      }
-      if (outcome === undefined) {
-        result.skipped.push({
-          id: entry.id,
-          question: qText,
-          reason:
-            kind === "mc"
-              ? `verdict option ${JSON.stringify(verdict.option ?? "")} is not in the question's option list — settle manually with: swarm resolve set ${entry.id} <option>`
-              : kind === "date"
-                ? "date outcome had no parseable date"
-                : "numeric outcome had no value",
-        });
+      const mapped = resolveOutcome(entry, verdict);
+      if ("skip" in mapped) {
+        result.skipped.push({ id: entry.id, question: qText, reason: mapped.skip });
         continue;
       }
+      const outcome = mapped.outcome;
       const rec = resolveLedgerEntry(entry, outcome, {
         evidence: verdict.evidence,
         sources: verdict.sources,
