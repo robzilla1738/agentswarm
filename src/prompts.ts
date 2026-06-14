@@ -598,7 +598,7 @@ Rewrite it as a precisely resolvable question. Reply with ONLY a JSON object (no
 - kind: "binary" for will-it-happen questions; "numeric" for what-will-the-value-be questions (then include unit, else omit it); "mc" for which-of-N questions (include options: 2-8 mutually exclusive outcomes). Add a catch-all like "None of the above / other" ONLY when the named candidates genuinely leave outcomes uncovered (an open race, an incomplete field). For a CLOSED set where one listed option must occur — a head-to-head between exactly the named teams/parties, or any either/or — list ONLY the named options and add NO catch-all; handle a non-occurrence (cancelled, postponed, "no contest") as a void/N-A clause in resolutionCriteria instead. Example: "Which team wins Game 5, A vs B?" → options ["A","B"], criteria adds "voided if the game is not played". "date" for when-will-it-happen questions (resolutionDate is then the horizon after which "never" is the answer).
 - resolutionCriteria: exactly what counts as YES (or how the value/winner/date is measured), naming the authoritative public source to check.
 - resolutionDate: ${operatorDate ? `use ${operatorDate}` : "the ISO date when the answer is knowable — infer it from the mission; if the mission names no horizon, pick a sensible near-term one"}.
-- Keep the question's intent; sharpen, don't replace it. Only use "mc"/"date" when the mission genuinely asks which/when — a will-it-happen mission stays binary.`;
+- PRESERVE THE QUANTITY BEING ASKED. Sharpen the wording; NEVER change WHAT is forecast. Match the mission's question word to the kind: "when" → "date" (forecast the TIMING the event happens); "who"/"which" → "mc"; "how much / how many / what value / what level" → "numeric"; "will / whether" → "binary". Do not substitute one for another. Worked example — mission "When will X be restored?" → {"kind":"date","text":"When will X be restored to the public (on or before DATE)?"}. WRONG: "Which party restores X?" (that forecasts WHO, not WHEN); WRONG: "Will X be restored by DATE?" (that discards the timing the operator asked for).`;
 }
 
 /**
@@ -615,7 +615,7 @@ ${mission}
 ${operatorDate ? `\nThe operator set the resolution date: ${operatorDate}.` : ""}
 
 Decide how many forecasts the mission needs:
-- A clean, single will-it-happen / what-value / which / when mission → return EXACTLY ONE question.
+- A clean, single will-it-happen / what-value / which / when mission → return EXACTLY ONE question. Decomposition splits a BROAD mission into facets; it must NEVER turn one specific question into a different question. A "when will X happen" mission stays a single "date" forecast of the TIMING — never "which party causes X" (that forecasts WHO) and never "will X happen by DATE" (that discards the timing).
 - An OPEN-ENDED mission ("what will happen with X?", "how will Y evolve?", "what's the outlook for Z?") → break it into 2-6 concrete sub-forecasts that, taken together, answer it. Each sub-forecast must be independently resolvable and cover a distinct, decision-relevant facet (key metrics, turning-point events, the main alternative outcomes) — not rephrasings of one another. Prefer fewer, higher-signal sub-forecasts over many trivial ones.
 
 Reply with ONLY a JSON object (no prose, no markdown fence):
@@ -623,6 +623,7 @@ Reply with ONLY a JSON object (no prose, no markdown fence):
 
 For EACH question:
 - text: unambiguous, self-contained, includes the date. NEUTRALIZE the framing — strip loaded words, presuppositions, and the asker's lean; forecasters must inherit a neutral event statement, not an opinion.
+- PRESERVE THE QUANTITY each facet asks. Match the question word to the kind: "when" → "date" (the timing), "who"/"which" → "mc", "how much/many/what value" → "numeric", "will/whether" → "binary". Never swap one for another (a "when" facet must forecast the date, not "which party" or "will it by DATE").
 - kind: "binary" for will-it-happen; "numeric" for what-will-the-value-be (include unit); "mc" for which-of-N (include options: 2-8 mutually exclusive outcomes). Add a catch-all like "None of the above / other" ONLY when the named candidates genuinely leave outcomes uncovered (an open race, an incomplete field). For a CLOSED set where one listed option must occur — a head-to-head between exactly the named teams/parties, or any either/or — list ONLY the named options and add NO catch-all; handle a non-occurrence (cancelled, postponed, "no contest") as a void/N-A clause in resolutionCriteria instead. Example: "Which team wins Game 5, A vs B?" → options ["A","B"], criteria adds "voided if the game is not played". "date" for when-will-it-happen (resolutionDate is the horizon after which "never" is the answer).
 - resolutionCriteria: exactly what counts as YES (or how the value/winner/date is measured), naming the authoritative public source to check.
 - resolutionDate: ${operatorDate ? `use ${operatorDate} for every question` : "the ISO date when that question is knowable — infer it; if no horizon is implied, pick a sensible near-term one. Sub-forecasts may share a horizon or differ."}.

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.16.1
+
+A correctness fix for question sharpening: a "when will X happen" mission could be silently reframed into a different question (e.g. "which party will be responsible for X?") — forecasting *who* instead of *when*. The quantity being forecast is now preserved.
+
+### Preserve the quantity being asked
+- **The bug**: on a small planner model, "the US government shut down Fable 5 access — when will it be restored?" came back sharpened as the multiple-choice "Which party will be primarily responsible for restoring access?" The sharpener changed *what* was forecast (timing → attribution), not just the wording. The prompts said "keep the intent, sharpen don't replace it" but never forbade swapping the measured quantity, and nothing checked the result.
+- **Prompt fix**: both the single-question sharpener and the open-ended decomposer now carry a hard rule with a worked example — match the question word to the kind ("when" → `date` timing, "who/which" → `mc`, "how much" → `numeric`, "will/whether" → `binary`) and **never** substitute one for another.
+- **Deterministic guard** (`isTimingMission`): a timing mission ("when will…", "by when…", "how long/soon until…") that comes back with no timing-typed forecast is rejected and re-planned with a targeted correction — on both the decompose and single-sharpen paths — and the last-resort mechanical fallback now emits a `date` forecast (it hard-coded `binary` before). High-precision detection ignores "when" used as a conjunction ("what happens when the Fed cuts?"). So a "when" question can no longer become a "which/who" or "will-it" one, regardless of the model.
+
 ## 0.16.0
 
 Grounded scenario simulation: a forward Monte Carlo that turns a decomposed forecast's sub-forecasts into correlated drivers, ranks the scenarios, and cross-checks the headline — earning weight only on the resolved ledger. No breaking changes; the headline never moves until the ledger proves the simulation helps.

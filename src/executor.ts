@@ -75,6 +75,7 @@ import {
   liquidityFactor,
   loadLedger,
   MANIFOLD_VOLUME_DISCOUNT,
+  isTimingMission,
   methodWeights,
   monotoneQuantiles,
   normalizeOptionProbs,
@@ -82,6 +83,7 @@ import {
   parseQuestionJson,
   parseSimStructure,
   scaleK,
+  TIMING_KINDS,
   validateForecastAnalytics,
   validateSimStructure,
 } from "./forecast";
@@ -609,6 +611,13 @@ export class Executor {
     const operatorDate = this.meta.options.resolutionDate;
     const maxN = Math.max(1, this.cfg.forecastMaxSubQuestions ?? 6);
     const decompose = this.cfg.forecastDecompose && !this.meta.options.forecastSingle;
+    // A "when will X happen" mission must be forecast as TIMING (date/numeric).
+    // The planner on a small model sometimes swaps it for a "which party" (mc)
+    // or "will it" (binary) question — a different quantity entirely. Detect it
+    // and force a re-plan, then a timing-typed mechanical fallback.
+    const timing = isTimingMission(this.meta.mission);
+    const timingFix =
+      'the mission asks WHEN something happens — return a single "date" forecast of the TIMING (when it occurs), NOT a "which"/"who" (mc) or a "will-it-by-DATE" (binary) question. Do not change what is being forecast.';
     const ask = async (prompt: string, maxTokens: number): Promise<string> => {
       const res = await chat(this.cfg, {
         model: this.meta.options.conductorModel,
@@ -634,6 +643,14 @@ export class Executor {
           );
           const plan = parseForecastPlan(out, operatorDate, today, maxN);
           if (plan) {
+            // Quantity-swap guard: a timing ("when will X") mission must yield at
+            // least one timing-typed forecast — otherwise the planner replaced
+            // "when" with a different quantity (a "which party"/"will it" swap).
+            // Retry (then fall through to sharpen, then a date fallback).
+            if (timing && !plan.questions.some((q) => TIMING_KINDS.has(q.kind))) {
+              lastErr = timingFix;
+              continue;
+            }
             commit(plan.questions, plan.brief);
             return;
           }
@@ -656,29 +673,43 @@ export class Executor {
           1024
         );
         parsed = parseQuestionJson(out, operatorDate);
-        if (!parsed) lastErr = "not valid JSON with the required fields";
+        if (parsed && timing && !TIMING_KINDS.has(parsed.kind)) {
+          parsed = null; // quantity-swap — retry with the correction
+          lastErr = timingFix;
+        } else if (!parsed) {
+          lastErr = "not valid JSON with the required fields";
+        }
       } catch (e) {
         if (this.ac.signal.aborted) return;
         lastErr = errMsg(e);
       }
     }
 
-    // 3) Mechanical fallback.
+    // 3) Mechanical fallback — preserve the asked quantity: a timing mission
+    // becomes a date forecast (when it happens), everything else a binary.
     if (!parsed) {
       const fallbackDate =
         operatorDate && ISO_DATE.test(operatorDate)
           ? operatorDate
           : new Date(this.meta.createdAt + 90 * 86_400_000).toISOString().slice(0, 10);
-      parsed = {
-        text: oneLine(this.meta.mission, 300),
-        kind: "binary",
-        resolutionCriteria:
-          "Resolves YES if the event described in the question has occurred by the resolution date, per authoritative public reporting.",
-        resolutionDate: fallbackDate,
-      };
+      parsed = timing
+        ? {
+            text: oneLine(this.meta.mission, 300),
+            kind: "date",
+            resolutionCriteria:
+              'Resolves to the date the event described in the question first occurs, per authoritative public reporting; resolves "never" if it has not occurred by the resolution date.',
+            resolutionDate: fallbackDate,
+          }
+        : {
+            text: oneLine(this.meta.mission, 300),
+            kind: "binary",
+            resolutionCriteria:
+              "Resolves YES if the event described in the question has occurred by the resolution date, per authoritative public reporting.",
+            resolutionDate: fallbackDate,
+          };
       this.journal.append("log", {
         level: "warn",
-        msg: "question planning failed — using the mission verbatim as a binary question",
+        msg: `question planning failed — using the mission verbatim as a ${parsed.kind} question`,
       });
     }
     commit([parsed], "");

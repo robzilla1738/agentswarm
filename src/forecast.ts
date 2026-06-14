@@ -1122,6 +1122,26 @@ export function canonicalMethodLabel(raw: string): string {
 
 export const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
+/** Kinds that forecast a timing/quantity ("when") rather than a category or yes/no. */
+export const TIMING_KINDS: ReadonlySet<ForecastKind> = new Set<ForecastKind>(["date", "numeric"]);
+
+/**
+ * A "when will X happen" mission asks for TIMING — it must be forecast as a
+ * date (or a duration), never silently reframed into a "which/who" (mc) or
+ * "will-it" (binary) question. The sharpener/planner sometimes does exactly
+ * that on a small model, so the engine guards against it.
+ *
+ * High precision by design: matches "by when", a "when <auxiliary verb>"
+ * interrogative ("when will|does|is|did|can|could…"), or "how long|soon
+ * until|before|till" — NOT a "when" used as a subordinating conjunction
+ * ("what happens when the Fed cuts?"), which never precedes one of those verbs.
+ */
+export function isTimingMission(mission: string): boolean {
+  return /\bby\s+when\b|\bwhen\s+(will|would|does|do|is|are|was|were|did|can|could|might|must|should|shall|has|have)\b|\bhow\s+(long|soon)\s+(until|till|before|'?til)\b/i.test(
+    mission
+  );
+}
+
 /**
  * Resolve a sub-forecast's horizon when decomposing (best-effort, never
  * rejects): operator date wins; an absent/unparseable/past model date falls

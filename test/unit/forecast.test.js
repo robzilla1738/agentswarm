@@ -21,6 +21,7 @@ const {
   parseQuestionJson,
   parseForecastPlan,
   clampHorizon,
+  isTimingMission,
   extractQuestionRef,
   validateForecastAnalytics,
   evidenceOverlap,
@@ -787,6 +788,23 @@ test("clampHorizon: operator date wins; missing/past → fallback; far future ca
   assert.equal(clampHorizon("2026-12-31", undefined, today), "2026-12-31");
   // absurdly far future is capped to ~5 years
   assert.equal(clampHorizon("2099-01-01", undefined, today), "2031-06-12");
+});
+
+test("isTimingMission: a 'when will X' mission is timing; a 'which/will' one is not", () => {
+  // The reported failure: a "when will it be restored" mission must read as timing
+  // so the engine forces a date forecast instead of a "which party" mc swap.
+  assert.equal(isTimingMission("the US government just shut down Fable 5 access. When will it be restored to the public?"), true);
+  assert.equal(isTimingMission("When will the Fed cut rates?"), true);
+  assert.equal(isTimingMission("By when will SpaceX land humans on Mars?"), true);
+  assert.equal(isTimingMission("How long until GPT-6 ships?"), true);
+  assert.equal(isTimingMission("How soon before the strike ends?"), true);
+  assert.equal(isTimingMission("when is the next recession"), true);
+  // Not timing — these ask a different quantity and must keep their own kind.
+  assert.equal(isTimingMission("Which party will win the 2028 election?"), false);
+  assert.equal(isTimingMission("Will the Fed cut rates by September 2026?"), false);
+  assert.equal(isTimingMission("How much will Bitcoin be worth at year end?"), false);
+  // "when" as a subordinating conjunction (not an interrogative) must not trip it
+  assert.equal(isTimingMission("What happens to stocks when the Fed cuts rates?"), false);
 });
 
 test("parseForecastPlan: multi-question decomposition with stable ids", () => {
