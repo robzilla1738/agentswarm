@@ -105,6 +105,7 @@ export interface PublicConfig {
   forecastExtremizeK: number;
   forecastCoherenceProbe: boolean;
   forecastMarketWeight: number;
+  forecastSportsMarketWeight: number;
   forecastDecompose: boolean;
   forecastMaxSubQuestions: number;
   forecastSimulate: boolean;

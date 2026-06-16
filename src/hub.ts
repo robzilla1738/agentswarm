@@ -570,6 +570,7 @@ export function publicConfig(cfg: SwarmConfig) {
     forecastExtremizeK: cfg.forecastExtremizeK,
     forecastCoherenceProbe: cfg.forecastCoherenceProbe,
     forecastMarketWeight: cfg.forecastMarketWeight,
+    forecastSportsMarketWeight: cfg.forecastSportsMarketWeight,
     forecastDecompose: cfg.forecastDecompose,
     forecastMaxSubQuestions: cfg.forecastMaxSubQuestions,
     forecastSimulate: cfg.forecastSimulate,

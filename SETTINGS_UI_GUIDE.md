@@ -175,6 +175,7 @@ Forecast runs (`swarm forecast`) put an independent forecaster panel behind ever
 - **Panel size**: 3-11 (default 5) — independent forecasters per question
 - **Extremization k**: 1-4 (default 2.5) — aggregation exponent; auto-tunes once ≥30 forecasts resolve
 - **Market anchor weight**: 0-1 (default 0.4) — base blend toward a verified market price (×liquidity); 0 disables; auto-tunes once ≥20 resolve
+- **Sports line weight**: 0-1 (default 0.75) — base blend toward the sharp sportsbook line for a game's winner/total/margin; a closing line is a stronger predictor than the generic market, so it earns more pull; 0 disables; auto-tunes once ≥20 sports facets resolve
 - **Max sub-forecasts**: 1-8 (default 6) — cap when an open-ended question decomposes
 - **Coherence probe** (toggle, default on) — engine re-asks the question inverted and folds the flipped answer into the panel (counters affirmative-framing bias)
 - **Decompose open questions** (toggle, default on) — fan an open-ended question into several resolvable sub-forecasts; `swarm forecast --single` overrides per run
@@ -183,7 +184,7 @@ Forecast runs (`swarm forecast`) put an independent forecaster panel behind ever
 ### API keys (all optional, free):
 - **FRED API key** — economic time series (`time_series` tool) · fred.stlouisfed.org
 - **Metaculus API token** — adds the Metaculus forecaster crowd to `market_odds` · metaculus.com
-- **The Odds API key** — de-vigged sportsbook consensus in `market_odds` · the-odds-api.com
+- **The Odds API key** — sportsbook lines: de-vigged consensus in `market_odds`, the `sports_odds` tool, and the engine's market-anchored decomposition of a game into winner/total/margin (resolved from the box score, CLV-tracked via `swarm sports close`) · the-odds-api.com
 
 Manifold, Polymarket, Kalshi, and PredictIt odds need no key. Clear any key with its "clear" link, same as other sections.
 

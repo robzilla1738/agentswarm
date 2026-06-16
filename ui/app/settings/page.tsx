@@ -93,6 +93,7 @@ export default function SettingsPage() {
         forecastExtremizeK: config.forecastExtremizeK,
         forecastCoherenceProbe: config.forecastCoherenceProbe,
         forecastMarketWeight: config.forecastMarketWeight,
+        forecastSportsMarketWeight: config.forecastSportsMarketWeight,
         forecastDecompose: config.forecastDecompose,
         forecastMaxSubQuestions: config.forecastMaxSubQuestions,
         forecastSimulate: config.forecastSimulate,
@@ -487,6 +488,13 @@ export default function SettingsPage() {
                 type="number" className="input" min={0} max={1} step={0.05}
                 value={form.forecastMarketWeight ?? 0.4}
                 onChange={(e) => setForm({ ...form, forecastMarketWeight: e.target.value })}
+              />
+            </Field>
+            <Field label="Sports line weight" hint="base blend toward the sharp sportsbook line for a game's winner/total/margin — a closing line beats the generic market anchor (0 disables; auto-tunes once ≥20 sports facets resolve)">
+              <input
+                type="number" className="input" min={0} max={1} step={0.05}
+                value={form.forecastSportsMarketWeight ?? 0.75}
+                onChange={(e) => setForm({ ...form, forecastSportsMarketWeight: e.target.value })}
               />
             </Field>
             <Field label="Max sub-forecasts" hint="cap when an open question decomposes (1–8)">
