@@ -765,10 +765,32 @@ async function waybackFetch(url: string, maxChars: number, signal?: AbortSignal)
   );
 }
 
+// windows-1252 differs from latin1 only in 0x80–0x9F (smart quotes, dashes, €,
+// …). Decoding it via the platform TextDecoder is ICU-build-dependent: a
+// small-icu/system-icu Node (what CI ships) lacks the table and silently
+// degrades to a raw latin1 decode, turning 0x93 into the U+0093 control char
+// instead of “. Map the range explicitly so the result is byte-identical on
+// every Node build. Undefined slots (0x81/0x8D/0x8F/0x90/0x9D) pass through as
+// their C1 control, exactly as the WHATWG Encoding standard specifies.
+const WIN1252_C1: Record<number, string> = {
+  0x80: "€", 0x82: "‚", 0x83: "ƒ", 0x84: "„", 0x85: "…", 0x86: "†", 0x87: "‡",
+  0x88: "ˆ", 0x89: "‰", 0x8a: "Š", 0x8b: "‹", 0x8c: "Œ", 0x8e: "Ž", 0x91: "‘",
+  0x92: "’", 0x93: "“", 0x94: "”", 0x95: "•", 0x96: "–", 0x97: "—", 0x98: "˜",
+  0x99: "™", 0x9a: "š", 0x9b: "›", 0x9c: "œ", 0x9e: "ž", 0x9f: "Ÿ",
+};
+function decodeWin1252(buf: Buffer): string {
+  return buf.toString("latin1").replace(/[\u0080-\u009f]/g, (ch) => WIN1252_C1[ch.charCodeAt(0)] ?? ch);
+}
+
 /** Decode a response body honoring its content-type charset (UTF-8 fallback). */
 function decodeBody(buf: Buffer, ctype: string): string {
   const charset = /charset=([\w-]+)/i.exec(ctype)?.[1]?.toLowerCase();
   if (charset && charset !== "utf-8" && charset !== "utf8") {
+    // windows-1252 plus the latin1/ascii labels the WHATWG standard folds into
+    // it — decode deterministically rather than trust the platform's ICU tables.
+    if (/^(windows-1252|cp-?1252|win-?1252|x-cp1252|ansi|iso-?8859-1|latin1|l1|us-ascii|ascii)$/.test(charset)) {
+      return decodeWin1252(buf);
+    }
     try {
       return new TextDecoder(charset).decode(buf);
     } catch {
