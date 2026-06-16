@@ -1,6 +1,7 @@
 import * as path from "path";
 import * as fs from "fs";
 import { home } from "./config";
+import { normInv } from "./datatools";
 import { canonicalizeUrl } from "./searchcore";
 import {
   AggregateForecast,
@@ -13,6 +14,8 @@ import {
   ForecastQuestion,
   Quantiles,
   SimDriver,
+  SportsLineSnapshot,
+  SportsMeta,
 } from "./types";
 import { ensureDir, errMsg } from "./util";
 
@@ -37,6 +40,18 @@ import { ensureDir, errMsg } from "./util";
 export function clampProb(p: number): number {
   if (!Number.isFinite(p)) return 0.5;
   return Math.min(0.99, Math.max(0.01, p));
+}
+
+/**
+ * Looser clamp for OBSERVED market prices feeding the anchor. A real-money
+ * market can correctly sit at 98–99.5% on a nearly-decided question; squashing
+ * it to the panel's 0.99 ceiling before the log-odds blend throws away exactly
+ * the information that makes a confident market worth anchoring to. Still guards
+ * the hard 0/1 boundary so the logit stays finite.
+ */
+export function clampMarketProb(p: number): number {
+  if (!Number.isFinite(p)) return 0.5;
+  return Math.min(0.995, Math.max(0.005, p));
 }
 
 function median(sorted: number[]): number {
@@ -510,8 +525,13 @@ export function scaleK(k: number, overlap: number): number {
  */
 export function blendWithMarket(panelP: number, marketP: number, w: number): number {
   const wc = Math.min(1, Math.max(0, w));
-  const lp = Math.log(clampProb(panelP) / (1 - clampProb(panelP)));
-  const lm = Math.log(clampProb(marketP) / (1 - clampProb(marketP)));
+  const pp = clampProb(panelP);
+  // The market operand keeps its near-boundary information (clampMarketProb),
+  // while the panel keeps its conservative clamp. The blended OUTPUT is still
+  // capped at 0.99 so the engine never publishes >99% certainty.
+  const mp = clampMarketProb(marketP);
+  const lp = Math.log(pp / (1 - pp));
+  const lm = Math.log(mp / (1 - mp));
   const odds = Math.exp((1 - wc) * lp + wc * lm);
   return clampProb(odds / (1 + odds));
 }
@@ -546,8 +566,8 @@ export function chooseMarketWeight(entries = loadLedger(), fallback = DEFAULT_MA
       e.question.kind === "binary" &&
       e.resolution &&
       (e.resolution.outcome === 0 || e.resolution.outcome === 1) &&
-      typeof e.aggregate.components?.extremized === "number" &&
-      typeof e.aggregate.components?.market?.probability === "number"
+      Number.isFinite(e.aggregate.components?.extremized) &&
+      Number.isFinite(e.aggregate.components?.market?.probability)
   );
   if (usable.length < MIN_MARKET_WEIGHT_N) return fallback;
   let bestW = fallback;
@@ -566,6 +586,192 @@ export function chooseMarketWeight(entries = loadLedger(), fallback = DEFAULT_MA
       const wEff = Math.max(0, w * liq - 1 / panelN);
       const p = blendWithMarket(c.extremized!, c.market!.probability, wEff);
       sum += -logScore(p, e.resolution!.outcome as 0 | 1);
+    }
+    const mean = sum / usable.length;
+    if (mean < bestLoss - 1e-12) {
+      bestLoss = mean;
+      bestW = w;
+    }
+  }
+  return bestW;
+}
+
+// ---------------------------------------------------------------- sports line anchoring
+
+/**
+ * Game-to-game standard deviation of the realized quantity, per sport × line
+ * type — well-established public values (the season-long SD of final totals and
+ * margins). These are physical constants of the sport, not tunables, so they
+ * live in code. An unknown sport returns null → no line anchor (safe fallback).
+ */
+export const SPORTS_SIGMA: Record<string, { total: number; margin: number }> = {
+  nba: { total: 11, margin: 12 },
+  wnba: { total: 11, margin: 12 },
+  ncaab: { total: 12, margin: 12 },
+  basketball: { total: 11, margin: 12 },
+  nfl: { total: 10, margin: 13.5 },
+  ncaaf: { total: 14, margin: 16 },
+  americanfootball: { total: 11, margin: 14 },
+  mlb: { total: 3.2, margin: 4.3 },
+  baseball: { total: 3.2, margin: 4.3 },
+  nhl: { total: 1.9, margin: 2.4 },
+  hockey: { total: 1.9, margin: 2.4 },
+  soccer: { total: 1.6, margin: 1.9 },
+  epl: { total: 1.6, margin: 1.9 },
+};
+
+/**
+ * The de-vigged moneyline as an mc market over the winner options. 3-way
+ * (soccer-style) books persist all three legs and need normalizing — independent
+ * per-leg medians need not sum to 1; 2-way is exact at {home, 1−home}.
+ */
+export function sportsWinnerMarket(sm: Pick<SportsMeta, "home" | "away" | "lineAtCreate">): Record<string, number> {
+  const snap = sm.lineAtCreate;
+  const h = snap?.pHome ?? 0.5;
+  if (typeof snap?.pDraw === "number" && typeof snap?.pAway === "number") {
+    const s = h + snap.pDraw + snap.pAway || 1;
+    return { [sm.home]: h / s, Draw: snap.pDraw / s, [sm.away]: snap.pAway / s };
+  }
+  return { [sm.home]: h, [sm.away]: 1 - h };
+}
+
+/**
+ * Decide whether a mission is a head-to-head game the engine should decompose
+ * into market-anchored facets, and which one. Returns the facet to forecast
+ * ("full" = winner + combined total + margin), or null to leave it to the
+ * normal planner. Conservative by design: anything that isn't clearly winner /
+ * combined total / margin — a single-team total, a player prop, a binary
+ * over-under / cover bet, a half/quarter/period line, or a non-game mission —
+ * returns null so the forecast target is never silently rewritten.
+ */
+export function classifySportsMission(mission: string): "winner" | "total" | "margin" | "full" | null {
+  const m = (mission || "").toLowerCase();
+  // "combine for" / "both teams" imply a two-team game even without a vs/@ token.
+  const matchupShape = /\b(vs\.?|@|versus)\b|\b(beat|defeat|upset)s?\b|\bgame \d|\bwin(s|ning)? (against|over)\b|\bcombine[ds]? for\b|\bboth teams?\b/.test(m);
+  const leagueWord =
+    /\b(nba|wnba|ncaa|nfl|mlb|nhl|epl|premier league|la ?liga|bundesliga|serie a|champions league|ufc|f1|formula 1|test match|odi|ipl|super bowl|world series|stanley cup|playoff|finals?)\b/.test(m);
+  if (!matchupShape && !leagueWord) return null;
+  const combinedSignal = /\b(combined?|both teams?|each team|total (score|points|runs|goals))\b/.test(m) || /\bcombine[ds]? (for|to)\b/.test(m) || /\bbe scored\b/.test(m);
+  const propish =
+    /\b(prop|player|rebounds?|assists?|steals?|blocks?|strikeouts?|home runs?|touchdowns?|first half|second half|1st half|2nd half|half[\s-]?time|quarter|q[1-4]\b|period|overtime|\bot\b|first to \d|anytime|hat[\s-]?trick|yards|passing|rushing|receiving)\b/.test(m);
+  // A single-team scoring total ("how many points will the Lakers score") is
+  // unsupported — but the same phrasing for both teams ("…combine for", "…be scored") is the combined total.
+  const singleTeamStat = !combinedSignal && /\bhow many (points|goals|runs|yards|hits|saves) (will|does|can) (the )?[a-z][a-z .'-]*\b/.test(m);
+  // A threshold/cover/over-under/win-by-N bet is BINARY — the normal planner
+  // owns it ("will A beat B by 5?" is yes/no, not "by how many will A win").
+  const binaryThreshold =
+    /\bcover(s|ing)? (the )?(spread|line|number|points?)\b/.test(m) ||
+    /\b(go|goes|going|stay|stays|land|lands|finish|finishes) (over|under)\b/.test(m) ||
+    /\bwin by (more|at least|over|fewer|less|under|exactly) than?\b/.test(m) ||
+    (/\bwill\b/.test(m) && /\b(over|under) \d+(\.\d+)?\b/.test(m)) ||
+    (/\bwill\b/.test(m) && /\b(beat|beats|defeat|defeats|win|wins|lead|leads) .*\bby \d/.test(m));
+  // A season/standings/series comparison is NOT a single game — don't bind it to
+  // the next matchup ("win more games than … this season", "win the division").
+  const seasonOrSeries =
+    /\b(this season|the season|regular season|over the season|this year|all season)\b/.test(m) ||
+    /\bmore (games|wins|points|goals|runs) than\b/.test(m) ||
+    /\bwin (the )?(division|title|championship|pennant|conference|league|series|cup|trophy|playoffs?)\b/.test(m) ||
+    /\b(standings|best.of|series (lead|win|sweep)|win the series|sweep)\b/.test(m) ||
+    /\bmake (the )?playoffs?\b/.test(m);
+  if (propish || singleTeamStat || binaryThreshold || seasonOrSeries) return null;
+  if (
+    /\b(combined|total) (score|points|runs|goals)\b/.test(m) ||
+    /\b(combined|game|match|the) total\b/.test(m) ||
+    /\btotal (be|is|will be)\b/.test(m) ||
+    /\bcombine[ds]? (for|to)\b/.test(m) ||
+    /\bover[\s/]?under\b/.test(m) ||
+    /\bbe scored\b/.test(m)
+  )
+    return "total";
+  if (/\b(by how many|margin of victory|winning margin|what.{0,8}\bmargin)\b/.test(m)) return "margin";
+  if (/\b(who (wins|will win|takes it)|which team wins|winner|moneyline)\b/.test(m) || /\bwill (the )?[a-z][a-z .'-]*\b (beat|defeat|upset|win|wins)\b/.test(m)) return "winner";
+  return "full";
+}
+
+/**
+ * Sports whose `spreads` market IS the median expected margin (the line is set
+ * so each side is ~50%), so it can anchor the margin distribution. Baseball run
+ * lines and hockey puck lines are fixed ±1.5 markets, and soccer handicaps are
+ * ±0.5/±1.5 — none is the median margin, so margin anchoring is skipped there
+ * (the margin facet still resolves from the box score, just panel-only).
+ */
+const POINT_SPREAD_SPORTS = new Set(["nba", "wnba", "ncaab", "basketball", "nfl", "ncaaf", "americanfootball"]);
+
+/**
+ * Per-sport σ for a total/margin line; null when the sport is unknown (→ skip
+ * the anchor). Margin σ is returned only for true point-spread sports — for
+ * run-line/puck-line/handicap sports the spread is not the median margin.
+ */
+export function sportsSigma(sportTitle: string, kind: "total" | "margin"): number | null {
+  const key = (sportTitle || "").toLowerCase().replace(/[^a-z]/g, "");
+  for (const k of Object.keys(SPORTS_SIGMA)) {
+    if (key.includes(k)) {
+      if (kind === "margin" && !POINT_SPREAD_SPORTS.has(k)) return null;
+      return SPORTS_SIGMA[k][kind];
+    }
+  }
+  return null;
+}
+
+/**
+ * A sportsbook total/spread line as a Normal(mean=line, sd=σ) mapped onto the
+ * 7 canonical taus: q_τ = line + σ·Φ⁻¹(τ). Sharp books post the median≈mean
+ * outcome, so the line IS the center; σ is the game-to-game SD. Symmetric and
+ * pure additive arithmetic — correct for negative margins, never touches log
+ * space, and the tail never reaches 0 at realistic total line/σ.
+ */
+export function lineToQuantiles(line: number, sigma: number): Quantiles {
+  if (!Number.isFinite(line) || !(sigma > 0)) throw new Error("lineToQuantiles: bad line/σ");
+  const out: Partial<Record<keyof Quantiles, number>> = {};
+  for (const { key, tau } of QUANTILE_TAUS) out[key] = line + sigma * normInv(tau);
+  return monotoneQuantiles(out)!;
+}
+
+/**
+ * Blend a numeric panel aggregate toward a market line distribution PER-TAU
+ * (Vincent), not via the linear opinion pool. The LOP widens on disagreement —
+ * right for independent panelists, wrong for a sharper estimate of the SAME
+ * quantity: it would inflate the band straddling panel and book. Per-tau pulls
+ * the CENTER toward the calibrated line while width stays the panel's. w=0 →
+ * panel, w=1 → line.
+ */
+export function blendQuantilesWithMarket(panel: Quantiles, market: Quantiles, w: number): Quantiles {
+  return blendQuantiles(panel, market, w);
+}
+
+/** Sharp books deserve a high default weight; the panel only nudges the line where it has a real edge. */
+export const DEFAULT_SPORTS_MARKET_WEIGHT = 0.75;
+/** Resolved sports facets needed before the sports market weight is fit from the record. */
+export const MIN_SPORTS_MARKET_WEIGHT_N = 20;
+
+/**
+ * Fit the numeric sports market weight on the resolved record: the w that would
+ * have minimized mean pinball loss re-blending each facet's stored pre-blend
+ * quantiles (components.blendedQ) toward its stored line distribution. Mirrors
+ * chooseMarketWeight but in pinball space, re-applying the same −1/panelSize
+ * residual the live path uses. Falls back to the high default below 20.
+ */
+export function chooseSportsMarketWeight(entries = loadLedger(), fallback = DEFAULT_SPORTS_MARKET_WEIGHT): number {
+  const usable = entries.filter(
+    (e) =>
+      (e.question.kind === "numeric" || e.question.kind === "date") &&
+      e.resolution &&
+      typeof e.resolution.outcome === "number" &&
+      e.aggregate.components?.blendedQ &&
+      e.aggregate.components?.marketLine
+  );
+  if (usable.length < MIN_SPORTS_MARKET_WEIGHT_N) return fallback;
+  let bestW = fallback;
+  let bestLoss = Infinity;
+  for (let i = 0; i <= 10; i++) {
+    const w = i / 10;
+    let sum = 0;
+    for (const e of usable) {
+      const c = e.aggregate.components!;
+      const mq = lineToQuantiles(c.marketLine!.line, c.marketLine!.sigma);
+      const panelN = Math.max(1, e.panel?.length || e.aggregate.n || 1);
+      const wEff = Math.max(0, w - 1 / panelN);
+      sum += pinballLoss(blendQuantilesWithMarket(c.blendedQ!, mq, wEff), e.resolution!.outcome as number);
     }
     const mean = sum / usable.length;
     if (mean < bestLoss - 1e-12) {
@@ -647,7 +853,7 @@ export function fitRecalibration(entries = loadLedger()): Recalibration | null {
     if (o !== 0 && o !== 1) continue;
     const c = e.aggregate.components;
     const p = c?.blended ?? c?.extremized ?? e.aggregate.probability;
-    if (typeof p !== "number") continue;
+    if (typeof p !== "number" || !Number.isFinite(p)) continue;
     pts.push({ p: clampProb(p), outcome: o });
   }
   if (pts.length < MIN_RECALIBRATION_N) return null;
@@ -867,6 +1073,13 @@ export function validateSimStructure(
   const binaryIds = new Set(drivers.filter((d) => d.marginal.kind === "binary").map((d) => d.id));
   const root = sanitizeCombiner(proposal.combiner, groundedIds, binaryIds);
   if (!root) return { ok: false, drivers, deps: [], dropped, reason: "combiner referenced ungrounded drivers or was malformed" };
+  // mc outcomes are an option INDEX: aggregateSimOutcomes reads each draw's
+  // scalar as round(v) into the option list, which is only meaningful when the
+  // root is argmax (it returns an exact integer index). Any other op returns an
+  // arbitrary scalar that round() would smear across options — reject it.
+  if (kind === "mc" && root.op !== "argmax") {
+    return { ok: false, drivers, deps: [], dropped, reason: "mc combiner root must be argmax (option-index selection)" };
+  }
   const deps = proposal.dependencies.filter(
     (d) => groundedIds.has(d.id1) && groundedIds.has(d.id2) && d.id1 !== d.id2 && Number.isFinite(d.rho)
   );
@@ -1354,8 +1567,11 @@ export interface LedgerUpdated {
   rec: "updated";
   id: string;
   t: number;
-  aggregate: AggregateForecast;
+  /** Optional: the sim-augmented aggregate (absent when the patch only carries a closing line). */
+  aggregate?: AggregateForecast;
   simulationRan?: boolean;
+  /** The sportsbook line near tip-off, merged into the entry's sports facet for CLV. */
+  sportsLineAtClose?: SportsLineSnapshot;
 }
 
 export interface LedgerEntry extends Omit<LedgerCreated, "rec"> {
@@ -1402,11 +1618,13 @@ export function loadLedger(): LedgerEntry[] {
       const { rec: _omit, ...rest } = rec;
       entries.set(rec.id, { ...rest, panel: Array.isArray(rec.panel) ? rec.panel : [] });
     } else if (rec.rec === "updated") {
-      // Patch the base entry with the sim-augmented aggregate (best-effort).
+      // Patch the base entry with the sim-augmented aggregate and/or the
+      // closing sportsbook line (best-effort — a missing field is just skipped).
       const entry = entries.get(rec.id);
-      if (entry && rec.aggregate) {
-        entry.aggregate = rec.aggregate;
+      if (entry) {
+        if (rec.aggregate) entry.aggregate = rec.aggregate;
         if (rec.simulationRan) entry.simulationRan = true;
+        if (rec.sportsLineAtClose && entry.question.sports) entry.question.sports.lineAtClose = rec.sportsLineAtClose;
       }
     } else if (rec.rec === "resolved") {
       const entry = entries.get(rec.id);
@@ -1438,41 +1656,55 @@ export function resolveLedgerEntry(
   outcome: LedgerOutcome,
   opts: { evidence: string; sources: string[]; resolvedBy: "swarm" | "operator" }
 ): LedgerResolved {
+  const kind = entry.question.kind;
+  // Canonicalize an mc outcome to the exact option-list spelling (case/space-
+  // insensitive). Callers already validate, but a primitive whose STORED
+  // outcome and scoring guard could disagree on case is latent corruption: the
+  // record would close "resolved" yet score nothing, silently dropping out of
+  // mc calibration.
+  const settled: LedgerOutcome =
+    kind === "mc" && typeof outcome === "string" && outcome !== "void"
+      ? (entry.question.options?.find((o) => o.trim().toLowerCase() === outcome.trim().toLowerCase()) ?? outcome)
+      : outcome;
   const rec: LedgerResolved = {
     v: 1,
     rec: "resolved",
     id: entry.id,
     t: Date.now(),
-    outcome,
+    outcome: settled,
     evidence: opts.evidence,
     sources: opts.sources,
     resolvedBy: opts.resolvedBy,
   };
-  const kind = entry.question.kind;
-  if (outcome !== "void") {
-    if (kind === "binary" && (outcome === 0 || outcome === 1)) {
-      const p = entry.aggregate.probability ?? 0.5;
-      rec.brier = brierScore(p, outcome);
-      rec.logScore = logScore(p, outcome);
-    } else if ((kind === "numeric" || kind === "date") && typeof outcome === "number") {
+  if (settled !== "void") {
+    if (kind === "binary" && (settled === 0 || settled === 1)) {
+      // A non-finite or missing headline is a corrupt record — score nothing
+      // rather than laundering it into a 0.5 coin-flip (clampProb maps NaN→0.5)
+      // that would poison every parameter the flywheel fits on this row.
+      const p = entry.aggregate.probability;
+      if (typeof p === "number" && Number.isFinite(p)) {
+        rec.brier = brierScore(p, settled);
+        rec.logScore = logScore(p, settled);
+      }
+    } else if ((kind === "numeric" || kind === "date") && typeof settled === "number") {
       const q = entry.aggregate.quantiles;
       if (q) {
-        rec.intervalScore = intervalScore(q.p10, q.p90, outcome);
-        rec.pinball = pinballLoss(q, outcome);
+        rec.intervalScore = intervalScore(q.p10, q.p90, settled);
+        rec.pinball = pinballLoss(q, settled);
       }
       // A realized date also scores the never-mass: the event happened, so
       // P(never) should have been low.
       if (kind === "date" && typeof entry.aggregate.pNever === "number") {
         rec.logScore = logScore(1 - entry.aggregate.pNever, 1);
       }
-    } else if (kind === "date" && outcome === "never") {
+    } else if (kind === "date" && settled === "never") {
       if (typeof entry.aggregate.pNever === "number") {
         rec.logScore = logScore(entry.aggregate.pNever, 1);
       }
-    } else if (kind === "mc" && typeof outcome === "string" && entry.aggregate.optionProbs) {
-      if (entry.question.options?.includes(outcome)) {
-        rec.brier = mcBrierScore(entry.aggregate.optionProbs, outcome);
-        rec.logScore = mcLogScore(entry.aggregate.optionProbs, outcome);
+    } else if (kind === "mc" && typeof settled === "string" && entry.aggregate.optionProbs) {
+      if (entry.question.options?.includes(settled)) {
+        rec.brier = mcBrierScore(entry.aggregate.optionProbs, settled);
+        rec.logScore = mcLogScore(entry.aggregate.optionProbs, settled);
       }
     }
   }
@@ -1513,7 +1745,7 @@ function scoreable(entries: LedgerEntry[]): { p: number; outcome: 0 | 1; panel: 
     const o = e.resolution.outcome;
     if (o !== 0 && o !== 1) continue;
     const p = e.aggregate.probability;
-    if (typeof p !== "number") continue;
+    if (typeof p !== "number" || !Number.isFinite(p)) continue;
     out.push({ p, outcome: o, panel: e.panel });
   }
   return out;
@@ -1542,7 +1774,7 @@ export function calibrationStats(entries: LedgerEntry[]): CalibrationStats {
   const byMethod: Record<string, { n: number; brierMean: number }> = {};
   for (const s of scored) {
     for (const m of s.panel) {
-      if (typeof m.probability !== "number") continue;
+      if (typeof m.probability !== "number" || !Number.isFinite(m.probability)) continue;
       const key = m.method || "unknown";
       const cur = byMethod[key] ?? { n: 0, brierMean: 0 };
       cur.brierMean = (cur.brierMean * cur.n + brierScore(m.probability, s.outcome)) / (cur.n + 1);
@@ -1578,6 +1810,84 @@ export function calibrationStats(entries: LedgerEntry[]): CalibrationStats {
     mcBins: mcBins.filter((b) => b.n > 0),
     byMethod,
   };
+}
+
+/** "Did we match/beat the market" — the success metric for sports forecasts. */
+export interface SportsCalibration {
+  /** Winner facets: our Brier vs the de-vigged moneyline's Brier on the realized team. */
+  winner: { n: number; brier: number; marketBrier: number };
+  /** Total-points facets: our mean pinball vs a degenerate "just predict the line" baseline. */
+  total: { n: number; pinball: number; linePinball: number };
+  /** Margin facets: same comparison against the spread. */
+  margin: { n: number; pinball: number; linePinball: number };
+  /** Closing Line Value: among facets with a captured closing line, the share where our median led the line's move. */
+  clv: { n: number; pctProfitable: number };
+}
+
+/** A degenerate distribution with all mass at v — the "forecast = the line" baseline for pinball comparison. */
+function pointQuantiles(v: number): Quantiles {
+  const out: Partial<Record<keyof Quantiles, number>> = {};
+  for (const { key } of QUANTILE_TAUS) out[key] = v;
+  return out as Quantiles;
+}
+
+/**
+ * Score the sports record against the market — the literal "match/beat the
+ * line" deliverable. Winner Brier vs the moneyline's Brier; total/margin pinball
+ * vs predicting the line itself; and CLV (did our median lead the line's move)
+ * for facets whose closing line was captured. Empty sections report n=0.
+ */
+export function sportsCalibrationStats(entries = loadLedger()): SportsCalibration {
+  const out: SportsCalibration = {
+    winner: { n: 0, brier: 0, marketBrier: 0 },
+    total: { n: 0, pinball: 0, linePinball: 0 },
+    margin: { n: 0, pinball: 0, linePinball: 0 },
+    clv: { n: 0, pctProfitable: 0 },
+  };
+  let winB = 0, winM = 0, totP = 0, totL = 0, marP = 0, marL = 0, clvProfit = 0;
+  for (const e of entries) {
+    const sm = e.question.sports;
+    if (!sm || !e.resolution) continue;
+    const o = e.resolution.outcome;
+    if (o === "void") continue;
+    if (sm.facet === "winner" && typeof o === "string" && e.aggregate.optionProbs && typeof sm.lineAtCreate?.pHome === "number") {
+      // The market baseline prices every leg (incl. Draw for 3-way books).
+      out.winner.n++;
+      winB += mcBrierScore(e.aggregate.optionProbs, o);
+      winM += mcBrierScore(sportsWinnerMarket(sm), o);
+    } else if ((sm.facet === "total" || sm.facet === "margin") && typeof o === "number" && e.aggregate.quantiles) {
+      // The margin baseline is the spread only when it's a true point-spread
+      // anchor (sm.sigma set) — a run/puck/handicap line is not the median margin.
+      const lineVal = sm.facet === "total" ? sm.lineAtCreate?.total : typeof sm.sigma === "number" ? sm.lineAtCreate?.spread : undefined;
+      // This is a "vs the line" comparison — skip facets that never had a line,
+      // or the missing baseline term would deflate the line's averaged pinball.
+      if (typeof lineVal !== "number") continue;
+      const ourPin = pinballLoss(e.aggregate.quantiles, o);
+      const linePin = pinballLoss(pointQuantiles(lineVal), o);
+      if (sm.facet === "total") {
+        out.total.n++;
+        totP += ourPin;
+        totL += linePin;
+      } else {
+        out.margin.n++;
+        marP += ourPin;
+        marL += linePin;
+      }
+    }
+    // CLV: our median led the line's open→close move (we beat the closing line).
+    const createV = sm.facet === "total" ? sm.lineAtCreate?.total : sm.facet === "margin" ? sm.lineAtCreate?.spread : sm.lineAtCreate?.pHome;
+    const closeV = sm.facet === "total" ? sm.lineAtClose?.total : sm.facet === "margin" ? sm.lineAtClose?.spread : sm.lineAtClose?.pHome;
+    const ourMedian = sm.facet === "winner" ? e.aggregate.optionProbs?.[sm.home] : e.aggregate.quantiles?.p50;
+    if (typeof createV === "number" && typeof closeV === "number" && typeof ourMedian === "number" && closeV !== createV) {
+      out.clv.n++;
+      if (Math.sign(ourMedian - createV) === Math.sign(closeV - createV)) clvProfit++;
+    }
+  }
+  if (out.winner.n) { out.winner.brier = winB / out.winner.n; out.winner.marketBrier = winM / out.winner.n; }
+  if (out.total.n) { out.total.pinball = totP / out.total.n; out.total.linePinball = totL / out.total.n; }
+  if (out.margin.n) { out.margin.pinball = marP / out.margin.n; out.margin.linePinball = marL / out.margin.n; }
+  if (out.clv.n) out.clv.pctProfitable = clvProfit / out.clv.n;
+  return out;
 }
 
 /** Resolved history below this is noise, not a track record. */
@@ -1649,12 +1959,12 @@ const K_MAX = 6;
 export const MIN_ADAPTIVE_N = 30;
 
 export function chooseExtremizeK(entries = loadLedger(), fallback = DEFAULT_EXTREMIZE_K): number {
-  const usable = scoreable(entries).filter((s) => s.panel.filter((m) => typeof m.probability === "number").length >= 2);
+  const usable = scoreable(entries).filter((s) => s.panel.filter((m) => Number.isFinite(m.probability)).length >= 2);
   if (usable.length < MIN_ADAPTIVE_N) return fallback;
   const meanBrier = (k: number): number => {
     let sum = 0;
     for (const s of usable) {
-      const probs = s.panel.map((m) => m.probability).filter((p): p is number => typeof p === "number");
+      const probs = s.panel.map((m) => m.probability).filter((p): p is number => typeof p === "number" && Number.isFinite(p));
       try {
         sum += brierScore(aggregateBinary(probs, k).probability!, s.outcome);
       } catch (e) {
@@ -1698,7 +2008,21 @@ export function chooseExtremizeK(entries = loadLedger(), fallback = DEFAULT_EXTR
       fd = meanBrier(d);
     }
   }
-  return Number(((a + b) / 2).toFixed(3));
+  // Golden-section converges to an INTERIOR point of the bracket; if the true
+  // optimum sits at a boundary (k=K_MIN ≈ no extremization for a chronically
+  // overconfident panel, or k=K_MAX), that midpoint is strictly worse and
+  // unreachable. Compare the refined point against the coarse winner and the
+  // bracket endpoints and take the genuine argmin so a boundary k is reachable.
+  let bestK = coarseBest;
+  let bestKLoss = Infinity;
+  for (const k of [coarseBest, (a + b) / 2, a, b]) {
+    const loss = meanBrier(k);
+    if (loss < bestKLoss - 1e-12) {
+      bestKLoss = loss;
+      bestK = k;
+    }
+  }
+  return Number(bestK.toFixed(3));
 }
 
 // ---------------------------------------------------------------- backtest
@@ -1777,7 +2101,7 @@ export function backtest(entries = loadLedger()): BacktestReport {
     }
     const o = e.resolution.outcome;
     if (o !== 0 && o !== 1) continue;
-    const probs = e.panel.map((m) => m.probability).filter((p): p is number => typeof p === "number");
+    const probs = e.panel.map((m) => m.probability).filter((p): p is number => typeof p === "number" && Number.isFinite(p));
     const published = e.aggregate.probability;
     if (!probs.length || typeof published !== "number") {
       skipped.noPanel++;

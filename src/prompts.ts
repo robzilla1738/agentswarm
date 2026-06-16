@@ -177,6 +177,7 @@ const ROLE_HINTS: Record<string, string> = {
     "• Check market_odds (several phrasings) — calibrated crowds are a strong baseline. State explicitly whether you deviate from the crowd and exactly why your evidence beats theirs. If you anchor on a market, cite that exact market URL in your sources, so the engine knows the panel already reflects it and doesn't double-count it.\n" +
     "• Use time_series with project_to=<resolution date> for any quantitative trend that bears on the question — ground extrapolation in the OLS projection it returns, not in narrative momentum.\n" +
     "• MATCH THE TOOL TO THE DOMAIN: price-threshold questions → options_implied (the option market's own probability); elections/polling and historical base-rate lists → wiki_tables; weather-dependent questions → time_series openmeteo with past dates (the ERA5 archive turns \"how often does it snow 6 inches in March?\" into a counted frequency); public-attention trajectories (elections, launches, emerging events) → time_series wikipageviews — attention, not probability, but a useful leading indicator.\n" +
+    "• SPORTS GAMES (a single match between two teams — total points, margin of victory, or who wins): call sports_odds(home, away, sport, date) — always pass the league and game date from the question so it can't match the wrong sport or a different game in a series. The sharp closing line is the most accurate public predictor of a game; CENTER your total/margin quantiles on the book's total/spread and your win probability on the de-vigged moneyline, then justify any deviation with a concrete, line-relevant edge (an injury or rest situation the line hasn't absorbed). The realized total/margin still scatters by roughly a sport-specific σ around the line (NBA total ≈±11, margin ≈±12), so keep your interval honestly wide.\n" +
     "• NEWS VOLUME MEASURES ATTENTION, NOT PROBABILITY. Heavy coverage of a possibility is not evidence it will happen (use gdelt to see attention for what it is, then ask what the boring base rate says). Commentary and prediction articles are sentiment; primary documents, data series, and counted history are evidence.\n" +
     "• TIME WINDOW: a \"by DATE\" question is about the remaining window. Decompose into per-period hazard rates — the same event with less remaining time deserves a lower probability, whatever the headlines say.\n" +
     "• Consider BOTH directions: write down the strongest case for YES and the strongest case for NO before settling.\n" +
@@ -680,6 +681,15 @@ export function aggregateBlock(q: ForecastQuestion, agg: AggregateForecast, pane
       `ENSEMBLE FORECAST (10%-trimmed mean per quantile${agg.logSpace ? ", aggregated in log space for skew" : ""}): p10 ${fq(agg.quantiles.p10)} · p50 ${fq(agg.quantiles.p50)} · p90 ${fq(agg.quantiles.p90)}${mid}`,
       `Panel size: ${agg.n} · relative p50 spread: ${Math.round(agg.spread * 100)}%`
     );
+    const ml = agg.components?.marketLine;
+    if (ml && q.sports) {
+      lines.push(
+        `Anchored to the sportsbook ${ml.lineKind === "total" ? "total" : "spread"} line of ${Number(ml.line.toPrecision(6))} (per-sport σ=${ml.sigma}, blend weight ${ml.weight.toFixed(2)}) — the closing line is the strongest public predictor, so the published interval is centered on it and only nudged where the panel had a concrete edge.`
+      );
+    }
+  }
+  if (q.kind === "mc" && q.sports?.facet === "winner" && typeof q.sports.lineAtCreate?.pHome === "number") {
+    lines.push(`Anchored to the de-vigged sportsbook moneyline (${q.sports.home} ${pct(q.sports.lineAtCreate.pHome)}).`);
   }
   if (agg.spread > 0.25) {
     lines.push(`NOTE: the panel disagreed substantially — present the disagreement honestly, not just the point estimate.`);

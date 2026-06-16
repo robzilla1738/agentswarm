@@ -12,6 +12,7 @@ import {
   formatTimeSeries,
   marketOdds,
   optionsImplied,
+  sportsbookLines,
   timeSeries,
   wikiSummary,
   wikiTables,
@@ -530,6 +531,38 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
       const count = Math.min(Math.max(Number(args.count) || 10, 1), 25);
       const hits = await marketOdds(ctx.cfg, String(args.query), count, ctx.signal, (m) => ctx.log?.("warn", m));
       return formatMarketHits(hits);
+    },
+  };
+
+  tools.sports_odds = {
+    schema: {
+      name: "sports_odds",
+      description:
+        "Sharp sportsbook consensus for a single upcoming game (The Odds API; needs the free oddsApiKey): de-vigged moneyline win probability, the point spread, and the over/under total, each a book-median across many bookmakers. The closing line is the single most accurate public predictor of a game — center your total/margin quantiles on it and your win probability on the moneyline, then justify any deviation. ALWAYS pass `sport` (the league) and `date` from the question when known — they disambiguate same-name teams across leagues and a team-pair that plays more than once. Returns null-equivalent text when no matching game is found.",
+      parameters: {
+        type: "object",
+        properties: {
+          home: { type: "string", description: "One team (home or away — order need not match the book)" },
+          away: { type: "string", description: "The other team" },
+          sport: { type: "string", description: "League/sport, e.g. NBA, NFL, MLB, NHL, EPL — disambiguates same-name teams across leagues" },
+          date: { type: "string", description: "Game date YYYY-MM-DD when known — pins a specific game in a series" },
+        },
+        required: ["home", "away"],
+      },
+    },
+    run: async (args, ctx) => {
+      const sport = args.sport ? String(args.sport) : "";
+      const date = /^\d{4}-\d{2}-\d{2}$/.test(String(args.date ?? "")) ? String(args.date) : undefined;
+      // The league word rides in the query (leagueKeyHint parses it); the date goes through opts.
+      const query = `${sport} ${String(args.home)} ${String(args.away)}`.trim();
+      if (!ctx.cfg.oddsApiKey) return "sportsbook odds need the free oddsApiKey (set it in Settings) — none configured";
+      const line = await sportsbookLines(ctx.cfg, query, { date, signal: ctx.signal });
+      if (!line) return `no matching upcoming game found for "${query}"${date ? ` on ${date}` : ""}`;
+      const lines: string[] = [`${line.sportTitle}: ${line.away} @ ${line.home} (${line.commence.slice(0, 16).replace("T", " ")} UTC) — median of ${line.nBooks} books`];
+      if (line.h2h) lines.push(`Moneyline (de-vigged): ${line.home} ${Math.round(line.h2h.pHome * 100)}%${typeof line.h2h.pDraw === "number" ? ` / Draw ${Math.round(line.h2h.pDraw * 100)}%` : ""} / ${line.away} ${Math.round(line.h2h.pAway * 100)}%`);
+      if (line.spread) lines.push(`Spread: ${line.spread.favorite === "home" ? line.home : line.away} -${line.spread.line}`);
+      if (line.total) lines.push(`Total (over/under): ${line.total.line} points`);
+      return lines.join("\n");
     },
   };
 

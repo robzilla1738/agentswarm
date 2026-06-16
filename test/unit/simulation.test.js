@@ -183,6 +183,55 @@ test("scenarios rank by frequency and a tornado is produced", () => {
   assert.ok(r.sensitivity.every((s) => s.varianceContribution >= 0 && s.varianceContribution <= 1));
 });
 
+test("tornado: a near-certain binary driver that drives the outcome reports nonzero importance", () => {
+  // p=0.95 binary driver A IS the outcome here. The old quantile-bin η² collapsed
+  // A's 5% of zeros into the majority block and reported ZERO influence for a
+  // driver that fully determines Y — exactly the rare-flip driver a tornado must
+  // surface. Distinct-value binning fixes it (η²→1).
+  const drivers = [binDriver("A", 0.95), binDriver("B", 0.5)];
+  const spec = { kind: "binary", root: { op: "driver", id: "A" } };
+  const r = runSimulation(drivers, spec, [], 20000, 23);
+  const a = r.sensitivity.find((s) => s.driverId === "A");
+  assert.ok(a.varianceContribution > 0.5, `near-certain binary driver must show real influence, got ${a.varianceContribution}`);
+});
+
+test("evalCombiner weighted_sum: a mixed-sign difference is NOT normalized away", () => {
+  const idx = new Map([["A", 0], ["B", 1]]);
+  // [1, -1] over (10, 4) is the difference 6 — NOT the old Σ|w| result 0.5·10 − 0.5·4 = 3.
+  const diff = { op: "weighted_sum", children: [{ op: "driver", id: "A" }, { op: "driver", id: "B" }], weights: [1, -1] };
+  near(evalCombiner(diff, idx, [10, 4]), 6, 1e-9, "difference keeps full magnitude");
+  // All-nonneg weights still normalize to a weighted average (unchanged).
+  const avg = { op: "weighted_sum", children: [{ op: "driver", id: "A" }, { op: "driver", id: "B" }], weights: [1, 3] };
+  near(evalCombiner(avg, idx, [4, 8]), (1 * 4 + 3 * 8) / 4, 1e-9, "convex combo unchanged");
+});
+
+test("aggregateSimOutcomes mc uses Laplace smoothing — unseen options shrink with N, simplex holds", () => {
+  const opts = ["A", "B", "C"];
+  const combiner = { kind: "mc", root: { op: "argmax", children: [] }, mcOptions: opts };
+  const agg = aggregateSimOutcomes([0, 0, 0, 0, 0, 0], combiner); // all select index 0
+  near(opts.reduce((s, o) => s + agg.optionProbs[o], 0), 1, 1e-9, "simplex");
+  near(agg.optionProbs.A, 7 / 9, 1e-9); // (6+1)/(6+3)
+  near(agg.optionProbs.B, 1 / 9, 1e-9); // (0+1)/(6+3)
+  const big = aggregateSimOutcomes(new Array(600).fill(0), combiner);
+  assert.ok(big.optionProbs.B < agg.optionProbs.B, "an unseen option's smoothed mass shrinks as N grows (unlike a flat floor)");
+});
+
+test("validateSimStructure rejects an mc combiner whose root is not argmax", () => {
+  const catalog = [binDriver("A", 0.5), binDriver("B", 0.5)];
+  const base = { drivers: ["A", "B"], dependencies: [], rationale: "" };
+  const notArgmax = validateSimStructure(
+    { ...base, combiner: { op: "or", children: [{ op: "driver", id: "A" }, { op: "driver", id: "B" }] } },
+    catalog, "mc", ["X", "Y"]
+  );
+  assert.equal(notArgmax.ok, false);
+  assert.match(notArgmax.reason, /argmax/);
+  const argmax = validateSimStructure(
+    { ...base, combiner: { op: "argmax", children: [{ op: "driver", id: "A" }, { op: "driver", id: "B" }] } },
+    catalog, "mc", ["X", "Y"]
+  );
+  assert.equal(argmax.ok, true, "the same structure with an argmax root is accepted");
+});
+
 // ---------------------------------------------------------------- runSimulation: numeric & mc
 
 test("numeric sum combiner ≈ sum of medians", () => {

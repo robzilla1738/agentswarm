@@ -150,8 +150,14 @@ export async function polymarketSearch(query: string, count: number, signal?: Ab
       try {
         const prices = typeof m.outcomePrices === "string" ? JSON.parse(m.outcomePrices) : m.outcomePrices;
         const outcomes = typeof m.outcomes === "string" ? JSON.parse(m.outcomes) : m.outcomes;
-        const yes = Array.isArray(outcomes) ? outcomes.findIndex((o: unknown) => String(o).toLowerCase() === "yes") : -1;
-        if (Array.isArray(prices)) probability = num(prices[yes >= 0 ? yes : 0]);
+        // Only a genuine 2-outcome market yields a P(YES). For a multi-candidate
+        // market prices[0] is P(first option) — labeling that as the event's YES
+        // probability would mislead the panel and could mis-anchor a binary
+        // forecast. Mirror the tournament importer's 2-outcome rule.
+        if (Array.isArray(prices) && Array.isArray(outcomes) && outcomes.length === 2) {
+          const yes = outcomes.findIndex((o: unknown) => String(o).toLowerCase() === "yes");
+          probability = num(prices[yes >= 0 ? yes : 0]);
+        }
       } catch {
         /* market without parseable prices still names the question */
       }
@@ -233,6 +239,11 @@ export async function kalshiSearch(query: string, count: number, signal?: AbortS
 export function devigProbs(decimalOdds: number[]): number[] {
   const inv = decimalOdds.map((o) => (o > 1 ? 1 / o : 0));
   const sum = inv.reduce((s, v) => s + v, 0);
+  // Need ≥2 priced outcomes to remove the margin. Normalizing a single outcome
+  // to sum 1 would fabricate a 100% probability (devigProbs([1.5]) → [1]); return
+  // the raw implied prob instead so a one-sided book reads as incomplete rather
+  // than certain.
+  if (inv.filter((v) => v > 0).length < 2) return inv;
   return sum > 0 ? inv.map((v) => v / sum) : inv;
 }
 
@@ -328,7 +339,9 @@ export async function sportsbookSearch(
       const h2h = (bk?.markets ?? []).find((m: any) => m?.key === "h2h");
       const outcomes = Array.isArray(h2h?.outcomes) ? h2h.outcomes : [];
       const prices = outcomes.map((o: any) => Number(o?.price));
-      if (!prices.length || prices.some((p: number) => !Number.isFinite(p) || p <= 1)) continue;
+      // Need ≥2 priced outcomes to de-vig; a lone outcome (suspended line, one
+      // side pulled) isn't a probability and would otherwise fabricate ~100%.
+      if (prices.length < 2 || prices.some((p: number) => !Number.isFinite(p) || p <= 1)) continue;
       const probs = devigProbs(prices);
       outcomes.forEach((o: any, i: number) => {
         const key = String(o?.name ?? "");
@@ -362,6 +375,402 @@ export async function sportsbookSearch(
     .sort((a, b) => b.score - a.score)
     .slice(0, count)
     .map((s) => s.hit);
+}
+
+// ---------------------------------------------------------------- sports lines (totals / spreads / final scores)
+
+/**
+ * A sportsbook's consensus lines for ONE head-to-head game: de-vigged win
+ * probability, point spread, and total, plus the keys needed to re-fetch and
+ * resolve the game. Sharp lines are the strongest public predictor of a game's
+ * outcome — the engine anchors the winner/total/margin sub-forecasts to them.
+ */
+export interface SportsLine {
+  /** The Odds API event id (a re-fetch handle). */
+  eventId: string;
+  /** e.g. "basketball_nba" — the key the /scores endpoint needs. */
+  sportKey: string;
+  /** e.g. "NBA" — drives the per-sport σ lookup. */
+  sportTitle: string;
+  /** ISO commence time. */
+  commence: string;
+  home: string;
+  away: string;
+  /** De-vigged, book-median win probabilities. pDraw is present only for 3-way (soccer-style) books. */
+  h2h?: { pHome: number; pAway: number; pDraw?: number };
+  /** Consensus point spread: |handicap| on the favorite, and which side is favored. */
+  spread?: { line: number; favorite: "home" | "away" };
+  /** Consensus over/under total points. */
+  total?: { line: number };
+  /** Bookmakers that contributed. */
+  nBooks: number;
+}
+
+/** Final score of a completed game (The Odds API /scores). */
+export interface SportsScore {
+  completed: boolean;
+  home: string;
+  away: string;
+  homeScore: number;
+  awayScore: number;
+}
+
+const TEAM_STOPWORDS = new Set(["the", "fc", "afc", "club"]);
+
+/** Tokens for fuzzy team/query matching: lowercase alphanumerics, drop tiny/stop words. */
+function teamTokens(s: string): string[] {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, " ")
+    .split(/\s+/)
+    .filter((t) => t.length > 2 && !TEAM_STOPWORDS.has(t));
+}
+
+/**
+ * City/structural tokens shared by many teams (so NOT distinctive on their own):
+ * a match must share a non-generic token — usually the mascot — per side, or
+ * "New York Giants" could bind a Jets game via "new"/"york", and "Man City" a
+ * different "* City". Mascots (giants, lakers, arsenal) are never in this set.
+ */
+const GENERIC_TEAM_TOKENS = new Set([
+  "new", "york", "los", "angeles", "san", "saint", "las", "vegas", "bay", "fort",
+  "north", "south", "east", "west", "city", "united", "county", "town", "club",
+  "sporting", "real", "inter", "athletic", "atletico", "deportivo", "state", "the",
+]);
+/** A team's distinctive (non-generic) tokens — the part that identifies it within its city/league. */
+export function distinctiveTokens(s: string): string[] {
+  return teamTokens(s).filter((t) => !GENERIC_TEAM_TOKENS.has(t));
+}
+
+/** Median of a numeric sample (NaN on empty). */
+function medianOf(values: number[]): number {
+  if (!values.length) return NaN;
+  const s = [...values].sort((a, b) => a - b);
+  const n = s.length;
+  return n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
+}
+
+/** Reduce one Odds API event to a SportsLine: median across books per market, de-vig h2h. */
+function parseEventLines(ev: any, home: string, away: string): SportsLine | null {
+  const sportKey = String(ev?.sport_key ?? "");
+  const commence = String(ev?.commence_time ?? "");
+  if (!sportKey || !commence) return null;
+  const books = Array.isArray(ev?.bookmakers) ? ev.bookmakers : [];
+  const pHome: number[] = [];
+  const pAway: number[] = [];
+  const pDraw: number[] = [];
+  const spreads: { line: number; favorite: "home" | "away" }[] = [];
+  const totals: number[] = [];
+  for (const bk of books) {
+    const markets = Array.isArray(bk?.markets) ? bk.markets : [];
+    const h2h = markets.find((m: any) => m?.key === "h2h");
+    if (h2h) {
+      const outs = Array.isArray(h2h.outcomes) ? h2h.outcomes : [];
+      const hp = Number(outs.find((o: any) => String(o?.name) === home)?.price);
+      const ap = Number(outs.find((o: any) => String(o?.name) === away)?.price);
+      // 3-way books (soccer and the like) carry a Draw outcome; de-vig ALL
+      // present outcomes together, or a 2-way de-vig inflates home/away.
+      const dp = Number(outs.find((o: any) => /^draw|^tie$/i.test(String(o?.name)))?.price);
+      if (hp > 1 && ap > 1) {
+        if (dp > 1) {
+          const [ph, pd, pa] = devigProbs([hp, dp, ap]);
+          pHome.push(ph);
+          pDraw.push(pd);
+          pAway.push(pa);
+        } else {
+          const [ph, pa] = devigProbs([hp, ap]);
+          pHome.push(ph);
+          pAway.push(pa);
+        }
+      }
+    }
+    const spread = markets.find((m: any) => m?.key === "spreads");
+    if (spread) {
+      const outs = Array.isArray(spread.outcomes) ? spread.outcomes : [];
+      const hp = Number(outs.find((o: any) => String(o?.name) === home)?.point);
+      if (Number.isFinite(hp) && hp !== 0) spreads.push({ line: Math.abs(hp), favorite: hp < 0 ? "home" : "away" });
+    }
+    const total = markets.find((m: any) => m?.key === "totals");
+    if (total) {
+      const outs = Array.isArray(total.outcomes) ? total.outcomes : [];
+      const pt = Number(outs[0]?.point);
+      if (Number.isFinite(pt) && pt > 0) totals.push(pt);
+    }
+  }
+  const line: SportsLine = {
+    eventId: String(ev?.id ?? ""),
+    sportKey,
+    sportTitle: String(ev?.sport_title ?? ""),
+    commence,
+    home,
+    away,
+    nBooks: books.length,
+  };
+  if (pHome.length) line.h2h = { pHome: medianOf(pHome), pAway: medianOf(pAway), ...(pDraw.length ? { pDraw: medianOf(pDraw) } : {}) };
+  if (spreads.length) {
+    const favHome = spreads.filter((s) => s.favorite === "home").length;
+    line.spread = { line: medianOf(spreads.map((s) => s.line)), favorite: favHome * 2 >= spreads.length ? "home" : "away" };
+  }
+  if (totals.length) line.total = { line: medianOf(totals) };
+  return line;
+}
+
+/** The Odds API `group`s we decompose — team games with home/away + spreads/totals (not individual sports or futures). */
+const TEAM_SPORT_GROUPS = new Set([
+  "American Football",
+  "Aussie Rules",
+  "Baseball",
+  "Basketball",
+  "Cricket",
+  "Ice Hockey",
+  "Lacrosse",
+  "Rugby League",
+  "Rugby Union",
+  "Soccer",
+]);
+
+let activeSportsCache: { t: number; sports: string[] } | null = null;
+const sportEventsCache = new Map<string, { t: number; evs: any }>();
+
+/** In-season team-sport keys (The Odds API /sports — free, cached 6h in-process). */
+async function activeTeamSports(cfg: SwarmConfig, signal?: AbortSignal): Promise<string[]> {
+  if (activeSportsCache && Date.now() - activeSportsCache.t < 6 * 3_600_000) return activeSportsCache.sports;
+  const res = await apiGet(`https://api.the-odds-api.com/v4/sports?apiKey=${encodeURIComponent(cfg.oddsApiKey)}`, signal);
+  const data: any = await res.json();
+  const sports = (Array.isArray(data) ? data : [])
+    .filter((s: any) => s?.active && !s?.has_outrights && TEAM_SPORT_GROUPS.has(String(s?.group)))
+    .map((s: any) => String(s?.key))
+    .filter(Boolean);
+  activeSportsCache = { t: Date.now(), sports };
+  return sports;
+}
+
+/** Upcoming events for one sport (The Odds API /events — free, full schedule, cached 5min). */
+async function sportEvents(cfg: SwarmConfig, sportKey: string, signal?: AbortSignal): Promise<any[]> {
+  const cached = sportEventsCache.get(sportKey);
+  if (cached && Date.now() - cached.t < 5 * 60_000) return cached.evs;
+  const res = await apiGet(`https://api.the-odds-api.com/v4/sports/${encodeURIComponent(sportKey)}/events?apiKey=${encodeURIComponent(cfg.oddsApiKey)}`, signal);
+  const evs = await res.json();
+  const arr = Array.isArray(evs) ? evs : [];
+  sportEventsCache.set(sportKey, { t: Date.now(), evs: arr });
+  return arr;
+}
+
+/** Odds for ONE event (cost = markets × regions = 3 on us). */
+async function eventOdds(cfg: SwarmConfig, sportKey: string, eventId: string, signal?: AbortSignal): Promise<SportsLine | null> {
+  try {
+    const res = await apiGet(
+      `https://api.the-odds-api.com/v4/sports/${encodeURIComponent(sportKey)}/events/${encodeURIComponent(eventId)}/odds?regions=us&markets=h2h,spreads,totals&oddsFormat=decimal&apiKey=${encodeURIComponent(cfg.oddsApiKey)}`,
+      signal
+    );
+    const ev: any = await res.json();
+    return parseEventLines(ev, String(ev?.home_team ?? ""), String(ev?.away_team ?? ""));
+  } catch {
+    return null;
+  }
+}
+
+/** League words → the Odds API sport key they pin to (disambiguates same-name teams across leagues). */
+const LEAGUE_KEY_HINTS: [RegExp, string][] = [
+  [/\bnba\b/i, "basketball_nba"],
+  [/\bwnba\b/i, "basketball_wnba"],
+  [/\b(ncaab|college basketball)\b/i, "basketball_ncaab"],
+  [/\bnfl\b/i, "americanfootball_nfl"],
+  [/\b(ncaaf|college football)\b/i, "americanfootball_ncaaf"],
+  [/\b(mlb|baseball)\b/i, "baseball_mlb"],
+  [/\bnhl\b/i, "icehockey_nhl"],
+  [/\b(epl|premier league)\b/i, "soccer_epl"],
+  [/\bla ?liga\b/i, "soccer_spain_la_liga"],
+  [/\bbundesliga\b/i, "soccer_germany_bundesliga"],
+  [/\bserie a\b/i, "soccer_italy_serie_a"],
+  [/\bchampions league\b/i, "soccer_uefa_champs_league"],
+];
+function leagueKeyHint(text: string): string | null {
+  for (const [re, key] of LEAGUE_KEY_HINTS) if (re.test(text)) return key;
+  return null;
+}
+
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+/** A target day (epoch-days, UTC) parsed from an ISO date or a "Month DD"/"DD Month" phrase; null if none. */
+/** Odds API sport-key prefixes for US/Americas leagues, whose evening games commence after UTC midnight. */
+const US_LEAGUE_PREFIXES = [
+  "americanfootball",
+  "basketball_nba",
+  "basketball_wnba",
+  "basketball_ncaab",
+  "baseball_mlb",
+  "baseball_milb",
+  "icehockey_nhl",
+  "lacrosse",
+  "soccer_usa",
+  "soccer_mexico",
+  "soccer_conmebol",
+];
+function isUsLeague(sportKey: string): boolean {
+  return US_LEAGUE_PREFIXES.some((p) => sportKey.startsWith(p));
+}
+
+/**
+ * Day-number for a game's LOCAL calendar date — what a user means by "the June
+ * 20 game". US/Americas evening games commence after UTC midnight, so they are
+ * shifted back 10h to land on their local date; leagues at/east of UTC (Europe,
+ * Australia, Asia) already commence on their local UTC date, so no shift. A
+ * coarse but correct US-vs-rest model — the Odds API exposes no venue timezone.
+ * Call with no sportKey (shift 0) for a plain calendar day (e.g. a target date).
+ */
+export function sportsDayNumber(ms: number, sportKey = ""): number {
+  const shiftH = isUsLeague(sportKey) ? 10 : 0;
+  return Math.floor((ms - shiftH * 3_600_000) / 86_400_000);
+}
+
+/** The ISO date (YYYY-MM-DD) of a game's local sports day — the user-facing/resolution date. */
+export function sportsDayIso(ms: number, sportKey = ""): string {
+  return new Date(sportsDayNumber(ms, sportKey) * 86_400_000 + 12 * 3_600_000).toISOString().slice(0, 10);
+}
+
+function parseTargetDay(text: string): number | null {
+  if (!text) return null;
+  const iso = text.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) {
+    const ms = Date.parse(`${iso[1]}-${iso[2]}-${iso[3]}T12:00:00Z`);
+    return Number.isFinite(ms) ? sportsDayNumber(ms) : null;
+  }
+  const lower = text.toLowerCase();
+  const m = lower.match(/\b([a-z]{3,9})\.?\s+(\d{1,2})\b/) || lower.match(/\b(\d{1,2})\s+([a-z]{3,9})\b/);
+  if (m) {
+    const monStr = /[a-z]/.test(m[1]) ? m[1] : m[2];
+    const day = Number(/[a-z]/.test(m[1]) ? m[2] : m[1]);
+    const mon = MONTHS.findIndex((mm) => monStr.startsWith(mm));
+    if (mon >= 0 && day >= 1 && day <= 31) {
+      const now = Date.now();
+      let ms = Date.UTC(new Date(now).getUTCFullYear(), mon, day, 12);
+      if (ms < now - 2 * 86_400_000) ms = Date.UTC(new Date(now).getUTCFullYear() + 1, mon, day, 12);
+      return sportsDayNumber(ms);
+    }
+  }
+  return null;
+}
+
+/**
+ * Sharp consensus lines for a single head-to-head game from The Odds API. The
+ * `upcoming` odds key only returns the next 8 games across ALL sports, so we
+ * discover the game through the FREE /sports + /events endpoints (full per-sport
+ * schedule, no quota cost), then buy odds for ONLY the matched event (cost = 3).
+ *
+ * Matching requires BOTH team names (a single-team hit must not match a game)
+ * and respects any league word ("NFL Giants vs Cardinals" won't match the MLB
+ * pair) and any date in the query/opts ("…on June 20" won't bind to an earlier
+ * game in the series); on remaining ties it picks the SOONEST event
+ * deterministically, never API order. Pass `opts.sportKey`+`opts.eventId` to
+ * refresh a KNOWN event directly (closing-line capture) with zero match risk.
+ * Needs the free oddsApiKey; returns null without it or when no game clears.
+ */
+export async function sportsbookLines(
+  cfg: SwarmConfig,
+  query: string,
+  opts: { sportKey?: string; eventId?: string; date?: string; signal?: AbortSignal } = {}
+): Promise<SportsLine | null> {
+  if (!cfg.oddsApiKey) return null;
+  const { signal } = opts;
+  // Direct refresh of a known event — no fuzzy match, never the wrong game.
+  if (opts.sportKey && opts.eventId) return eventOdds(cfg, opts.sportKey, opts.eventId, signal);
+  const qTokens = new Set(teamTokens(query));
+  if (!qTokens.size) return null;
+  const qDistinct = new Set(distinctiveTokens(query));
+  const leagueKey = leagueKeyHint(query);
+  const targetDay = parseTargetDay(opts.date || query);
+  let sportKeys: string[];
+  try {
+    sportKeys = await activeTeamSports(cfg, signal);
+  } catch {
+    return null;
+  }
+  if (leagueKey) sportKeys = sportKeys.filter((k) => k === leagueKey);
+  if (!sportKeys.length) return null;
+  // Fan out the free events lookup across the (league-filtered) team sports.
+  const lists = await Promise.allSettled(sportKeys.map((key) => sportEvents(cfg, key, signal).then((evs) => ({ key, evs }))));
+  let best: { sportKey: string; eventId: string; home: string; away: string; score: number; commence: number } | null = null;
+  for (const r of lists) {
+    if (r.status !== "fulfilled") continue;
+    const { key, evs } = r.value;
+    for (const ev of evs) {
+      const home = String(ev?.home_team ?? "");
+      const away = String(ev?.away_team ?? "");
+      const eventId = String(ev?.id ?? "");
+      if (!home || !away || !eventId) continue;
+      const homeHit = teamTokens(home).filter((t) => qTokens.has(t)).length;
+      const awayHit = teamTokens(away).filter((t) => qTokens.has(t)).length;
+      if (homeHit === 0 || awayHit === 0) continue; // both teams must be named
+      // Require a DISTINCTIVE (non-generic) token per side so shared city words
+      // can't bind the wrong same-city team. A team with no distinctive tokens
+      // at all (e.g. "New York City FC") falls back to any-token match.
+      const homeDist = distinctiveTokens(home);
+      const awayDist = distinctiveTokens(away);
+      const homeOk = homeDist.length === 0 || homeDist.some((t) => qDistinct.has(t));
+      const awayOk = awayDist.length === 0 || awayDist.some((t) => qDistinct.has(t));
+      if (!homeOk || !awayOk) continue;
+      const commence = Date.parse(String(ev?.commence_time ?? "")) || Number.MAX_SAFE_INTEGER;
+      // Honor an explicit date EXACTLY (on the timezone-normalized sports day):
+      // a dated request must match that day's game or none — never an adjacent
+      // game in a series. Fail closed (the normal planner then handles it)
+      // rather than bind the wrong eventId.
+      if (targetDay !== null && sportsDayNumber(commence, key) !== targetDay) continue;
+      const score = homeHit + awayHit;
+      const better = !best || score > best.score || (score === best.score && commence < best.commence);
+      if (better) best = { sportKey: key, eventId, home, away, score, commence };
+    }
+  }
+  if (!best) return null;
+  return eventOdds(cfg, best.sportKey, best.eventId, signal);
+}
+
+/**
+ * Final score of a completed game from The Odds API /scores (daysFrom=3 —
+ * the free-tier window). Resolves against the stored eventId (Odds API ids are
+ * stable between /odds and /scores), so a team-pair that plays twice inside the
+ * window — an MLB series, a doubleheader — can never settle the wrong game. A
+ * legacy entry with no id falls back to team-pair + commence proximity. Returns
+ * null until `completed`, so a straggler older than 3 days falls back to the
+ * research-agent resolver.
+ */
+export async function sportsScore(
+  cfg: SwarmConfig,
+  match: { sportKey: string; home: string; away: string; eventId?: string; commence?: string },
+  signal?: AbortSignal
+): Promise<SportsScore | null> {
+  if (!cfg.oddsApiKey || !match.sportKey) return null;
+  // A fetch/HTTP failure THROWS (the caller treats it as "couldn't check" and
+  // falls back to the web resolver) — distinct from a successful response where
+  // the game simply isn't completed yet, which returns null ("not final, wait").
+  const res = await apiGet(
+    `https://api.the-odds-api.com/v4/sports/${encodeURIComponent(match.sportKey)}/scores?daysFrom=3&apiKey=${encodeURIComponent(cfg.oddsApiKey)}`,
+    signal
+  );
+  const data: any = await res.json();
+  const homeT = new Set(teamTokens(match.home));
+  const awayT = new Set(teamTokens(match.away));
+  const wantId = match.eventId || "";
+  const wantMs = match.commence ? Date.parse(match.commence) : NaN;
+  for (const ev of Array.isArray(data) ? data : []) {
+    if (!ev?.completed) continue;
+    const evHome = String(ev?.home_team ?? "");
+    const evAway = String(ev?.away_team ?? "");
+    if (wantId) {
+      // Exact event — zero wrong-game risk.
+      if (String(ev?.id ?? "") !== wantId) continue;
+    } else {
+      // Legacy entry without a stored id: team-pair + commence proximity (≤18h).
+      if (!teamTokens(evHome).some((t) => homeT.has(t)) || !teamTokens(evAway).some((t) => awayT.has(t))) continue;
+      const evMs = Date.parse(String(ev?.commence_time ?? ""));
+      if (Number.isFinite(wantMs) && Number.isFinite(evMs) && Math.abs(evMs - wantMs) > 18 * 3_600_000) continue;
+    }
+    const scores = Array.isArray(ev?.scores) ? ev.scores : [];
+    const hs = Number(scores.find((s: any) => String(s?.name) === evHome)?.score);
+    const as = Number(scores.find((s: any) => String(s?.name) === evAway)?.score);
+    if (!Number.isFinite(hs) || !Number.isFinite(as)) continue;
+    return { completed: true, home: evHome, away: evAway, homeScore: hs, awayScore: as };
+  }
+  return null;
 }
 
 /**
@@ -878,7 +1287,10 @@ async function yahooSeries(series: string, start?: string, end?: string, signal?
     );
   }
   const ts: number[] = Array.isArray(result.timestamp) ? result.timestamp : [];
-  const closes: unknown[] = result.indicators?.quote?.[0]?.close ?? [];
+  // Prefer split/dividend-adjusted closes so a corporate action (e.g. a 4:1
+  // split) doesn't inject a step discontinuity the OLS trend would read as a
+  // huge slope. adjclose is absent for FX/indices/crypto — fall back to raw close.
+  const closes: unknown[] = result.indicators?.adjclose?.[0]?.adjclose ?? result.indicators?.quote?.[0]?.close ?? [];
   const points = ts
     .map((t, i) => ({ date: new Date(t * 1000).toISOString().slice(0, 10), value: Number(closes[i]) }))
     .filter((p) => Number.isFinite(p.value));
@@ -1119,13 +1531,15 @@ function tQuantile90(df: number): number {
  * t(n−2) · σ · √(1 + 1/n + (x−x̄)²/Sxx). Unlike a flat ±1.28σ residual band,
  * this widens with extrapolation distance — exactly where forecasters lean on
  * the projection hardest. Deterministic trend math the agent can cite instead
- * of narrating "momentum" — a baseline, not destiny. Returns null when a line
- * can't be fit (fewer than 2 points, or no time variance). The band still
- * ignores autocorrelated residuals (near-universal in time series), so treat
- * it as optimistic.
+ * of narrating "momentum" — a baseline, not destiny. Returns null when a band
+ * can't be honestly estimated (fewer than 3 points — with 2 the line fits
+ * exactly, residual variance is undefined, and the band collapses to a
+ * zero-width point mass paraded as 80% — or no time variance). σ is inflated
+ * for lag-1 residual autocorrelation (near-universal in time series), so the
+ * band is no longer the optimistic i.i.d. one.
  */
 export function olsProject(points: { date: string; value: number }[], targetDate: string): OlsProjection | null {
-  if (points.length < 2 || !/^\d{4}-\d{2}-\d{2}/.test(targetDate)) return null;
+  if (points.length < 3 || !/^\d{4}-\d{2}-\d{2}/.test(targetDate)) return null;
   const t0 = Date.parse(points[0].date);
   const target = Date.parse(targetDate);
   if (!Number.isFinite(t0) || !Number.isFinite(target)) return null;
@@ -1144,12 +1558,19 @@ export function olsProject(points: { date: string; value: number }[], targetDate
   if (sxx === 0) return null;
   const slope = sxy / sxx;
   const intercept = my - slope * mx;
-  let ssr = 0;
-  for (let i = 0; i < n; i++) {
-    const r = ys[i] - (intercept + slope * xs[i]);
-    ssr += r * r;
+  const resid = ys.map((y, i) => y - (intercept + slope * xs[i]));
+  const ssr = resid.reduce((s, r) => s + r * r, 0);
+  let sigma = Math.sqrt(ssr / (n - 2));
+  // Time-series residuals are autocorrelated, so the i.i.d. band understates
+  // uncertainty. Inflate σ by the AR(1) effective-sample-size factor
+  // √((1+ρ)/(1−ρ)) from the lag-1 residual autocorrelation. Only ever widen
+  // (ρ clamped to [0, 0.9]); needs ≥4 points to estimate ρ at all.
+  if (n >= 4 && ssr > 0) {
+    let r1 = 0;
+    for (let i = 1; i < n; i++) r1 += resid[i] * resid[i - 1];
+    const rho = Math.max(0, Math.min(0.9, r1 / ssr));
+    sigma *= Math.sqrt((1 + rho) / (1 - rho));
   }
-  const sigma = n > 2 ? Math.sqrt(ssr / (n - 2)) : 0;
   const xTarget = (target - t0) / DAY;
   const projected = intercept + slope * xTarget;
   // Full prediction interval: parameter uncertainty (1/n) plus the
@@ -1203,11 +1624,21 @@ export function formatTimeSeries(r: TimeSeriesResult, projectTo?: string): strin
   }
   if (projectTo) {
     const proj = olsProject(r.points, projectTo);
-    headerLines.push(
-      proj
-        ? `OLS trend: ${proj.slopePerDay >= 0 ? "+" : ""}${fmt(proj.slopePerDay)}/day over the window · naive projection to ${projectTo} (${proj.daysAhead}d ahead): ${fmt(proj.projected)} (80% prediction band ${fmt(proj.lo)}–${fmt(proj.hi)}, widens with distance) — a trend baseline, not destiny.`
-        : `OLS trend: not fittable for projection to ${projectTo} (need ≥2 dated observations with time variance).`
-    );
+    if (proj) {
+      // Clamp the band to the series' physical support where it's unambiguous:
+      // pageview counts, prices, and coverage % can't go negative, and GDELT %
+      // can't exceed 100. A symmetric Gaussian band that projects past the
+      // support is plainly wrong, and a forecaster reading "−500 pageviews" as
+      // a real lower bound is worse than no bound.
+      const nonNeg = r.source === "wikipageviews" || r.source === "yahoo" || r.source === "gdelt";
+      const lo = nonNeg ? Math.max(0, proj.lo) : proj.lo;
+      const hi = r.source === "gdelt" ? Math.min(100, proj.hi) : proj.hi;
+      headerLines.push(
+        `OLS trend: ${proj.slopePerDay >= 0 ? "+" : ""}${fmt(proj.slopePerDay)}/day over the window · naive projection to ${projectTo} (${proj.daysAhead}d ahead): ${fmt(proj.projected)} (80% prediction band ${fmt(lo)}–${fmt(hi)}, widens with distance) — a trend baseline, not destiny.`
+      );
+    } else {
+      headerLines.push(`OLS trend: not fittable for projection to ${projectTo} (need ≥3 dated observations with time variance).`);
+    }
   }
   const header = headerLines.join("\n");
   const tail = r.points
@@ -1238,6 +1669,32 @@ export function normCdf(x: number): number {
       t *
       Math.exp(-ax * ax);
   return 0.5 * (1 + sign * erf);
+}
+
+/**
+ * Inverse standard-normal CDF (Acklam's rational approximation, |err| < 1.15e-9).
+ * The quantile function normCdf lacks — needed to turn a sportsbook total/spread
+ * line into a Normal(line, σ) quantile distribution for market anchoring.
+ */
+export function normInv(p: number): number {
+  const pc = Math.min(1 - 1e-12, Math.max(1e-12, p));
+  const a = [-3.969683028665376e1, 2.209460984245205e2, -2.759285104469687e2, 1.38357751867269e2, -3.066479806614716e1, 2.506628277459239];
+  const b = [-5.447609879822406e1, 1.615858368580409e2, -1.556989798598866e2, 6.680131188771972e1, -1.328068155288572e1];
+  const c = [-7.784894002430293e-3, -3.223964580411365e-1, -2.400758277161838, -2.549732539343734, 4.374664141464968, 2.938163982698783];
+  const d = [7.784695709041462e-3, 3.224671290700398e-1, 2.445134137142996, 3.754408661907416];
+  const plow = 0.02425;
+  const phigh = 1 - plow;
+  if (pc < plow) {
+    const q = Math.sqrt(-2 * Math.log(pc));
+    return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+  }
+  if (pc <= phigh) {
+    const q = pc - 0.5;
+    const r = q * q;
+    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
+  }
+  const q = Math.sqrt(-2 * Math.log(1 - pc));
+  return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
 }
 
 /**

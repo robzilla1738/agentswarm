@@ -120,7 +120,13 @@ function drawMarginal(m: DriverMarginal, z: number): number {
   // specified correlation between a binary and a numeric driver would realize as
   // a negative one. The marginal P(fire)=p is preserved: P(Φ(z) ≥ 1−p) = p.
   if (m.kind === "binary") return normCdf(z) >= 1 - clampProb(m.probability) ? 1 : 0;
-  if (m.kind === "quantiles") return sampleFromQuantiles(m.quantiles, normCdf(z), Boolean(m.logSpace));
+  if (m.kind === "quantiles") {
+    const v = sampleFromQuantiles(m.quantiles, normCdf(z), Boolean(m.logSpace));
+    // A logSpace marginal whose quantiles disagree (a non-positive knot slipping
+    // past the upstream shouldUseLogSpace guard) would log()→NaN and poison the
+    // whole simulated distribution. Fall back to the median rather than propagate.
+    return Number.isFinite(v) ? v : m.quantiles.p50;
+  }
   // trend: a Gaussian marginal whose (lo,hi) is treated as an 80% band, so
   // σ = (hi−lo)/(2·z₀.₉) with z₀.₉=1.282. NOTE: when sourcing this from
   // olsProject (a Student-t band at df=n−2), the constructor must convert the
@@ -234,8 +240,14 @@ export function evalCombiner(node: CombinerNode, idx: Map<string, number>, dvals
     case "sum":
       return node.children.reduce((s, c) => s + evalCombiner(c, idx, dvals), 0);
     case "weighted_sum": {
-      const wsum = node.weights.reduce((s, w) => s + Math.abs(w), 0) || 1;
-      return node.children.reduce((s, c, i) => s + ((node.weights[i] ?? 0) / wsum) * evalCombiner(c, idx, dvals), 0);
+      // A convex combination (all weights ≥ 0) normalizes to a weighted average;
+      // a mixed-sign form (a difference / net change) is a genuine linear
+      // combination and must NOT be normalized — dividing by Σ|w| compresses it
+      // toward 0 and biases every zero-centered outcome's interval narrow.
+      const allNonNeg = node.weights.every((w) => w >= 0);
+      const sumW = node.weights.reduce((s, w) => s + w, 0);
+      const denom = allNonNeg && sumW > 0 ? sumW : 1;
+      return node.children.reduce((s, c, i) => s + ((node.weights[i] ?? 0) / denom) * evalCombiner(c, idx, dvals), 0);
     }
     case "max":
       return Math.max(...node.children.map((c) => evalCombiner(c, idx, dvals)));
@@ -289,10 +301,10 @@ export function aggregateSimOutcomes(rawOutcomes: number[], combiner: CombinerSp
     for (const { key, tau } of QUANTILE_TAUS) quantiles[key] = empiricalQuantile(sorted, tau);
     return { quantiles, k: 1, n: N, spread: 0 };
   }
-  // mc: each draw's scalar is an option index (argmax gives it exactly; other
-  // combiners are rounded). Clamp into range so no draw is silently dropped —
-  // dropping draws while keeping N in the denominator would deflate every
-  // option's fraction.
+  // mc: each draw's scalar is an option index. validateSimStructure guarantees
+  // the root is argmax (which returns an exact integer index), so round() is
+  // just defensive; the clamp keeps any stray value in range so no draw is
+  // silently dropped (which would deflate every option's fraction).
   const opts = combiner.mcOptions ?? [];
   const counts: Record<string, number> = {};
   for (const o of opts) counts[o] = 0;
@@ -300,10 +312,13 @@ export function aggregateSimOutcomes(rawOutcomes: number[], combiner: CombinerSp
     const i = Math.max(0, Math.min(opts.length - 1, Math.round(v)));
     counts[opts[i]]++;
   }
+  // Add-one (Laplace) smoothing — the principled multinomial cell estimator. It
+  // shrinks toward uniform as a function of N (unlike a flat 0.005 floor that
+  // inflates never-selected options by a fixed amount regardless of draws) and
+  // already sums to 1 (Σ(countᵢ+1) = N+K), so no renormalization is needed.
+  const K = opts.length || 1;
   const optionProbs: Record<string, number> = {};
-  for (const o of opts) optionProbs[o] = Math.max((counts[o] ?? 0) / N, 0.005);
-  const sum = Object.values(optionProbs).reduce((s, v) => s + v, 0) || 1;
-  for (const o of opts) optionProbs[o] = optionProbs[o] / sum;
+  for (const o of opts) optionProbs[o] = ((counts[o] ?? 0) + 1) / (N + K);
   return { optionProbs, k: 1, n: N, spread: 0 };
 }
 
@@ -374,16 +389,35 @@ function correlationRatio(xs: number[], ys: number[], meanY: number, varY: numbe
   if (varY < 1e-12) return 0;
   const order = Array.from({ length: N }, (_, k) => k).sort((a, b) => xs[a] - xs[b]);
   let between = 0;
-  let start = 0;
-  for (let b = 0; b < bins && start < N; b++) {
-    let end = Math.min(N, Math.floor(((b + 1) * N) / bins));
-    while (end < N && end > 0 && xs[order[end]] === xs[order[end - 1]]) end++; // keep equal values together
-    if (end <= start) continue;
+  const groupMean = (start: number, end: number): void => {
     let sum = 0;
     for (let k = start; k < end; k++) sum += ys[order[k]];
-    const m = sum / (end - start);
-    between += ((end - start) / N) * (m - meanY) ** 2;
-    start = end;
+    between += ((end - start) / N) * (sum / (end - start) - meanY) ** 2;
+  };
+  // Count distinct X values. A driver with few distinct values (binary → 2, a
+  // small-count integer) is grouped BY VALUE so a rare class (a p=0.95 binary's
+  // 5% of zeros) still forms its own group. Quantile bins would let the majority
+  // value-block swallow the boundary and report η²=0 for a driver that clearly
+  // matters — the rare-flip drivers whose importance the tornado most needs.
+  let distinct = 1;
+  for (let k = 1; k < N; k++) if (xs[order[k]] !== xs[order[k - 1]]) distinct++;
+  if (distinct <= bins) {
+    let start = 0;
+    for (let k = 1; k <= N; k++) {
+      if (k === N || xs[order[k]] !== xs[order[k - 1]]) {
+        groupMean(start, k);
+        start = k;
+      }
+    }
+  } else {
+    let start = 0;
+    for (let b = 0; b < bins && start < N; b++) {
+      let end = Math.min(N, Math.floor(((b + 1) * N) / bins));
+      while (end < N && end > 0 && xs[order[end]] === xs[order[end - 1]]) end++; // keep equal values together
+      if (end <= start) continue;
+      groupMean(start, end);
+      start = end;
+    }
   }
   return Math.max(0, Math.min(1, between / varY));
 }

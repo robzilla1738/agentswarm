@@ -12,6 +12,7 @@ process.env.AGENTSWARM_HOME = TMP_HOME;
 
 const {
   clampProb,
+  clampMarketProb,
   trimmedMean,
   aggregateBinary,
   aggregateQuantiles,
@@ -448,6 +449,52 @@ test("calibrationStats bins by forecast probability and tracks per-method Brier"
   assert.equal(stats.byMethod["trend"].n, 1);
 });
 
+test("calibrationStats drops non-finite probabilities instead of laundering them to a 0.5 coin-flip", () => {
+  // A corrupt headline (NaN/Infinity from a partial write, crash, or hand edit)
+  // must NOT be scored — clampProb maps it to 0.5, which would silently bias the
+  // Brier mean and every parameter fit on the record. Same family as the
+  // binary-NO poisoning guard.
+  const entries = [
+    resolvedEntry("a", 0.7, 1),
+    resolvedEntry("b", NaN, 0),
+    resolvedEntry("c", Infinity, 1),
+  ];
+  const stats = calibrationStats(entries);
+  assert.equal(stats.n, 1, "only the finite forecast is scoreable");
+  assert.equal(stats.byMethod["outside-view"].n, 1, "the non-finite panelists are dropped too");
+  // chooseExtremizeK and fitRecalibration read the same path — neither should
+  // see the corrupt rows.
+  assert.equal(fitRecalibration(entries), null, "well below MIN, but proves the path doesn't throw on NaN");
+});
+
+test("resolveLedgerEntry writes no score for a non-finite headline (no 0.5 laundering)", () => {
+  clearLedger();
+  const entry = {
+    id: "f_nan", runId: "r", t: 1,
+    question: { ...QUESTION },
+    aggregate: { probability: NaN, k: 2.5, n: 1, spread: 0 },
+    panel: [],
+  };
+  const rec = resolveLedgerEntry(entry, 1, { evidence: "", sources: [], resolvedBy: "operator" });
+  assert.equal(rec.brier, undefined, "a corrupt headline scores nothing");
+  assert.equal(rec.logScore, undefined);
+  assert.equal(rec.outcome, 1, "but the resolution itself is still recorded");
+});
+
+test("resolveLedgerEntry canonicalizes a case/space-variant mc outcome and scores it", () => {
+  clearLedger();
+  const entry = {
+    id: "f_mc", runId: "r", t: 1,
+    question: { ...QUESTION, kind: "mc", options: ["Labour", "Conservative", "Reform"] },
+    aggregate: { optionProbs: { Labour: 0.5, Conservative: 0.3, Reform: 0.2 }, n: 1, spread: 0 },
+    panel: [],
+  };
+  const rec = resolveLedgerEntry(entry, "  conservative ", { evidence: "", sources: [], resolvedBy: "operator" });
+  assert.equal(rec.outcome, "Conservative", "stored as the exact option spelling, not the operator's casing");
+  assert.ok(typeof rec.brier === "number", "scored, not silently dropped as a non-match");
+  assert.ok(typeof rec.logScore === "number");
+});
+
 test("calibrationBlock stays silent below the minimum track record, then reports", () => {
   const few = Array.from({ length: MIN_CALIBRATION_N - 1 }, (_, i) => resolvedEntry(`s${i}`, 0.9, 1));
   assert.equal(calibrationBlock(few), "");
@@ -568,6 +615,50 @@ test("olsProject interpolates noisy data with a real band", () => {
   assert.ok(p.hi > p.projected && p.lo < p.projected, "noisy fit carries a band");
 });
 
+test("olsProject returns null for 2 points — no zero-width band paraded as 80%", () => {
+  // Two points fit a line exactly; residual variance is undefined (df=0), so the
+  // old code emitted a zero-width "80% band" — false certainty. Null is honest.
+  assert.equal(
+    olsProject([{ date: "2026-01-01", value: 10 }, { date: "2026-01-08", value: 20 }], "2026-02-01"),
+    null
+  );
+});
+
+test("olsProject inflates the band for autocorrelated residuals beyond the i.i.d. fit", () => {
+  const points = [
+    { date: "2026-01-01", value: 0 },
+    { date: "2026-01-02", value: 1 },
+    { date: "2026-01-03", value: 8 },
+    { date: "2026-01-04", value: 9 },
+    { date: "2026-01-05", value: 4 },
+    { date: "2026-01-06", value: 5 },
+  ];
+  const p = olsProject(points, "2026-01-12");
+  // Faithfully recompute the i.i.d. band the old code produced and prove the
+  // AR(1) inflation made the actual band materially wider.
+  const x = [0, 1, 2, 3, 4, 5];
+  const y = points.map((q) => q.value);
+  const n = 6;
+  const mx = 2.5;
+  const my = y.reduce((s, v) => s + v, 0) / n;
+  let sxx = 0, sxy = 0;
+  for (let i = 0; i < n; i++) { sxx += (x[i] - mx) ** 2; sxy += (x[i] - mx) * (y[i] - my); }
+  const slope = sxy / sxx;
+  const intercept = my - slope * mx;
+  const resid = y.map((v, i) => v - (intercept + slope * x[i]));
+  const ssr = resid.reduce((s, r) => s + r * r, 0);
+  const sigmaIid = Math.sqrt(ssr / (n - 2));
+  let r1 = 0;
+  for (let i = 1; i < n; i++) r1 += resid[i] * resid[i - 1];
+  const rho = Math.max(0, Math.min(0.9, r1 / ssr));
+  assert.ok(rho > 0, "the test series is positively autocorrelated");
+  const xT = (Date.parse("2026-01-12") - Date.parse("2026-01-01")) / 86_400_000;
+  const tMul = 1.533; // tQuantile90(df=4)
+  const iidHalf = tMul * sigmaIid * Math.sqrt(1 + 1 / n + ((xT - mx) ** 2) / sxx);
+  const actualHalf = (p.hi - p.lo) / 2;
+  assert.ok(actualHalf > iidHalf * 1.05, `AR(1) inflation widens the band: ${actualHalf} vs i.i.d. ${iidHalf}`);
+});
+
 // ---------------------------------------------------------------- market anchoring
 
 test("blendWithMarket: w=0 keeps the panel, w=1 takes the market, blend is monotone", () => {
@@ -583,6 +674,28 @@ test("blendWithMarket: w=0 keeps the panel, w=1 takes the market, blend is monot
     assert.ok(b < prev, `w=${w} should pull toward the market`);
     prev = b;
   }
+});
+
+test("clampMarketProb keeps near-boundary market information the panel clamp discards", () => {
+  near(clampMarketProb(0.995), 0.995, 1e-12);
+  near(clampMarketProb(0.999), 0.995, 1e-12); // still bounded off 1 for a finite logit
+  near(clampMarketProb(0.001), 0.005, 1e-12);
+  assert.equal(clampMarketProb(NaN), 0.5);
+  // The panel clamp would crush a 99.5% real-money market to 0.99; this does not.
+  assert.ok(clampMarketProb(0.995) > clampProb(0.995));
+});
+
+test("blendWithMarket preserves a confident market's information at partial weight", () => {
+  // At w=0.75 the result stays under the 0.99 output cap, so the looser market
+  // clamp is visible: the blend lands strictly above what the old 0.99-clamped
+  // market price would have produced.
+  const b = blendWithMarket(0.9, 0.995, 0.75);
+  assert.ok(b > 0.985 && b < 0.99, `confident market pulls the blend up, got ${b}`);
+  const logit = (p) => Math.log(p / (1 - p));
+  const oldClamped = Math.min(0.99, Math.max(0.01, 0.995)); // the old clampProb path → 0.99
+  const odds = Math.exp(0.25 * logit(0.9) + 0.75 * logit(oldClamped));
+  const oldBlend = odds / (1 + odds);
+  assert.ok(b > oldBlend, `new blend ${b} should exceed the old 0.99-clamped blend ${oldBlend}`);
 });
 
 test("liquidityFactor: dead markets earn nothing, $100K earns full weight", () => {

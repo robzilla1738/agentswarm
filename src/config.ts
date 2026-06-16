@@ -70,6 +70,13 @@ export interface SwarmConfig {
    */
   forecastMarketWeight: number;
   /**
+   * Forecast mode: base weight of the sportsbook-line anchor for sports facets
+   * (total/margin numerics, winner mc). A sharp closing line is the strongest
+   * public predictor of a game, so it earns more pull than the generic market
+   * weight. Re-fit from the resolved record once 20+ sports facets resolve.
+   */
+  forecastSportsMarketWeight: number;
+  /**
    * Forecast mode: let an open-ended question decompose into several
    * independently-resolvable sub-forecasts (each its own panel + ledger entry).
    * A clean single question still resolves to one. `--single` overrides per run.
@@ -179,6 +186,7 @@ export const DEFAULTS: SwarmConfig = {
   forecastCoherenceProbe: true,
   forecastSimulate: false,
   forecastMarketWeight: 0.4,
+  forecastSportsMarketWeight: 0.75,
   forecastDecompose: true,
   forecastMaxSubQuestions: 6,
   sandboxRuntime: "host",
@@ -391,6 +399,7 @@ export const SETTABLE_KEYS: (keyof SwarmConfig)[] = [
   "forecastCoherenceProbe",
   "forecastSimulate",
   "forecastMarketWeight",
+  "forecastSportsMarketWeight",
   "forecastDecompose",
   "forecastMaxSubQuestions",
   "maxToolResultChars",
@@ -431,6 +440,7 @@ const NUM_RANGES: Partial<Record<keyof SwarmConfig, [number, number]>> = {
 const FLOAT_RANGES: Partial<Record<keyof SwarmConfig, [number, number]>> = {
   forecastExtremizeK: [1, 4],
   forecastMarketWeight: [0, 1],
+  forecastSportsMarketWeight: [0, 1],
 };
 
 const ENUMS: Partial<Record<keyof SwarmConfig, string[]>> = {

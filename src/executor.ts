@@ -56,13 +56,17 @@ import {
   applyRecalibration,
   blendOptionProbs,
   blendQuantiles,
+  blendQuantilesWithMarket,
   blendWithMarket,
   calibrationBlock,
   canonicalMethodLabel,
   chooseExtremizeK,
   chooseMarketWeight,
   chooseSimulationWeight,
+  chooseSportsMarketWeight,
   clampProb,
+  clampMarketProb,
+  classifySportsMission,
   daysToIso,
   evidenceOverlap,
   extractMethodLabel,
@@ -76,6 +80,7 @@ import {
   loadLedger,
   MANIFOLD_VOLUME_DISCOUNT,
   isTimingMission,
+  lineToQuantiles,
   methodWeights,
   monotoneQuantiles,
   normalizeOptionProbs,
@@ -83,18 +88,20 @@ import {
   parseQuestionJson,
   parseSimStructure,
   scaleK,
+  sportsSigma,
+  sportsWinnerMarket,
   TIMING_KINDS,
   validateForecastAnalytics,
   validateSimStructure,
 } from "./forecast";
-import { MarketHit, marketOdds } from "./datatools";
+import { MarketHit, marketOdds, sportsbookLines, sportsDayIso } from "./datatools";
 import { runSimulation } from "./simulation";
 import { appendMemory, memoryBlock } from "./memory";
 import { canonicalizeUrl } from "./searchcore";
 import { aggregateSources, renderFinalHtml, sourcesBlock } from "./report";
 import { SandboxRuntime, createSandbox } from "./sandbox";
 import { RunState } from "./state";
-import { AggregateForecast, Forecast, ForecastQuestion, MarketAnchor, RunMeta, RunStatus, SimDriver, SourceRef, Task, TaskSpec, Usage, usageCost } from "./types";
+import { AggregateForecast, Forecast, ForecastQuestion, MarketAnchor, RunMeta, RunStatus, SimDriver, SourceRef, SportsLineSnapshot, Task, TaskSpec, Usage, usageCost } from "./types";
 import { canonicalArtifactRel, clip, ensureDir, errMsg, oneLine, rid, sleep, truncateMiddle, validateArtifactFormat, withTimeout } from "./util";
 
 
@@ -607,6 +614,24 @@ export class Executor {
       return;
     }
 
+    // Sports games: if the mission names both teams of a real upcoming game, the
+    // engine OWNS the decomposition — winner / total / margin, each anchored to
+    // the sharp betting line and resolvable from the official box score. An
+    // exact final score is not a single resolvable quantity, so we never forecast
+    // it; these three are. Deterministic (no reliance on the LLM emitting the
+    // right shape). Tournament imports keep their own sharp question.
+    if (!this.meta.options.forecastOrigin) {
+      try {
+        const facets = await this.planSportsGame();
+        if (facets) {
+          commit(facets, "head-to-head game — winner, total points, and margin of victory, each anchored to the sportsbook line");
+          return;
+        }
+      } catch (e) {
+        this.journal.append("log", { level: "info", msg: `sports decomposition skipped: ${errMsg(e)}` });
+      }
+    }
+
     const today = new Date(this.meta.createdAt).toISOString().slice(0, 10);
     const operatorDate = this.meta.options.resolutionDate;
     const maxN = Math.max(1, this.cfg.forecastMaxSubQuestions ?? 6);
@@ -713,6 +738,85 @@ export class Executor {
       });
     }
     commit([parsed], "");
+  }
+
+  /**
+   * If the mission names both teams of a real upcoming game, build the three
+   * resolvable, market-benchmarked facets — winner (mc), total points, and
+   * favorite margin (numeric) — each stamped with the matched sportsbook line
+   * (lineAtCreate) and the keys the /scores resolver needs. Returns null when
+   * no key is set or no game matches (the normal planner then runs).
+   */
+  private async planSportsGame(): Promise<ForecastQuestion[] | null> {
+    if (!this.cfg.oddsApiKey) return null;
+    // Classify the mission (also the cheap gate before spending an Odds API
+    // credit): null → not a clean winner/total/margin game question, leave it to
+    // the normal planner so the forecast target is never silently rewritten.
+    const ask = classifySportsMission(this.meta.mission);
+    if (!ask) return null;
+    // Match on the game date FROM THE MISSION TEXT, not the --by resolution
+    // deadline (which can be later than the game). sportsbookLines parses the
+    // date out of the mission query itself.
+    const line = await sportsbookLines(this.cfg, this.meta.mission, { signal: this.ac.signal });
+    if (!line) return null;
+    const { home, away, sportTitle, sportKey, eventId, commence } = line;
+    // Label with the game's LOCAL sports day (what the user asked for), not the
+    // raw UTC date — a US night game tipping after UTC midnight still reads as
+    // its local date. The resolution deadline is end-of-day UTC; a game that
+    // finishes after that simply stays open one extra resolve cycle (the /scores
+    // resolver returns null until it's final).
+    const resolutionDate = sportsDayIso(Date.parse(commence), sportKey);
+    const favorite: "home" | "away" =
+      line.spread?.favorite ?? (line.h2h && line.h2h.pAway > line.h2h.pHome ? "away" : "home");
+    const favName = favorite === "home" ? home : away;
+    const dogName = favorite === "home" ? away : home;
+    // 3-way books (soccer and the like) price a Draw — the winner facet must
+    // include it as an option, or a level final score voids instead of resolving.
+    const threeWay = typeof line.h2h?.pDraw === "number";
+    const lineAtCreate: SportsLineSnapshot = {
+      t: Date.now(),
+      ...(line.h2h ? { pHome: line.h2h.pHome } : {}),
+      ...(threeWay ? { pDraw: line.h2h!.pDraw, pAway: line.h2h!.pAway } : {}),
+      ...(line.spread ? { spread: line.spread.line } : {}),
+      ...(line.total ? { total: line.total.line } : {}),
+    };
+    const base = { sportKey, eventId, sportTitle, home, away, commence, favorite, lineAtCreate };
+    const matchup = `${away} @ ${home} on ${resolutionDate}`;
+    const winner: ForecastQuestion = {
+      text: `Who wins ${matchup}: ${home}, ${away}${threeWay ? ", or a draw" : ""}?`,
+      kind: "mc",
+      options: threeWay ? [home, "Draw", away] : [home, away],
+      resolutionCriteria: threeWay
+        ? 'Resolves to the team with more goals in the official final score, or "Draw" if the scores are level. Voided if the game is not played as scheduled.'
+        : "Resolves to the team with more points in the official final box score. Voided if the game is not played as scheduled.",
+      resolutionDate,
+      sports: { ...base, facet: "winner" },
+    };
+    const total: ForecastQuestion = {
+      text: `What will the combined final score (both teams) be in ${matchup}?`,
+      kind: "numeric",
+      unit: "points",
+      resolutionCriteria: "The sum of both teams' points in the official final box score, including overtime.",
+      resolutionDate,
+      sports: { ...base, facet: "total", ...(sportsSigma(sportTitle, "total") ? { sigma: sportsSigma(sportTitle, "total")! } : {}) },
+    };
+    const margin: ForecastQuestion = {
+      text: `By how many points will ${favName} beat ${dogName} in ${matchup}? (negative if ${favName} loses)`,
+      kind: "numeric",
+      unit: "points",
+      resolutionCriteria: `${favName}'s points minus ${dogName}'s points in the official final box score (can be negative).`,
+      resolutionDate,
+      sports: { ...base, facet: "margin", ...(sportsSigma(sportTitle, "margin") ? { sigma: sportsSigma(sportTitle, "margin")! } : {}) },
+    };
+    // Return only what the mission asks for (classifySportsMission decided): an
+    // explicit single-facet ask yields just that facet; "full" (a generic "final
+    // score" or bare matchup) gets winner+total+margin, collapsed to the winner
+    // headline under --single.
+    if (ask === "total") return [total];
+    if (ask === "margin") return [margin];
+    if (ask === "winner") return [winner];
+    const single = this.cfg.forecastDecompose === false || this.meta.options.forecastSingle;
+    return single ? [winner] : [winner, total, margin];
   }
 
   /**
@@ -1001,6 +1105,48 @@ export class Executor {
           msg: `interval dilation (${q.id}, ×${cal.d}, ${cal.source}, n=${cal.n}): p10–p90 widened around the median`,
         });
       }
+      // Sports line anchor: pull the DILATED panel toward the sharp total/margin
+      // line. The line is already calibrated, so it is NOT dilated; width stays
+      // the panel's, location is pulled toward the book. We snapshot the
+      // post-dilation/pre-blend quantiles (blendedQ) so a future weight refit
+      // never sees the market — exactly the discipline the binary chain uses.
+      const sm = q.sports;
+      const lineVal = sm?.facet === "total" ? sm.lineAtCreate?.total : sm?.facet === "margin" ? sm.lineAtCreate?.spread : undefined;
+      if (sm && (sm.facet === "total" || sm.facet === "margin") && typeof lineVal === "number" && typeof sm.sigma === "number" && sm.sigma > 0) {
+        const base = chooseSportsMarketWeight(ledger, this.cfg.forecastSportsMarketWeight);
+        const wEff = Math.max(0, base - 1 / panel.length);
+        if (wEff > 0) {
+          const mq = lineToQuantiles(lineVal, sm.sigma);
+          agg.components = agg.components ?? {};
+          agg.components.blendedQ = agg.quantiles;
+          agg.components.marketLine = { line: lineVal, sigma: sm.sigma, lineKind: sm.facet, weight: Number(wEff.toFixed(4)) };
+          agg.quantiles = blendQuantilesWithMarket(agg.quantiles, mq, wEff);
+          this.journal.append("log", {
+            level: "info",
+            msg: `sports line anchor (${q.id}, ${sm.facet} line ${lineVal} σ${sm.sigma}, residual weight ${wEff.toFixed(2)}): p50 ${Math.round(agg.components.blendedQ.p50)} → ${Math.round(agg.quantiles.p50)}`,
+          });
+        }
+      }
+    }
+    if (q.kind === "mc" && q.sports?.facet === "winner" && agg.optionProbs && typeof q.sports.lineAtCreate?.pHome === "number") {
+      // Sports winner: an mc over the two team names (plus "Draw" for 3-way
+      // books) — anchor its option probabilities to the de-vigged moneyline,
+      // the sharpest win-prob source.
+      const sm = q.sports;
+      const market = sportsWinnerMarket(sm);
+      // Every market option must be a real facet option (guards a name mismatch).
+      if (Object.keys(market).every((o) => o in agg.optionProbs!)) {
+        const wEff = Math.max(0, this.cfg.forecastSportsMarketWeight - 1 / panel.length);
+        if (wEff > 0) {
+          const before = agg.optionProbs[sm.home];
+          agg.optionProbs = blendOptionProbs(agg.optionProbs, market, wEff);
+          const pd = sm.lineAtCreate!.pDraw;
+          this.journal.append("log", {
+            level: "info",
+            msg: `sports moneyline anchor (${q.id}, ${sm.home} ${Math.round(market[sm.home] * 100)}%${typeof pd === "number" ? ` / draw ${Math.round(market.Draw * 100)}%` : ""}, residual weight ${wEff.toFixed(2)}): P(${sm.home}) ${Math.round(before * 100)}% → ${Math.round(agg.optionProbs[sm.home] * 100)}%`,
+          });
+        }
+      }
     }
     if (q.kind === "binary") {
       agg.evidenceOverlap = overlap;
@@ -1131,8 +1277,25 @@ export class Executor {
         const raw = h.volume ?? (h.forecasters ? h.forecasters * 100 : 0);
         return h.platform === "manifold" ? raw / MANIFOLD_VOLUME_DISCOUNT : raw;
       };
+      // Coarse close-date gate: a market that already closed (a stale price, no
+      // longer a live crowd signal) or whose close date is far from the
+      // question's resolution window is a DIFFERENT horizon ("Will X by June?"
+      // vs by 2027). Reject it before the precise-but-fallible LLM same-question
+      // check; unknown close dates pass through to that check. "A WRONG anchor
+      // is worse than none."
+      const DAY = 86_400_000;
+      const qResMs = Date.parse(q.resolutionDate);
+      const closeCompatible = (h: MarketHit): boolean => {
+        if (!h.closes) return true;
+        const c = Date.parse(h.closes);
+        if (!Number.isFinite(c)) return true;
+        if (c < Date.now() - 2 * DAY) return false; // already closed
+        return !Number.isFinite(qResMs) || Math.abs(c - qResMs) <= 200 * DAY;
+      };
       const candidates = hits
-        .filter((h) => typeof h.probability === "number" && relevance(h) >= 0.5 && liquidity(h) >= 500)
+        .filter(
+          (h) => typeof h.probability === "number" && relevance(h) >= 0.5 && liquidity(h) >= 500 && closeCompatible(h)
+        )
         .sort((a, b) => liquidity(b) - liquidity(a));
       const best = candidates[0];
       if (!best) return null;
@@ -1168,7 +1331,7 @@ Same event, same direction (the market's YES means this question's YES), compati
         platform: best.platform,
         url: best.url,
         title: best.title,
-        probability: clampProb(best.probability!),
+        probability: clampMarketProb(best.probability!),
         // Discounted (real-money-equivalent) volume — the number liquidityFactor saw.
         volume: liquidity(best),
         weight,
@@ -1223,12 +1386,12 @@ Same event, same direction (the market's YES means this question's YES), compati
       }
       // mc sub-forecasts are not used as copula drivers in this version.
     }
-    // The verified market anchor on q (binary only) is a grounded signal.
-    const mkt = q.kind === "binary" && q.id ? this.aggregates.get(q.id)?.components?.market : undefined;
-    if (mkt && typeof mkt.probability === "number") {
-      const label = `market: ${oneLine(mkt.title ?? mkt.platform, 70)}`;
-      drivers.push({ id: "mkt_0", label, marginal: { kind: "binary", probability: clampProb(mkt.probability) }, provenance: { kind: "market", ref: mkt.url, label } });
-    }
+    // The verified market anchor is deliberately NOT added as a sim driver: it
+    // is already blended into the top-down headline this simulation is
+    // cross-checked against, so including it would (1) bias the bottom-up vs
+    // top-down divergence toward agreement by construction and (2) double-count
+    // the market once the sim earns blend weight. The cross-check stays a
+    // genuinely independent, fundamentals-only composition.
     // Fallback only: reference-class base rates committed by the panel (numeric
     // percentages). Added solely to give an otherwise-driverless single question
     // something to compose — kept out of the decomposed case where the sibling

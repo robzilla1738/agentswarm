@@ -59,6 +59,57 @@ export interface ForecastQuestion {
   unit?: string;
   /** The exhaustive option list for mc questions (2–8 distinct options). */
   options?: string[];
+  /**
+   * Set on sub-forecasts the engine decomposed from a single sporting event
+   * (winner / total / margin). Carries the matched sportsbook line so the
+   * aggregation anchors to it, and the keys the /scores resolver needs.
+   */
+  sports?: SportsMeta;
+}
+
+/** A sportsbook line snapshot — the values relevant to a game's three facets, and when it was taken. */
+export interface SportsLineSnapshot {
+  /** De-vigged home-team win probability. */
+  pHome?: number;
+  /** De-vigged draw probability — present only for 3-way (soccer-style) books. */
+  pDraw?: number;
+  /** De-vigged away-team win probability — stored for 3-way books (where independent leg medians need not sum to 1; for 2-way it is exactly 1−pHome). */
+  pAway?: number;
+  /** Favorite's point spread (positive magnitude). */
+  spread?: number;
+  /** Over/under total points. */
+  total?: number;
+  /** Capture time (ms). */
+  t: number;
+}
+
+/**
+ * Provenance for a sub-forecast the engine derived from one sporting event.
+ * The matched betting line is the strongest public predictor of the game, so
+ * the engine anchors the facet's aggregate to it (lineAtCreate) and resolves
+ * the game from the official box score via The Odds API /scores.
+ */
+export interface SportsMeta {
+  /** The Odds API sport key, e.g. "basketball_nba" — needed by /scores. */
+  sportKey: string;
+  /** The Odds API event id — a re-fetch handle for the closing line (CLV). */
+  eventId: string;
+  /** League label, e.g. "NBA" — drives the per-sport σ. */
+  sportTitle: string;
+  home: string;
+  away: string;
+  /** ISO commence time. */
+  commence: string;
+  /** Which resolvable facet of the game this sub-forecast is. */
+  facet: "winner" | "total" | "margin";
+  /** Favorite side — the margin sign convention (favorite − underdog). */
+  favorite: "home" | "away";
+  /** Per-sport game-to-game SD used to map the total/margin line to quantiles. */
+  sigma?: number;
+  /** The line at forecast time — the CLV baseline and the market-relative scoring baseline. */
+  lineAtCreate?: SportsLineSnapshot;
+  /** The line near tip-off — captured later by `swarm sports close` for CLV. */
+  lineAtClose?: SportsLineSnapshot;
 }
 
 /**
@@ -138,6 +189,16 @@ export interface AggregateComponents {
   simDivergence?: number;
   /** The simulation blend weight actually applied to the headline (0 until the ledger earns it trust). */
   simBlendWeight?: number;
+  /**
+   * The sportsbook line a numeric sports facet (total/margin) was anchored to,
+   * and how hard. Present only when the facet matched a betting line.
+   */
+  marketLine?: { line: number; sigma: number; lineKind: "total" | "margin"; weight: number };
+  /**
+   * Numeric sports facet AFTER interval dilation but BEFORE the line blend —
+   * the value a future sports-market-weight refit scores on (never circular).
+   */
+  blendedQ?: Quantiles;
 }
 
 /** Deterministic combination of the panel (computed in code, never by an LLM). */

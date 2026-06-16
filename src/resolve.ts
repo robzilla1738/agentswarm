@@ -14,7 +14,7 @@ import {
   resolveLedgerEntry,
   supersededIds,
 } from "./forecast";
-import { resolveFromPlatform } from "./datatools";
+import { resolveFromPlatform, sportsScore } from "./datatools";
 import { questionBlock } from "./prompts";
 import { createSandbox } from "./sandbox";
 import { ToolCtx, ToolDef, workerToolset } from "./tools";
@@ -156,12 +156,20 @@ const VERDICT_OUTCOMES = ["yes", "no", "value", "option", "date", "never", "void
  * exactly. Resolution errors poison every parameter the flywheel learns, so
  * "roughly the same" is the most generosity allowed.
  */
-function verdictsAgree(entry: LedgerEntry, a: ResolutionVerdict, b: ResolutionVerdict): boolean {
+export function verdictsAgree(entry: LedgerEntry, a: ResolutionVerdict, b: ResolutionVerdict): boolean {
   if (a.outcome !== b.outcome) return false;
   const kind = entry.question.kind;
   if (kind === "numeric" && a.outcome === "value") {
     if (typeof a.value !== "number" || typeof b.value !== "number") return false;
-    return Math.abs(a.value - b.value) <= Math.max(Math.abs(a.value), Math.abs(b.value)) * 0.01 + 1e-9;
+    // Relative 1% OR a band-relative absolute floor. A pure-relative tolerance
+    // collapses to ~0 near zero, so two correct resolvers of a small-magnitude
+    // value (a margin or net change near 0) would "disagree" and get bounced to
+    // manual settlement — starving numeric/date calibration of exactly the
+    // zero-centered quantities. Scale the floor to the forecast's own 80% width.
+    const q = entry.aggregate.quantiles;
+    const band = q && Number.isFinite(q.p90 - q.p10) ? Math.abs(q.p90 - q.p10) : 0;
+    const tol = Math.max(Math.abs(a.value), Math.abs(b.value)) * 0.01 + Math.max(band * 0.02, 1e-9);
+    return Math.abs(a.value - b.value) <= tol;
   }
   if (kind === "mc" && a.outcome === "option") {
     return String(a.option ?? "").trim().toLowerCase() === String(b.option ?? "").trim().toLowerCase();
@@ -287,6 +295,46 @@ async function resolveOne(
 }
 
 /**
+ * Resolve a sports facet straight from the official box score via The Odds API
+ * /scores — no mini-agent needed. winner → the team with more points; total →
+ * the sum; margin → favorite minus underdog (signed). Returns null until the
+ * game is completed (the caller then falls back to a research agent for
+ * stragglers older than the /scores 3-day window).
+ */
+export async function resolveSportsEntry(
+  cfg: SwarmConfig,
+  entry: LedgerEntry,
+  signal?: AbortSignal
+): Promise<{ outcome: LedgerOutcome; evidence: string; sources: string[] } | null> {
+  const sm = entry.question.sports;
+  if (!sm) return null;
+  const score = await sportsScore(cfg, { sportKey: sm.sportKey, home: sm.home, away: sm.away, eventId: sm.eventId, commence: sm.commence }, signal);
+  if (!score?.completed) return null;
+  const { homeScore, awayScore } = score;
+  const evidence = `Final: ${sm.home} ${homeScore}, ${sm.away} ${awayScore} (The Odds API /scores).`;
+  const sources = [`https://api.the-odds-api.com/v4/sports/${sm.sportKey}/scores`];
+  let outcome: LedgerOutcome;
+  if (sm.facet === "total") {
+    outcome = homeScore + awayScore;
+  } else if (sm.facet === "margin") {
+    const favScore = sm.favorite === "home" ? homeScore : awayScore;
+    const dogScore = sm.favorite === "home" ? awayScore : homeScore;
+    outcome = favScore - dogScore;
+  } else {
+    // winner — the option string must match the question's option list exactly.
+    // A level score resolves to the "Draw" option for 3-way books, else voids.
+    const opts = entry.question.options ?? [];
+    if (homeScore === awayScore) {
+      outcome = opts.find((o) => /^draw$/i.test(o)) ?? "void";
+    } else {
+      const winner = homeScore > awayScore ? sm.home : sm.away;
+      outcome = opts.find((o) => o === winner) ?? "void";
+    }
+  }
+  return { outcome, evidence, sources };
+}
+
+/**
  * Resolve every past-due open forecast (or the given ids) with bounded
  * parallelism. Solid verdicts are scored and appended to the ledger;
  * unclear/low-confidence ones stay open with a skip note.
@@ -309,6 +357,40 @@ export async function resolveDue(
       const entry = due[next++];
       const qText = oneLine(entry.question.text, 100);
       opts.log?.("info", `resolving ${entry.id}: ${qText}`);
+      // Sports facets resolve from the official box score (The Odds API /scores)
+      // — exact ground truth, no agent. Falls through if the game isn't final
+      // yet or is older than the /scores window.
+      if (entry.question.sports && cfg.oddsApiKey) {
+        let sr: Awaited<ReturnType<typeof resolveSportsEntry>> = null;
+        let available = true;
+        try {
+          sr = await resolveSportsEntry(cfg, entry, signal);
+        } catch (e) {
+          // The /scores lookup itself failed (network/HTTP) — we couldn't check,
+          // so don't suppress the fallback resolver.
+          available = false;
+          opts.log?.("warn", `${entry.id}: Odds API scores unavailable (${errMsg(e)}) — trying a resolution agent`);
+        }
+        if (sr) {
+          writeAudit(entry.id, { question: entry.question, sports: entry.question.sports, verdict: sr });
+          const rec = resolveLedgerEntry(entry, sr.outcome, { evidence: sr.evidence, sources: sr.sources, resolvedBy: "swarm" });
+          result.resolved.push({ ...rec, question: qText });
+          continue;
+        }
+        // Only when the API RESPONDED-but-not-final do we hold a recent game open
+        // (the box score is the only trustworthy source — never let a web agent
+        // settle from a live, in-progress score). If the API was unavailable, or
+        // the game is past the /scores window, fall through to the web resolver.
+        if (available) {
+          const commenceMs = Date.parse(entry.question.sports.commence);
+          const ageDays = Number.isFinite(commenceMs) ? (Date.now() - commenceMs) / 86_400_000 : 99;
+          if (ageDays < 2) {
+            result.skipped.push({ id: entry.id, question: qText, reason: "game not final on The Odds API yet — staying open, will retry" });
+            continue;
+          }
+          opts.log?.("info", `${entry.id}: past the /scores window — trying a resolution agent`);
+        }
+      }
       // Tournament questions carry their source market — the platform's own
       // resolution is ground truth, far more reliable than a research agent.
       if (entry.origin) {

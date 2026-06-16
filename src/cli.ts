@@ -35,6 +35,7 @@ import { SANDBOX_KINDS, SandboxKind, dockerAvailable, resolveSandboxKind, testSa
 import { TerminalRenderer, watchRun } from "./terminal";
 import {
   ISO_DATE,
+  appendLedger,
   backtest,
   backtestNumeric,
   calibrationStats,
@@ -43,9 +44,11 @@ import {
   loadLedger,
   resolveLedgerEntry,
   simulationLedgerSummary,
+  sportsCalibrationStats,
   supersededIds,
 } from "./forecast";
-import { TOURNAMENT_SOURCES, TournamentSource, listClosingQuestions } from "./datatools";
+import { SportsLineSnapshot } from "./types";
+import { TOURNAMENT_SOURCES, TournamentSource, listClosingQuestions, sportsbookLines } from "./datatools";
 import { resolveDue, watchOpenForecasts } from "./resolve";
 import { ForecastQuestion, RunMeta, RunOptions } from "./types";
 import { ansi, errMsg, fmtMoney, fmtTokens } from "./util";
@@ -133,6 +136,10 @@ export async function main(): Promise<void> {
         break;
       case "calibration":
         cmdCalibration();
+        break;
+      case "sports":
+        if (_[1] === "close") await cmdSportsClose();
+        else console.log("usage: swarm sports close   (capture closing lines for open games near tip-off — CLV baseline)");
         break;
       case "backtest":
         cmdBacktest();
@@ -880,10 +887,14 @@ async function cmdResolve(rest: string[]): Promise<void> {
 function cmdCalibration(): void {
   const entries = loadLedger();
   const stats = calibrationStats(entries);
-  if (!stats.n) {
-    console.log(ansi.gray("no resolved binary forecasts yet — resolve some first: swarm resolve"));
+  const sports = sportsCalibrationStats(entries);
+  const sportsN = sports.winner.n + sports.total.n + sports.margin.n;
+  if (!stats.n && !sportsN) {
+    console.log(ansi.gray("no resolved forecasts yet — resolve some first: swarm resolve"));
     return;
   }
+  if (sportsN) renderSportsCalibration(sports);
+  if (!stats.n) return;
   console.log(ansi.bold("calibration") + ansi.gray(`  (${stats.n} resolved · mean Brier ${stats.brierMean.toFixed(3)} — 0.25 = "always 50%", lower is better)`));
   console.log(ansi.gray("  band        said   resolved YES   n"));
   for (const b of stats.bins) {
@@ -905,6 +916,77 @@ function cmdCalibration(): void {
     console.log(ansi.bold("\nby panel method") + ansi.gray("  (mean Brier per panelist method)"));
     for (const [m, s] of methods) console.log(`  ${m.padEnd(18)} ${s.brierMean.toFixed(3)}  ${ansi.gray(`n=${s.n}`)}`);
   }
+}
+
+/** "Did we match/beat the market" — the verdict the sports work is judged on. */
+function renderSportsCalibration(s: ReturnType<typeof sportsCalibrationStats>): void {
+  const sportsN = s.winner.n + s.total.n + s.margin.n;
+  console.log(ansi.bold("sports vs the market") + ansi.gray(`  (${sportsN} resolved facets — can the engine match or beat the betting line?)`));
+  // beat = our score strictly lower (better) than the market baseline.
+  const verdict = (ours: number, mkt: number) =>
+    ours < mkt - 1e-9 ? ansi.green(`◀ beat by ${(mkt - ours).toFixed(3)}`) : ours > mkt + 1e-9 ? ansi.gray(`lost by ${(ours - mkt).toFixed(3)}`) : ansi.gray("tied");
+  if (s.winner.n) console.log(`  winner   Brier  ${s.winner.brier.toFixed(3)}   moneyline ${s.winner.marketBrier.toFixed(3)}   ${verdict(s.winner.brier, s.winner.marketBrier)}  ${ansi.gray(`n=${s.winner.n}`)}`);
+  if (s.total.n) console.log(`  total    pinball ${s.total.pinball.toFixed(2)}    line ${s.total.linePinball.toFixed(2)}     ${verdict(s.total.pinball, s.total.linePinball)}  ${ansi.gray(`n=${s.total.n}`)}`);
+  if (s.margin.n) console.log(`  margin   pinball ${s.margin.pinball.toFixed(2)}    line ${s.margin.linePinball.toFixed(2)}     ${verdict(s.margin.pinball, s.margin.linePinball)}  ${ansi.gray(`n=${s.margin.n}`)}`);
+  if (s.clv.n) console.log(`  CLV      ${Math.round(s.clv.pctProfitable * 100)}% on the profitable side of the line move  ${ansi.gray(`n=${s.clv.n}`)}`);
+  console.log("");
+}
+
+/**
+ * Capture the closing sportsbook line for open games near tip-off — the CLV
+ * baseline. Run on a short cron (e.g. every 15 min): for each open sports facet
+ * whose game starts within ~2h and has no closing line yet, snapshot the line
+ * and patch it onto the ledger entry. Best-effort; needs oddsApiKey.
+ */
+async function cmdSportsClose(): Promise<void> {
+  const cfg = loadConfig();
+  if (!cfg.oddsApiKey) {
+    console.log(ansi.gray("sports close needs the free oddsApiKey — set it: swarm config set oddsApiKey <key>"));
+    return;
+  }
+  const now = Date.now();
+  const open = loadLedger().filter((e) => {
+    const sm = e.question.sports;
+    if (!e.resolution && sm && !sm.lineAtClose) {
+      const t = Date.parse(sm.commence);
+      // PRE-GAME only: within the next 2h and not yet started. Once a game tips
+      // off the odds are live/in-game, not the closing line — capturing those
+      // would corrupt CLV, so fail closed at commence (no close → no CLV, safe).
+      return Number.isFinite(t) && t > now && t - now <= 2 * 3_600_000;
+    }
+    return false;
+  });
+  // De-dupe the fetch per game: one line covers all three facets of an event.
+  const byEvent = new Map<string, typeof open>();
+  for (const e of open) {
+    const key = e.question.sports!.eventId || `${e.question.sports!.home}|${e.question.sports!.away}`;
+    byEvent.set(key, [...(byEvent.get(key) ?? []), e]);
+  }
+  let patched = 0;
+  for (const group of byEvent.values()) {
+    const sm = group[0].question.sports!;
+    // Refresh the EXACT stored event (never a later same-team game).
+    const line = await sportsbookLines(cfg, `${sm.home} ${sm.away}`, { sportKey: sm.sportKey, eventId: sm.eventId }).catch(() => null);
+    if (!line) continue;
+    const snap: SportsLineSnapshot = {
+      t: Date.now(),
+      ...(line.h2h ? { pHome: line.h2h.pHome } : {}),
+      // Sign the closing spread relative to the ORIGINAL favorite so CLV stays
+      // correct even if the favorite flips by tip-off (A −1 → B −1 is a real move).
+      ...(line.spread ? { spread: line.spread.favorite === sm.favorite ? line.spread.line : -line.spread.line } : {}),
+      ...(line.total ? { total: line.total.line } : {}),
+    };
+    for (const e of group) {
+      // Only mark a facet closed once ITS line is present — a partial odds
+      // response must not permanently skip a facet whose close line never landed.
+      const facet = e.question.sports!.facet;
+      const has = facet === "winner" ? typeof snap.pHome === "number" : facet === "total" ? typeof snap.total === "number" : typeof snap.spread === "number";
+      if (!has) continue;
+      appendLedger({ v: 1, rec: "updated", id: e.id, t: Date.now(), sportsLineAtClose: snap });
+      patched++;
+    }
+  }
+  console.log(patched ? ansi.green(`captured closing lines for ${patched} open sports facet(s)`) : ansi.gray("no open games within the closing window"));
 }
 
 /**
@@ -1169,7 +1251,9 @@ ${b("USAGE")}
                                       --auto also resolves past-due forecasts (cron-friendly)
   swarm resolve [set <id> <outcome>]  resolve past-due forecasts & score them (Brier/log);
                                       set = operator override (yes|no|void|<value>)
-  swarm calibration                   the system's track record: reliability table + per-method Brier
+  swarm calibration                   the system's track record: reliability table + per-method Brier,
+                                      plus sports vs the market (beat-the-line / beat-the-moneyline)
+  swarm sports close                  capture closing betting lines for open games near tip-off (CLV)
   swarm backtest                      replay the resolved ledger under each aggregation strategy
                                       (adaptive k, market anchor, recalibration — fitted out-of-fold)
                                       and report Brier deltas + the swarm-vs-market skill line

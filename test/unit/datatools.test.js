@@ -28,6 +28,19 @@ test("devigProbs strips the bookmaker margin and sums to 1", () => {
   near(r[0] + r[1] + r[2], 1, 1e-12);
 });
 
+test("devigProbs never fabricates certainty from a single priced outcome", () => {
+  // A lone outcome (suspended line, one side pulled) can't be de-vigged —
+  // normalizing it to sum 1 would invent a 100% probability. Return the raw
+  // implied prob instead so it reads as incomplete, not certain.
+  const p = devigProbs([1.5]);
+  assert.equal(p.length, 1);
+  assert.ok(p[0] < 1, `single outcome must not normalize to 1, got ${p[0]}`);
+  near(p[0], 1 / 1.5, 1e-9);
+  // Two valid outcomes still de-vig to sum 1 as before.
+  const q = devigProbs([2, 2]);
+  near(q[0] + q[1], 1, 1e-12);
+});
+
 // ---------------------------------------------------------------- options math
 
 test("normCdf matches known values", () => {
