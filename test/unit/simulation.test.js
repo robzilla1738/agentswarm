@@ -9,6 +9,8 @@ const {
   aggregateSimOutcomes,
   checkCoherence,
   runSimulation,
+  studentTQuantile,
+  studentTCdf,
 } = require("../../dist/simulation.js");
 const {
   mulberry32,
@@ -42,6 +44,68 @@ test("normInv inverts normCdf", () => {
   near(normInv(0.975), 1.959964, 1e-3);
 });
 
+// ---------------------------------------------------------------- Student-t
+
+test("studentTQuantile matches standard t-tables (one-tailed 0.9)", () => {
+  // t_0.90(df) — the two-sided 80% band multiplier the engine uses elsewhere.
+  const table = { 1: 3.078, 2: 1.886, 3: 1.638, 5: 1.476, 10: 1.372, 30: 1.31, 120: 1.289 };
+  for (const [df, t] of Object.entries(table)) {
+    near(studentTQuantile(0.9, Number(df)), t, 2e-3, `t_0.9(${df})`);
+  }
+  // t_0.975(df) — the classic 95% two-sided values.
+  near(studentTQuantile(0.975, 1), 12.706, 5e-3, "t_0.975(1)");
+  near(studentTQuantile(0.975, 10), 2.228, 3e-3, "t_0.975(10)");
+  near(studentTQuantile(0.975, 30), 2.042, 3e-3, "t_0.975(30)");
+});
+
+test("studentTQuantile is symmetric and inverts studentTCdf", () => {
+  for (const df of [1, 3, 8, 25]) {
+    for (const p of [0.05, 0.2, 0.5, 0.8, 0.95]) {
+      const t = studentTQuantile(p, df);
+      near(studentTCdf(t, df), p, 1e-3, `cdf(quantile(${p},${df}))`);
+    }
+    near(studentTQuantile(0.3, df), -studentTQuantile(0.7, df), 1e-6, `symmetry df=${df}`);
+  }
+  // Large df → standard normal.
+  near(studentTQuantile(0.975, 1e9), 1.959964, 1e-3, "t→normal");
+});
+
+test("studentTCdf converges to the normal CDF as df grows", () => {
+  near(studentTCdf(1.0, 1e8), normCdf(1.0), 1e-4);
+  near(studentTCdf(-2.0, 1e8), normCdf(-2.0), 1e-4);
+  // Heavier tails than normal at small df: more mass beyond 2σ.
+  assert.ok(1 - studentTCdf(2.0, 3) > 1 - normCdf(2.0), "t_3 has a fatter right tail than normal");
+});
+
+test("trend marginal samples Student-t tails, not a mis-scaled Gaussian band", () => {
+  // A trend driver carrying sePred/df must produce the heavy tails of the t,
+  // and reproduce the displayed 80% band (lo,hi) at the p10/p90 of the sample.
+  const df = 3;
+  const sePred = 5;
+  const projected = 100;
+  const t90 = studentTQuantile(0.9, df); // ≈1.638
+  const lo = projected - t90 * sePred;
+  const hi = projected + t90 * sePred;
+  const driver = {
+    id: "trend",
+    label: "trend",
+    marginal: { kind: "trend", lo, projected, hi, sePred, df },
+    provenance: { kind: "ols-trend", ref: "x", label: "x" },
+  };
+  const combiner = { kind: "numeric", root: { op: "driver", id: "trend" } };
+  const res = runSimulation([driver], combiner, [], 80000, 7);
+  const q = res.simulatedAggregate.quantiles;
+  // The empirical p10/p90 reproduce the displayed band (within Monte-Carlo noise).
+  near(q.p10, lo, 0.6, "p10 ≈ displayed lo");
+  near(q.p90, hi, 0.6, "p90 ≈ displayed hi");
+  // Tails are HEAVIER than a Gaussian of the same 80% band would give: the p5 of
+  // a t_3 reaches well beyond the Gaussian p5 (= projected − 1.645·σ_gauss where
+  // σ_gauss = (hi−lo)/(2·1.282)). This is the bug the fix closes.
+  const sigmaGauss = (hi - lo) / (2 * 1.282);
+  const gaussP5 = projected - 1.645 * sigmaGauss;
+  assert.ok(q.p5 < gaussP5 - 0.5, `t p5 ${q.p5} should sit below Gaussian p5 ${gaussP5}`);
+});
+
 // ---------------------------------------------------------------- sampleFromQuantiles
 
 test("sampleFromQuantiles reproduces the input quantiles", () => {
@@ -73,19 +137,42 @@ test("sampleFromQuantiles log-space stays positive and monotone", () => {
 
 // ---------------------------------------------------------------- copula
 
-test("buildCopulaSampler reproduces target correlation", () => {
+test("buildCopulaSampler reproduces target correlation (uniforms, latent via normInv)", () => {
   const drivers = [binDriver("A", 0.5), binDriver("B", 0.5)];
   const rand = mulberry32(7);
   const draw = buildCopulaSampler(drivers, [{ id1: "A", id2: "B", rho: 0.7 }], rand);
   const N = 40000;
   let sx = 0, sy = 0, sxy = 0, sxx = 0, syy = 0;
   for (let i = 0; i < N; i++) {
-    const [x, y] = draw();
+    const [ux, uy] = draw();
+    assert.ok(ux >= 0 && ux <= 1 && uy >= 0 && uy <= 1, "copula emits uniforms");
+    const x = normInv(ux), y = normInv(uy); // Gaussian copula: Φ⁻¹(u) recovers the latent normal
     sx += x; sy += y; sxy += x * y; sxx += x * x; syy += y * y;
   }
   const cov = sxy / N - (sx / N) * (sy / N);
   const sd = Math.sqrt((sxx / N - (sx / N) ** 2) * (syy / N - (sy / N) ** 2));
-  near(cov / sd, 0.7, 0.03, "sample correlation");
+  near(cov / sd, 0.7, 0.02, "latent correlation");
+});
+
+test("Student-t copula adds joint tail dependence the Gaussian copula lacks (D2)", () => {
+  const drivers = [binDriver("A", 0.5), binDriver("B", 0.5)];
+  const deps = [{ id1: "A", id2: "B", rho: 0.6 }];
+  const N = 80000;
+  // Fraction of draws where BOTH uniforms are in the joint upper tail (>0.95).
+  const jointTail = (sampler) => {
+    let both = 0;
+    for (let i = 0; i < N; i++) {
+      const [u, v] = sampler();
+      if (u > 0.95 && v > 0.95) both++;
+    }
+    return both / N;
+  };
+  const gauss = jointTail(buildCopulaSampler(drivers, deps, mulberry32(11))); // ν=∞
+  const t4 = jointTail(buildCopulaSampler(drivers, deps, mulberry32(11), 4)); // ν=4
+  assert.ok(t4 > gauss * 1.3, `t-copula joint-tail ${t4.toFixed(4)} should exceed Gaussian ${gauss.toFixed(4)} (tail dependence)`);
+  // ν=∞ recovers the Gaussian copula (same stream → near-identical tail rate).
+  const tInf = jointTail(buildCopulaSampler(drivers, deps, mulberry32(11), 1e9));
+  near(tInf, gauss, 0.004, "ν→∞ ≈ Gaussian");
 });
 
 test("buildCopulaSampler repairs a non-PD correlation matrix (no throw)", () => {
@@ -119,6 +206,20 @@ test("evalCombiner: and / or / weighted_sum", () => {
   assert.strictEqual(evalCombiner(orNode, idx, [0, 0]), 0);
   const ws = { op: "weighted_sum", children: [{ op: "driver", id: "A" }, { op: "driver", id: "B" }], weights: [1, 3] };
   near(evalCombiner(ws, idx, [4, 8]), (1 * 4 + 3 * 8) / 4, 1e-9, "weighted_sum");
+});
+
+test("evalCombiner threshold honors direction: default/gt fires above, lt fires below", () => {
+  const idx = new Map([["A", 0]]);
+  const gt = { op: "threshold", child: { op: "driver", id: "A" }, above: 100 };
+  const gtExplicit = { op: "threshold", child: { op: "driver", id: "A" }, above: 100, dir: "gt" };
+  const lt = { op: "threshold", child: { op: "driver", id: "A" }, above: 100, dir: "lt" };
+  // gt (default, and every pre-existing node) fires above the threshold.
+  assert.strictEqual(evalCombiner(gt, idx, [150]), 1);
+  assert.strictEqual(evalCombiner(gt, idx, [50]), 0);
+  assert.strictEqual(evalCombiner(gtExplicit, idx, [150]), 1);
+  // lt fires BELOW the threshold — the "close under strike" outcome.
+  assert.strictEqual(evalCombiner(lt, idx, [50]), 1);
+  assert.strictEqual(evalCombiner(lt, idx, [150]), 0);
 });
 
 // ---------------------------------------------------------------- runSimulation: binary

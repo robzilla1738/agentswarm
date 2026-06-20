@@ -4,7 +4,7 @@
 // (prediction markets) and wiki_tables polling already serve it well, so the pack
 // mainly routes for per-domain calibration and surfaces the right UI knobs.
 
-import { timeSeries, olsProject } from "../datatools";
+import { timeSeries, projectSeries } from "../datatools";
 import type { ForecastQuestion, SimDriver } from "../types";
 import type { DomainCtx, DomainPack, DomainResolution, IntentMatch } from "./pack";
 
@@ -21,8 +21,12 @@ const MACRO_SERIES: MacroIndicator[] = [
   { re: /\b(fed funds|federal funds|policy rate|fed rate)\b/i, series: "DFF", direct: true, name: "fed funds rate" },
   { re: /\b(10[- ]?year|10y)\b[^.]*\b(treasury|yield|note)\b|\btreasury yield\b/i, series: "DGS10", direct: true, name: "10y treasury yield" },
   { re: /\bmortgage rate\b/i, series: "MORTGAGE30US", direct: true, name: "30y mortgage rate" },
-  { re: /\b(cpi|consumer price)\b/i, series: "CPIAUCSL", direct: false, name: "CPI index" },
-  { re: /\binflation\b/i, series: "T10YIE", direct: false, name: "10y breakeven inflation" },
+  // Inflation is a RATE: project the YoY % change of CPI ("inflation" alias →
+  // CPIAUCSL units=pc1), not the index level (OLS on the ever-rising index would
+  // answer the wrong question). Breakeven is a distinct long-horizon market
+  // expectation — reserve it for explicit phrasing, matched first.
+  { re: /\b(breakeven|inflation expectations?|expected inflation)\b/i, series: "T10YIE", direct: false, name: "10y breakeven inflation" },
+  { re: /\b(inflation|cpi|consumer price)\b/i, series: "inflation", direct: false, name: "CPI inflation rate (YoY%)" },
   { re: /\b(gdp|gross domestic product)\b/i, series: "GDPC1", direct: false, name: "real GDP" },
   { re: /\b(payrolls?|nonfarm|jobs report)\b/i, series: "PAYEMS", direct: false, name: "nonfarm payrolls" },
 ];
@@ -58,13 +62,13 @@ export const macroPack: DomainPack = {
     if (!series) return drivers;
     try {
       const ts = await timeSeries(ctx.cfg, "fred", series, undefined, undefined, ctx.signal);
-      const proj = olsProject(ts.points, q.resolutionDate);
+      const proj = projectSeries(ts.points, q.resolutionDate, "rwdrift");
       if (proj) {
         drivers.push({
           id: "macro_trend",
-          label: `${ts.label} OLS projection to ${q.resolutionDate}`,
-          marginal: { kind: "trend", lo: proj.lo, projected: proj.projected, hi: proj.hi },
-          provenance: { kind: "ols-trend", ref: `fred:${series}`, label: `slope ${proj.slopePerDay.toFixed(3)}/day` },
+          label: `${ts.label} RW-drift projection to ${q.resolutionDate}`,
+          marginal: { kind: "trend", lo: proj.lo, projected: proj.projected, hi: proj.hi, sePred: proj.sePred, df: proj.df },
+          provenance: { kind: "ols-trend", ref: `fred:${series}`, label: `RW-drift slope ${proj.slopePerDay.toFixed(3)}/day` },
         });
       }
     } catch (e) {

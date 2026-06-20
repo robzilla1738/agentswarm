@@ -14,7 +14,11 @@ const CONSTRUCTION_RE =
   /\b(construction|infrastructure|megaproject|project|build(?:ing)?|tunnel|bridge|highway|railway|rail line|metro|subway|pipeline|power plant|refinery|factory|facility|stadium|airport|dam|terminal)\b/i;
 const DELIVERY_RE = /\b(complete|completed|completion|operational|open(?:s|ed|ing)?|deliver(?:y|ed)?|finish(?:ed)?|on schedule|behind schedule|groundbreaking|topped out|in service|commission(?:ed|ing)?|by \d{4})\b/i;
 
-const REF_CLASS = "infra_schedule_slip";
+/** Canonical reference-class keys for construction — the pack's query default,
+ *  the prompt's examples, and the seed corpus all share these so the cold-start
+ *  seed actually feeds the driver (one source of truth prevents key drift). */
+export const REF_CLASS = "infra_schedule_slip";
+export const CONSTRUCTION_COST_OVERRUN = "infra_cost_overrun";
 
 export const constructionPack: DomainPack = {
   id: "construction",
@@ -41,7 +45,7 @@ Reply with ONLY JSON (no prose, no fence):
 {"brief":"one line on how the milestones combine","questions":[{"text":"...","kind":"binary|date|numeric","resolutionCriteria":"...","resolutionDate":"YYYY-MM-DD","refClass":"snake_case_class","unit":"months (numeric only)"}]}
 
 - Each milestone is a concrete, checkable gate: permits/approvals obtained, funding/financing secured, a construction phase complete (date), or schedule slip vs baseline (numeric, unit "months").
-- refClass: a normalized reference-class key for base-rate accumulation, e.g. "permit_approval", "funding_secured", "${REF_CLASS}".
+- refClass: a normalized reference-class key for base-rate accumulation. Use these canonical keys where they fit (they carry seeded historical base rates): "${REF_CLASS}" (schedule slip vs baseline), "${CONSTRUCTION_COST_OVERRUN}" (cost overrun); otherwise a descriptive snake_case key like "permit_approval", "funding_secured".
 - resolutionDate: ISO, on or before the project horizon.
 - Keep it to the few milestones that genuinely drive the outcome.`;
     let raw: string;
@@ -85,15 +89,31 @@ Reply with ONLY JSON (no prose, no fence):
 
   async buildDrivers(_ctx: DomainCtx, q: ForecastQuestion, _match: IntentMatch, siblings: SimDriver[]): Promise<SimDriver[]> {
     const drivers = [...siblings];
-    // Counted reference-class overrun rate from accumulated resolutions (dormant
-    // until enough comparable projects have resolved). Exclude this question.
-    const rc = queryRefClass("construction", REF_CLASS, (r) => r.ledgerId !== q.id);
-    if (rc.n >= 5 && typeof rc.baseRate === "number") {
+    // Counted reference-class overrun rate from accumulated resolutions + the
+    // seeded starter corpus. Query the sub-question's OWN refClass when it carries
+    // one (G4) — a "funding_secured" facet looks up a different base rate than a
+    // "schedule_slip" one — falling back to the pack default. Exclude this question.
+    const cls = q.refClass || REF_CLASS;
+    const rc = queryRefClass("construction", cls, (r) => r.ledgerId !== q.id);
+    if ((rc.binaryN ?? 0) >= 5 && typeof rc.baseRate === "number") {
+      // Describe the base rate by the class it actually came from — the driver
+      // also queries the cost-overrun class (and any milestone class a sub-question
+      // carries), so a hardcoded "schedule slip / % slipped" label would misdescribe
+      // those. The wording stays polarity-neutral because YES means different things
+      // across classes (slipped/overran vs a milestone met). rc.baseRate is the
+      // Beta(½,½)-smoothed rate — never a reckless 0/1 on a thin class; rawBaseRate
+      // (k/n) is shown alongside for transparency.
+      const noun = cls === REF_CLASS ? "schedule slip" : cls === CONSTRUCTION_COST_OVERRUN ? "cost overrun" : cls.replace(/_/g, " ");
+      const rawPct = Math.round((rc.rawBaseRate ?? rc.baseRate) * 100);
       drivers.push({
         id: "ref_overrun",
-        label: `Reference-class schedule overrun (n=${rc.n})`,
+        label: `Reference-class ${noun} (n=${rc.binaryN})`,
         marginal: { kind: "binary", probability: clampProb(rc.baseRate) },
-        provenance: { kind: "base-rate", ref: `refstore:${REF_CLASS}`, label: `${rc.n} comparable projects, ${Math.round(rc.baseRate * 100)}% slipped` },
+        provenance: {
+          kind: "base-rate",
+          ref: `refstore:${cls}`,
+          label: `${rc.binaryN} comparable projects, base rate ${rawPct}% → smoothed ${Math.round(rc.baseRate * 100)}%`,
+        },
       });
     }
     return drivers;

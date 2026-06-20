@@ -60,6 +60,14 @@ export interface DomainPack {
   readonly llmHint?: string;
   /** Forecast tunable ids the UI should surface for this domain (progressive disclosure). */
   readonly knobs?: readonly string[];
+  /**
+   * Degrees of freedom for the scenario simulation's Student-t copula. A finite
+   * value (≈6–8) gives the joint TAIL DEPENDENCE a Gaussian copula lacks — when
+   * one grounded driver hits an extreme, correlated drivers are more likely to
+   * too (the fat-tail co-movement a finance/macro shock actually exhibits).
+   * Omitted (or ∞) → the Gaussian copula (current behavior, exactly).
+   */
+  readonly copulaDf?: number;
 
   /**
    * DETERMINISTIC, FREE, PURE. A regex/keyword gate (the classifySportsMission

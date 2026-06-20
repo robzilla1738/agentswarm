@@ -3,7 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { api } from "@/lib/api";
-import { fmtAgo, fmtMoney, fmtTokens } from "@/lib/format";
+import { daysToIso, fmtAgo, fmtMoney, fmtNum, fmtTokens } from "@/lib/format";
 import type { RunSummary } from "@/lib/types";
 import { StatusBadge, StatusDot } from "./atoms";
 
@@ -41,7 +41,9 @@ export function RunCard({ run, now, onDeleted }: { run: RunSummary; now: number;
       role="link"
       tabIndex={0}
       onClick={() => router.push(`/run?id=${run.id}`)}
-      onKeyDown={(e) => e.key === "Enter" && router.push(`/run?id=${run.id}`)}
+      // Only navigate when the card ITSELF has focus — otherwise Enter on the
+      // nested delete button bubbles here and routes away before its confirm fires.
+      onKeyDown={(e) => e.key === "Enter" && e.target === e.currentTarget && router.push(`/run?id=${run.id}`)}
       className="panel panel-hover p-4 block cursor-pointer group relative"
       style={{ animation: "var(--animate-rise)", opacity: deleting ? 0.4 : 1 }}
     >
@@ -55,6 +57,7 @@ export function RunCard({ run, now, onDeleted }: { run: RunSummary; now: number;
         ) : onDeleted ? (
           <button
             onClick={remove}
+            aria-label="Delete run"
             title={confirming ? "Click again to delete" : "Delete run"}
             className="btn btn-sm px-2 py-[3px] text-2xs"
             style={{
@@ -77,7 +80,9 @@ export function RunCard({ run, now, onDeleted }: { run: RunSummary; now: number;
             {typeof run.forecast.p === "number"
               ? `${Math.round(run.forecast.p * 100)}%`
               : typeof run.forecast.p50 === "number"
-                ? `~${run.forecast.p50}${run.forecast.unit ? ` ${run.forecast.unit}` : ""}`
+                ? run.forecast.kind === "date"
+                  ? `~${daysToIso(run.forecast.p50)}`
+                  : `~${fmtNum(run.forecast.p50)}${run.forecast.unit ? ` ${run.forecast.unit}` : ""}`
                 : "forecast"}
           </span>
         )}

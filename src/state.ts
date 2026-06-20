@@ -459,6 +459,7 @@ export class RunState {
               p: this.aggregate?.probability,
               p50: this.aggregate?.quantiles?.p50,
               unit: this.question.unit,
+              kind: this.question.kind,
               n: this.aggregate?.n ?? 0,
               resolutionDate: this.question.resolutionDate,
               // >1 when an open question fanned out into several sub-forecasts.

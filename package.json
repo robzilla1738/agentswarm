@@ -1,6 +1,6 @@
 {
   "name": "@robzilla1738/agentswarm",
-  "version": "0.18.0",
+  "version": "0.19.0",
   "publishConfig": {
     "access": "public"
   },
@@ -47,7 +47,7 @@
     "serve": "node bin/swarm.js serve",
     "demo": "node bin/swarm.js demo",
     "test": "npm run test:unit && node test/e2e.js",
-    "test:unit": "node --test test/unit/*.test.js"
+    "test:unit": "npm run build && node --test test/unit/*.test.js"
   },
   "engines": {
     "node": ">=20.10"

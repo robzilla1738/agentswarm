@@ -261,6 +261,41 @@ export function devigProbs(decimalOdds: number[]): number[] {
 }
 
 /**
+ * Shin (1992/1993) de-vig: removes the bookmaker margin under a model where the
+ * overround compensates for informed ("insider") money, rather than spreading it
+ * proportionally. The fair probability of outcome i is
+ *   pᵢ = [√(z² + 4(1−z)·bᵢ²/B) − z] / (2(1−z)),   bᵢ = 1/oᵢ,  B = Σ bⱼ,
+ * with z (the insider proportion) solved so Σpᵢ = 1. Versus proportional
+ * normalization, Shin shifts probability mass TOWARD favorites and AWAY from
+ * longshots — correcting the favorite-longshot bias that makes a proportional
+ * de-vig misprice chalk. Reduces to proportional when the book is balanced (all
+ * bᵢ equal) or has no overround. ≥2 priced outcomes required (a lone outcome
+ * can't be de-vigged — returns the raw inverse odds, like devigProbs).
+ */
+export function shinDevig(decimalOdds: number[]): number[] {
+  const b = decimalOdds.map((o) => (o > 1 ? 1 / o : 0));
+  const B = b.reduce((s, v) => s + v, 0);
+  if (b.filter((v) => v > 0).length < 2 || B <= 0) return b;
+  if (B <= 1) return b.map((v) => v / B); // no overround → proportional is exact
+  const pAt = (z: number): number[] =>
+    b.map((bi) => (bi > 0 ? (Math.sqrt(z * z + (4 * (1 - z) * bi * bi) / B) - z) / (2 * (1 - z)) : 0));
+  const sumAt = (z: number): number => pAt(z).reduce((s, v) => s + v, 0);
+  // Σpᵢ(z) decreases from √B (>1) at z=0; bisect z∈[0,1) to Σ=1. The upper bound
+  // is the mathematical domain (z<1 keeps 2(1−z)>0), so even a heavily-juiced book
+  // converges instead of clamping at 0.5 and silently returning a biased vector.
+  let lo = 0;
+  let hi = 0.999;
+  for (let it = 0; it < 60; it++) {
+    const mid = (lo + hi) / 2;
+    if (sumAt(mid) > 1) lo = mid;
+    else hi = mid;
+  }
+  const p = pAt((lo + hi) / 2);
+  const s = p.reduce((a, v) => a + v, 0);
+  return s > 0 ? p.map((v) => v / s) : p; // tiny renorm for floating-point safety
+}
+
+/**
  * PredictIt (keyless): real-money US-politics markets. One endpoint returns
  * every open market; matching is client-side term overlap. Multi-contract
  * markets emit one hit per matching contract (each contract is its own YES/NO
@@ -355,7 +390,7 @@ export async function sportsbookSearch(
       // Need ≥2 priced outcomes to de-vig; a lone outcome (suspended line, one
       // side pulled) isn't a probability and would otherwise fabricate ~100%.
       if (prices.length < 2 || prices.some((p: number) => !Number.isFinite(p) || p <= 1)) continue;
-      const probs = devigProbs(prices);
+      const probs = shinDevig(prices);
       outcomes.forEach((o: any, i: number) => {
         const key = String(o?.name ?? "");
         const cur = sums.get(key) ?? { sum: 0, n: 0 };
@@ -486,12 +521,12 @@ function parseEventLines(ev: any, home: string, away: string): SportsLine | null
       const dp = Number(outs.find((o: any) => /^draw|^tie$/i.test(String(o?.name)))?.price);
       if (hp > 1 && ap > 1) {
         if (dp > 1) {
-          const [ph, pd, pa] = devigProbs([hp, dp, ap]);
+          const [ph, pd, pa] = shinDevig([hp, dp, ap]);
           pHome.push(ph);
           pDraw.push(pd);
           pAway.push(pa);
         } else {
-          const [ph, pa] = devigProbs([hp, ap]);
+          const [ph, pa] = shinDevig([hp, ap]);
           pHome.push(ph);
           pAway.push(pa);
         }
@@ -1245,7 +1280,12 @@ export const FRED_ALIASES: Record<string, string> = {
   treasury10y: "DGS10",
   cpi: "CPIAUCSL",
   corecpi: "CPILFESL",
+  // "inflation" is a RATE, not the index level — these resolve to CPI but the
+  // FRED_TRANSFORM table below requests the YoY % change (units=pc1) so an OLS
+  // projection answers "what will inflation be", not "what will the index read".
   inflation: "CPIAUCSL",
+  cpi_yoy: "CPIAUCSL",
+  core_inflation: "CPILFESL",
   unemployment: "UNRATE",
   payrolls: "PAYEMS",
   nonfarm_payrolls: "PAYEMS",
@@ -1268,6 +1308,18 @@ export const FRED_ALIASES: Record<string, string> = {
   case_shiller: "CSUSHPINSA",
 };
 
+/**
+ * Aliases whose natural reading is a TRANSFORM of the underlying series, applied
+ * via FRED's `units` param: pc1 = % change from a year ago (YoY rate). Keyed by
+ * the alias word so "inflation" returns the CPI inflation RATE while "cpi"
+ * returns the raw index level. The transform is part of the cache key.
+ */
+export const FRED_TRANSFORM: Record<string, "pc1" | "pch"> = {
+  inflation: "pc1",
+  cpi_yoy: "pc1",
+  core_inflation: "pc1",
+};
+
 /** FRED (St. Louis Fed) — economic series; needs the free fredApiKey. Accepts a plain-word alias (FRED_ALIASES) or a raw series id. */
 async function fredSeries(
   cfg: SwarmConfig,
@@ -1281,8 +1333,11 @@ async function fredSeries(
       "FRED needs an API key — get a free one at https://fred.stlouisfed.org/docs/api/api_key.html and set fredApiKey in Settings (swarm config set fredApiKey <key>). Meanwhile, worldbank and yahoo work keyless."
     );
   }
-  const id = FRED_ALIASES[series.trim().toLowerCase()] ?? series;
+  const key = series.trim().toLowerCase();
+  const id = FRED_ALIASES[key] ?? series;
+  const units = FRED_TRANSFORM[key];
   const params = new URLSearchParams({ series_id: id, api_key: cfg.fredApiKey, file_type: "json" });
+  if (units) params.set("units", units); // pc1 → YoY %; turns the CPI index into the inflation rate
   if (start) params.set("observation_start", start);
   if (end) params.set("observation_end", end);
   const res = await apiGet(`https://api.stlouisfed.org/fred/series/observations?${params}`, signal);
@@ -1290,7 +1345,9 @@ async function fredSeries(
   const points = (data?.observations ?? [])
     .map((o: any) => ({ date: String(o.date), value: Number(o.value) }))
     .filter((p: { value: number }) => Number.isFinite(p.value));
-  return { source: "fred", series: id, points, label: `FRED ${id}${id !== series ? ` (${series})` : ""}` };
+  const unitNote = units === "pc1" ? " YoY%" : units === "pch" ? " %chg" : "";
+  const unit = units === "pc1" ? "% YoY" : units === "pch" ? "% chg (period)" : undefined;
+  return { source: "fred", series: id, points, label: `FRED ${id}${unitNote}${id !== series ? ` (${series})` : ""}`, ...(unit ? { unit } : {}) };
 }
 
 /** World Bank — country indicators, keyless. Series form: INDICATOR:COUNTRY, e.g. NY.GDP.MKTP.CD:US. */
@@ -1407,40 +1464,79 @@ async function openmeteoSeries(series: string, start?: string, end?: string, sig
     throw new Error('openmeteo series must be "lat,lon[,daily_variable]", e.g. "39.74,-104.99,snowfall_sum"');
   }
   const today = new Date().toISOString().slice(0, 10);
-  const historical = Boolean(start && start < today);
-  const params = new URLSearchParams({
-    latitude: String(lat),
-    longitude: String(lon),
-    daily: variable,
-    timezone: "UTC",
-  });
-  let url: string;
-  if (historical) {
-    params.set("start_date", start!);
-    params.set("end_date", end && end < today ? end : today);
-    url = `https://archive-api.open-meteo.com/v1/archive?${params}`;
-  } else {
-    params.set("forecast_days", "16");
-    url = `https://api.open-meteo.com/v1/forecast?${params}`;
+  const baseParams = () =>
+    new URLSearchParams({ latitude: String(lat), longitude: String(lon), daily: variable, timezone: "auto" });
+  // One fetch → its daily rows, plus the units string and any reason note.
+  const fetchOM = async (url: string): Promise<{ pts: { date: string; value: number }[]; unit?: string; reason?: string }> => {
+    const res = await apiGet(url, signal);
+    const data: any = await res.json();
+    const dates: string[] = data?.daily?.time ?? [];
+    const values: unknown[] = data?.daily?.[variable] ?? [];
+    const pts = dates
+      .map((d, i) => ({ date: String(d).slice(0, 10), value: Number(values[i]) }))
+      .filter((p) => Number.isFinite(p.value));
+    return { pts, unit: data?.daily_units?.[variable] ? String(data.daily_units[variable]) : undefined, reason: data?.reason };
+  };
+
+  // A window that spans today needs BOTH endpoints: the ERA5 archive for the past
+  // and the forecast for the next ≤16 days. Routing the whole span to the archive
+  // (and capping end at today) silently drops the decision-relevant forecast days.
+  const needsArchive = Boolean(start && start < today);
+  const needsForecast = !end || end >= today;
+  const segments: { url: string; tag: string }[] = [];
+  if (needsArchive) {
+    const p = baseParams();
+    p.set("start_date", start!);
+    p.set("end_date", end && end < today ? end : today);
+    segments.push({ url: `https://archive-api.open-meteo.com/v1/archive?${p}`, tag: "ERA5 archive" });
   }
-  const res = await apiGet(url, signal);
-  const data: any = await res.json();
-  const dates: string[] = data?.daily?.time ?? [];
-  const values: unknown[] = data?.daily?.[variable] ?? [];
-  if (!dates.length) {
+  if (needsForecast) {
+    const p = baseParams();
+    p.set("forecast_days", "16");
+    segments.push({ url: `https://api.open-meteo.com/v1/forecast?${p}`, tag: "16-day forecast" });
+  }
+  if (!segments.length) {
+    // No start and an end in the past shouldn't happen (no start ⇒ default forecast);
+    // fall back to the forecast endpoint so we never return empty by construction.
+    const p = baseParams();
+    p.set("forecast_days", "16");
+    segments.push({ url: `https://api.open-meteo.com/v1/forecast?${p}`, tag: "16-day forecast" });
+  }
+
+  const byDate = new Map<string, number>();
+  let unit: string | undefined;
+  let lastReason: string | undefined;
+  const tags: string[] = [];
+  for (const seg of segments) {
+    // Per-segment isolation: a transient failure on one endpoint (e.g. the
+    // forecast side) must not discard the data the other endpoint already
+    // returned — for a weather base-rate query the ERA5 archive is the prize.
+    try {
+      const { pts, unit: u, reason } = await fetchOM(seg.url);
+      if (pts.length) tags.push(seg.tag);
+      if (u && !unit) unit = u;
+      if (reason) lastReason = reason;
+      for (const p of pts) byDate.set(p.date, p.value); // forecast overrides archive on any overlap day
+    } catch (e) {
+      lastReason = (e as Error)?.message ?? String(e);
+    }
+  }
+  const points = [...byDate.entries()].map(([date, value]) => ({ date, value })).sort((a, b) => (a.date < b.date ? -1 : 1));
+  if (!points.length) {
     throw new Error(
-      `open-meteo returned no data for "${series}"${data?.reason ? ` (${data.reason})` : ""} — check the variable name (daily variables like temperature_2m_max, precipitation_sum, snowfall_sum)`
+      `open-meteo returned no data for "${series}"${lastReason ? ` (${lastReason})` : ""} — check the variable name (daily variables like temperature_2m_max, precipitation_sum, snowfall_sum)`
     );
   }
-  const points = dates
-    .map((d, i) => ({ date: String(d).slice(0, 10), value: Number(values[i]) }))
-    .filter((p) => Number.isFinite(p.value));
+  // Honest degradation: open-meteo's forecast reaches only ~16 days out, so a
+  // horizon beyond that is not covered — say so in the label the forecaster reads.
+  const last = points[points.length - 1].date;
+  const truncated = end && end > last ? ` — NOTE: data ends ${last}; horizon ${end} is beyond open-meteo's 16-day forecast` : "";
   return {
     source: "openmeteo",
     series,
     points,
-    label: `${variable} at ${lat},${lon} (${historical ? "ERA5 archive" : "16-day forecast"})`,
-    unit: data?.daily_units?.[variable] ? String(data.daily_units[variable]) : undefined,
+    label: `${variable} at ${lat},${lon} (${tags.join(" + ") || "open-meteo"})${truncated}`,
+    unit,
   };
 }
 
@@ -1557,6 +1653,40 @@ async function resolveCik(ticker: string, signal?: AbortSignal): Promise<{ cik10
  * form "TICKER:us-gaap-tag", e.g. "AAPL:Revenues", "NVDA:NetIncomeLoss". Returns
  * one value per 10-K/10-Q period end.
  */
+/** One XBRL fact reduced to what duration-selection needs: period end, value, and span in days (0 = instant/stock). */
+export interface XbrlFact {
+  end: string;
+  val: number;
+  span: number;
+}
+
+/**
+ * Keep ONE consistent reporting frequency from a mix of XBRL flow facts. 10-K
+ * (annual, ~365d) and 10-Q (quarterly/YTD, ~90/180/270d) flows on one axis make
+ * a 4× sawtooth that destroys any trend fit. Prefer full fiscal years; failing a
+ * usable annual history, fall back to the single most common period length.
+ * Instant (stock) facts carry no duration (span 0) and pass through untouched.
+ */
+export function selectConsistentDuration(raw: XbrlFact[]): { kept: XbrlFact[]; durNote: string } {
+  const isFlow = raw.some((r) => r.span > 0);
+  if (!isFlow) return { kept: raw, durNote: "point-in-time" };
+  const annual = raw.filter((r) => r.span >= 330 && r.span <= 400);
+  if (annual.length >= 2) return { kept: annual, durNote: "annual (10-K FY)" };
+  const bucket = (s: number) => Math.round(s / 30) * 30;
+  const byBucket = new Map<number, XbrlFact[]>();
+  for (const r of raw) {
+    if (r.span <= 0) continue;
+    const b = bucket(r.span);
+    const arr = byBucket.get(b) ?? [];
+    arr.push(r);
+    byBucket.set(b, arr);
+  }
+  let best: XbrlFact[] = [];
+  let bestB = 0;
+  for (const [b, rs] of byBucket) if (rs.length > best.length) ((best = rs), (bestB = b));
+  return best.length ? { kept: best, durNote: `${bestB}-day periods` } : { kept: raw, durNote: "mixed" };
+}
+
 async function secFactsSeries(series: string, signal?: AbortSignal): Promise<TimeSeriesResult> {
   const [tk, tag = "Revenues"] = series.split(":").map((s) => s.trim());
   if (!tk) throw new Error('secfacts series must be "TICKER:tag", e.g. "AAPL:Revenues" or "NVDA:NetIncomeLoss"');
@@ -1567,15 +1697,24 @@ async function secFactsSeries(series: string, signal?: AbortSignal): Promise<Tim
   const units = data?.units ?? {};
   const unitKey = Object.keys(units)[0]; // USD | shares | USD/shares
   const rows: any[] = unitKey ? units[unitKey] : [];
-  const byEnd = new Map<string, number>();
+  const DAY = 86_400_000;
+  const raw: { end: string; val: number; span: number }[] = [];
   for (const r of rows) {
     if (r?.form !== "10-K" && r?.form !== "10-Q") continue;
     if (!r.end || !Number.isFinite(Number(r.val))) continue;
-    byEnd.set(String(r.end), Number(r.val)); // later array entries (amendments) override
+    // Duration (flow) facts carry `start`; instant (stock) facts don't. The span
+    // separates a 10-K full year (~365d) from a 10-Q quarter/YTD (~90/180/270d).
+    const start = r.start ? Date.parse(r.start) : NaN;
+    const end = Date.parse(r.end);
+    const span = Number.isFinite(start) && Number.isFinite(end) ? Math.round((end - start) / DAY) : 0;
+    raw.push({ end: String(r.end), val: Number(r.val), span });
   }
+  const { kept, durNote } = selectConsistentDuration(raw);
+  const byEnd = new Map<string, number>();
+  for (const r of kept) byEnd.set(r.end, r.val); // later entries (amendments) override
   const points = [...byEnd.entries()].map(([date, value]) => ({ date, value })).sort((a, b) => (a.date < b.date ? -1 : 1));
   if (!points.length) throw new Error(`secfacts: no 10-K/10-Q values for ${tk}:${tag} — check the us-gaap tag (try Revenues, NetIncomeLoss, Assets)`);
-  return { source: "secfacts", series: `${tk.toUpperCase()}:${tag}`, points, label: `${cik.title || tk} — ${tag}`, unit: unitKey };
+  return { source: "secfacts", series: `${tk.toUpperCase()}:${tag}`, points, label: `${cik.title || tk} — ${tag} (${durNote})`, unit: unitKey };
 }
 
 // ---------------------------------------------------------------- USAspending.gov (keyless)
@@ -1739,7 +1878,12 @@ async function rawTimeSeries(
  */
 export function canonicalSeriesKey(source: TimeSeriesSource, series: string): string {
   const s = series.trim();
-  if (source === "fred") return FRED_ALIASES[s.toLowerCase()] ?? s;
+  if (source === "fred") {
+    const key = s.toLowerCase();
+    const id = FRED_ALIASES[key] ?? s;
+    const u = FRED_TRANSFORM[key];
+    return u ? `${id}~${u}` : id; // keep YoY (inflation) distinct from the index level (cpi)
+  }
   if (source === "bls") return BLS_ALIASES[s.toLowerCase()] ?? s;
   if (source === "secfacts") {
     const i = s.indexOf(":"); // uppercase the ticker; the us-gaap tag is case-sensitive
@@ -1825,7 +1969,22 @@ export interface OlsProjection {
   hi: number;
   /** Days from the last observation to the target. */
   daysAhead: number;
+  /**
+   * Standard error of PREDICTION at the target — σ·√(1 + 1/n + (x−x̄)²/Sxx),
+   * WITHOUT the t multiplier. The honest scale of a location-scale Student-t
+   * predictive: a simulator samples `projected + sePred·t_df`, never a Gaussian
+   * band of width (hi−lo) (which is a t-band and would be mis-scaled as a normal).
+   */
+  sePred: number;
+  /** Degrees of freedom of the predictive t distribution. */
+  df: number;
+  /** Projector used: ordinary least squares, random-walk-with-drift, or damped trend. */
+  method?: ProjectionMethod;
+  /** True when the fit was in log space (multiplicative/price series) — projected/lo/hi are linear, sePred is log-units. */
+  logSpace?: boolean;
 }
+
+export type ProjectionMethod = "ols" | "rwdrift" | "damped";
 
 /** Student-t 90th percentile (one-tail) by df — the two-sided 80% band multiplier. */
 function tQuantile90(df: number): number {
@@ -1897,15 +2056,197 @@ export function olsProject(points: { date: string; value: number }[], targetDate
   const xTarget = (target - t0) / DAY;
   const projected = intercept + slope * xTarget;
   // Full prediction interval: parameter uncertainty (1/n) plus the
-  // extrapolation term ((x−x̄)²/Sxx) on top of the residual spread.
-  const band = tQuantile90(n - 2) * sigma * Math.sqrt(1 + 1 / n + ((xTarget - mx) * (xTarget - mx)) / sxx);
+  // extrapolation term ((x−x̄)²/Sxx) on top of the residual spread. sePred is
+  // the t-band's scale; the displayed lo/hi multiply it by t(n−2).
+  const sePred = sigma * Math.sqrt(1 + 1 / n + ((xTarget - mx) * (xTarget - mx)) / sxx);
+  const band = tQuantile90(n - 2) * sePred;
   return {
     slopePerDay: slope,
     projected,
     lo: projected - band,
     hi: projected + band,
     daysAhead: Math.round(xTarget - xs[n - 1]),
+    sePred,
+    df: n - 2,
+    method: "ols",
   };
+}
+
+/**
+ * Random-walk-with-drift projection — the benchmark that beats a linear OLS
+ * extrapolation out-of-sample on most price/rate series (it doesn't assume the
+ * past slope persists, only that the level wanders with a constant per-day
+ * drift). Drift μ = (yₙ − y₁)/Δdays; per-day innovation variance σ² from the
+ * drift-removed increments. h days ahead: ŷ = yₙ + μ·h with prediction variance
+ * σ²·h (random-walk growth) + Var(μ̂)·h² (drift uncertainty). `logSpace` fits on
+ * log(value) for multiplicative series (prices), returning a lognormal
+ * predictive: projected/lo/hi linear, sePred in log units. Same shape as
+ * olsProject so it drops into any consumer.
+ */
+export function rwDriftProject(
+  points: { date: string; value: number }[],
+  targetDate: string,
+  opts: { logSpace?: boolean } = {}
+): OlsProjection | null {
+  const logSpace = Boolean(opts.logSpace);
+  let pts = points.filter((p) => Number.isFinite(Date.parse(p.date)) && Number.isFinite(p.value) && (!logSpace || p.value > 0));
+  if (pts.length < 3 || !/^\d{4}-\d{2}-\d{2}/.test(targetDate)) return null;
+  pts = [...pts].sort((a, b) => Date.parse(a.date) - Date.parse(b.date));
+  const DAY = 86_400_000;
+  const xs = pts.map((p) => Date.parse(p.date) / DAY);
+  const ys = pts.map((p) => (logSpace ? Math.log(p.value) : p.value));
+  const n = ys.length;
+  const totalDays = xs[n - 1] - xs[0];
+  const target = Date.parse(targetDate) / DAY;
+  if (!Number.isFinite(target) || !(totalDays > 0)) return null;
+  const h = target - xs[n - 1]; // days ahead (the projection horizon)
+  const drift = (ys[n - 1] - ys[0]) / totalDays; // per-day drift
+  // Per-day innovation variance from drift-removed increments: each step of `s`
+  // days carries variance σ²·s, so σ² = mean over increments of (Δ − μ·s)²/s.
+  let s2 = 0;
+  let m = 0;
+  for (let i = 1; i < n; i++) {
+    const step = xs[i] - xs[i - 1];
+    if (step <= 0) continue;
+    const e = ys[i] - ys[i - 1] - drift * step;
+    s2 += (e * e) / step;
+    m++;
+  }
+  if (!m) return null;
+  const sig2 = m > 1 ? s2 / (m - 1) : s2;
+  const varMu = sig2 / totalDays; // Var of the drift estimate
+  const projFit = ys[n - 1] + drift * h;
+  const sePred = Math.sqrt(Math.max(0, sig2 * Math.abs(h) + varMu * h * h));
+  // sig2 is estimated from m=n−1 increments minus one drift parameter, so it
+  // carries n−2 dof (the divisor above is m−1). The predictive t must match —
+  // n−1 here understates the tails at the small-n floor (n=3 → ~39% too narrow).
+  const df = Math.max(1, n - 2);
+  const band = tQuantile90(df) * sePred;
+  const projected = logSpace ? Math.exp(projFit) : projFit;
+  return {
+    // Report momentum at the LAST observed value (current $/day), not at the
+    // far-horizon projected price, so the label reads as today's slope.
+    slopePerDay: logSpace ? pts[n - 1].value * drift : drift,
+    projected,
+    lo: logSpace ? Math.exp(projFit - band) : projFit - band,
+    hi: logSpace ? Math.exp(projFit + band) : projFit + band,
+    daysAhead: Math.round(h),
+    sePred,
+    df,
+    method: "rwdrift",
+    ...(logSpace ? { logSpace: true } : {}),
+  };
+}
+
+/**
+ * Damped-trend projection — an OLS fit whose slope contribution is geometrically
+ * damped over the forecast horizon (Holt's φ), so the trend flattens instead of
+ * extrapolating a steep line to infinity. Guards the classic failure of linear
+ * extrapolation on a temporarily-steep window. Same residual band as OLS.
+ */
+export function dampedTrendProject(
+  points: { date: string; value: number }[],
+  targetDate: string,
+  phi = 0.85
+): OlsProjection | null {
+  const base = olsProject(points, targetDate);
+  if (!base) return null;
+  const pts = points.filter((p) => Number.isFinite(Date.parse(p.date)) && Number.isFinite(p.value)).sort((a, b) => Date.parse(a.date) - Date.parse(b.date));
+  const DAY = 86_400_000;
+  const n = pts.length;
+  // True median of consecutive day-gaps — the cadence the damping counts in.
+  const gaps: number[] = [];
+  for (let i = 1; i < n; i++) gaps.push(Math.abs((Date.parse(pts[i].date) - Date.parse(pts[i - 1].date)) / DAY));
+  gaps.sort((a, b) => a - b);
+  const medianStep = Math.max(1, gaps.length ? gaps[Math.floor(gaps.length / 2)] : 1);
+  // Anchor on the OLS FITTED value at the last observation (the smooth trend),
+  // not the noisy last data point: fitted_last = projected − slope·daysAhead.
+  const fittedLast = base.projected - base.slopePerDay * base.daysAhead;
+  const hSteps = Math.max(0, base.daysAhead / medianStep);
+  // Holt damped: the slope adds φ+φ²+…+φ^h = φ(1−φ^h)/(1−φ) periods of slope,
+  // bounded as h→∞ (vs OLS's unbounded h·slope).
+  const dampedPeriods = phi >= 1 ? hSteps : (phi * (1 - Math.pow(phi, hSteps))) / (1 - phi);
+  const projected = fittedLast + base.slopePerDay * medianStep * dampedPeriods;
+  // Re-center the OLS band on the damped mean (width unchanged — same σ/df).
+  const band = base.hi - base.projected;
+  return { ...base, projected, lo: projected - band, hi: projected + band, method: "damped" };
+}
+
+export interface ProjectorBacktestRow {
+  method: ProjectionMethod;
+  /** One-step-ahead predictions scored. */
+  n: number;
+  /**
+   * Mean absolute SCALED error (MASE-style): each step's |error| is divided by
+   * that series' naive one-step MAE before pooling, so series of wildly different
+   * magnitudes (payrolls ~150,000 vs unemployment ~4%) contribute comparably and
+   * the pooled number isn't dominated by the largest series. <1 beats naive
+   * persistence; lower is better.
+   */
+  mase: number;
+  /** Fraction of actuals inside the ~80% band (target ≈ 0.80). */
+  coverage: number;
+}
+
+/**
+ * Walk-forward backtest of the trend PROJECTORS themselves — the proof that the
+ * RW-drift default earns its place. For each series, step forward one observation
+ * at a time: fit each method on the history so far, project to the next date, and
+ * score the scale-free point error + band coverage against what actually
+ * happened. This is the projector-level gate `backtestNumeric` can't be (it
+ * scores panel aggregation, not the projector, and the ledger never stored the
+ * source series). Positive (multiplicative) series score RW-drift in LOG space —
+ * the way the finance pack actually serves it. Operates on whatever series the
+ * refstore has accumulated.
+ */
+export function backtestProjectors(seriesList: { date: string; value: number }[][], minTrain = 8): ProjectorBacktestRow[] {
+  const methods: ProjectionMethod[] = ["ols", "rwdrift", "damped"];
+  const acc: Record<string, { scaledErr: number; covered: number; n: number }> = {};
+  for (const m of methods) acc[m] = { scaledErr: 0, covered: 0, n: 0 };
+  for (const raw of seriesList) {
+    const pts = raw
+      .filter((p) => Number.isFinite(Date.parse(p.date)) && Number.isFinite(p.value))
+      .sort((a, b) => Date.parse(a.date) - Date.parse(b.date));
+    if (pts.length < minTrain + 2) continue;
+    // Per-series scale = naive one-step (persistence) MAE, so the pooled error is
+    // unit-free and a $500 stock can't drown out a 4%-unemployment series.
+    let naive = 0;
+    for (let i = 1; i < pts.length; i++) naive += Math.abs(pts[i].value - pts[i - 1].value);
+    naive = naive / Math.max(1, pts.length - 1) || 1;
+    const positive = pts.every((p) => p.value > 0);
+    // Bound the work to O(n) per series: evaluate at most ~120 walk-forward steps
+    // (strided through the series) so a long daily history can't make `swarm
+    // backtest` quadratic. A diagnostic doesn't need every step.
+    const stride = Math.max(1, Math.ceil((pts.length - 1 - minTrain) / 120));
+    for (let i = minTrain; i < pts.length - 1; i += stride) {
+      const train = pts.slice(0, i + 1);
+      const target = pts[i + 1];
+      for (const m of methods) {
+        // RW-drift on a positive series is served in log space (finance prices);
+        // OLS/damped are the linear baselines, as they'd be used.
+        const proj = projectSeries(train, target.date, m, m === "rwdrift" && positive ? { logSpace: true } : {});
+        if (!proj) continue;
+        acc[m].scaledErr += Math.abs(proj.projected - target.value) / naive;
+        const lo = Math.min(proj.lo, proj.hi);
+        const hi = Math.max(proj.lo, proj.hi);
+        if (target.value >= lo && target.value <= hi) acc[m].covered++;
+        acc[m].n++;
+      }
+    }
+  }
+  return methods.map((m) => ({ method: m, n: acc[m].n, mase: acc[m].n ? acc[m].scaledErr / acc[m].n : 0, coverage: acc[m].n ? acc[m].covered / acc[m].n : 0 }));
+}
+
+/** Dispatch a projection method. Default is random-walk-with-drift (the strongest out-of-sample baseline). */
+export function projectSeries(
+  points: { date: string; value: number }[],
+  targetDate: string,
+  method: ProjectionMethod = "rwdrift",
+  opts: { logSpace?: boolean } = {}
+): OlsProjection | null {
+  if (method === "ols") return olsProject(points, targetDate);
+  if (method === "damped") return dampedTrendProject(points, targetDate);
+  return rwDriftProject(points, targetDate, opts);
 }
 
 /** Evenly thin a series to at most n points (always keeping the last). */
@@ -2021,15 +2362,55 @@ export function normInv(p: number): number {
 }
 
 /**
- * Risk-neutral P(S_T > K) from Black-Scholes: N(d2) with
- * d2 = [ln(S/K) + (r − σ²/2)·T] / (σ·√T). The option market's own implied
- * volatility makes this the financial gold standard for price-threshold
- * event probabilities (risk-neutral, so modestly biased vs real-world for
- * far-dated equity events — say so when citing it).
+ * Interpolate implied vol to a forecast horizon from the listed-expiry knots
+ * that bracket it. Interpolation is in TOTAL-VARIANCE space (w = σ²·T, linear in
+ * T) — the no-arbitrage convention for the vol term structure — then σ is backed
+ * out at the horizon. With one knot, or a horizon OUTSIDE both knots, σ is held
+ * flat at the nearest knot: extrapolating total variance would re-scale σ
+ * (√(σ²·T_knot/tYears) ≠ σ), silently mis-stating the vol. Only blend strictly
+ * inside the bracket. Pure and synchronous so the term-structure math is
+ * unit-testable without a network round-trip.
  */
-export function impliedProbAbove(spot: number, strike: number, iv: number, tYears: number, r = 0.04): number | null {
+export function interpIvToHorizon(
+  knots: { T: number; iv: number }[],
+  tYears: number
+): { iv: number; interpolated: boolean } {
+  if (!knots.length) throw new Error("interpIvToHorizon: need at least one knot");
+  if (knots.length === 1) return { iv: knots[0].iv, interpolated: false };
+  const [a, b] = knots[0].T <= knots[1].T ? [knots[0], knots[1]] : [knots[1], knots[0]];
+  const span = b.T - a.T;
+  const frac = span > 0 ? (tYears - a.T) / span : 0;
+  // Outside the bracket → hold flat at the nearest knot (not interpolated).
+  if (frac <= 0) return { iv: a.iv, interpolated: false };
+  if (frac >= 1) return { iv: b.iv, interpolated: false };
+  const wA = a.iv * a.iv * a.T;
+  const wB = b.iv * b.iv * b.T;
+  const wT = wA + (wB - wA) * frac;
+  return { iv: Math.sqrt(Math.max(wT, 1e-12) / Math.max(tYears, 1e-9)), interpolated: true };
+}
+
+/** Default risk-free rate (annualized) for the risk-neutral N(d2). */
+export const RISK_FREE_DEFAULT = 0.04;
+/**
+ * Equity risk premium added to the risk-free rate to recover a REAL-WORLD drift
+ * for forecasting (the physical measure). Options price under the risk-neutral
+ * measure (drift r); a forecast of whether the stock ACTUALLY finishes above K
+ * should use the real expected drift μ ≈ r + ERP. Negligible at short horizons,
+ * material over years — exactly where a risk-neutral number reads as a
+ * pessimistic forecast for an out-of-the-money call.
+ */
+export const EQUITY_RISK_PREMIUM = 0.05;
+
+/**
+ * P(S_T > K) from Black-Scholes: N(d2) with
+ * d2 = [ln(S/K) + (μ − σ²/2)·T] / (σ·√T). With the default drift μ = r this is
+ * the RISK-NEUTRAL probability (the option market's own price — what to cite as
+ * the market's view). Pass `drift = r + ERP` for the REAL-WORLD forecast
+ * probability, the measure a prediction of the actual outcome should use.
+ */
+export function impliedProbAbove(spot: number, strike: number, iv: number, tYears: number, r = RISK_FREE_DEFAULT, drift = r): number | null {
   if (!(spot > 0) || !(strike > 0) || !(iv > 0) || !(tYears > 0)) return null;
-  const d2 = (Math.log(spot / strike) + (r - (iv * iv) / 2) * tYears) / (iv * Math.sqrt(tYears));
+  const d2 = (Math.log(spot / strike) + (drift - (iv * iv) / 2) * tYears) / (iv * Math.sqrt(tYears));
   return normCdf(d2);
 }
 
@@ -2037,9 +2418,19 @@ export interface OptionsImplied {
   symbol: string;
   spot: number;
   strike: number;
-  expiry: string;
+  /** The forecast horizon the probability is computed for (the target/resolution date). */
+  horizonDate: string;
+  /** Years from now to the horizon — the T in N(d2), NOT the option's time-to-expiry. */
+  tYears: number;
+  /** IV interpolated to the horizon in total-variance (σ²T) space; the listed expiry(ies) used. */
   iv: number;
+  expiry: string;
+  /** True when the horizon was bracketed by two listed expiries and IV was interpolated; false on flat extrapolation. */
+  interpolated: boolean;
+  /** Risk-neutral P(>K) — the option market's own price (cite as the market's view). */
   probAbove: number;
+  /** Real-world P(>K) using drift r+ERP — the measure for an actual-outcome forecast (the engine's driver). */
+  probAboveReal: number;
   contractsUsed: string;
 }
 
@@ -2113,13 +2504,14 @@ export async function optionsImplied(
   }
   const target = Date.parse(byIso) / 1000;
   if (!Number.isFinite(target)) throw new Error("by must be an ISO date (YYYY-MM-DD)");
-  // Nearest listed expiry on/after the target date, else the last available.
-  const expiry = expirations.find((e) => e >= target) ?? expirations[expirations.length - 1];
-  const chain: any =
-    expiry === expirations[0] && root?.options?.[0]?.calls?.length
-      ? root
-      : ((await yahooOptionsGet(`${base}?date=${expiry}`, signal)) as any)?.optionChain?.result?.[0];
-  const opt = chain?.options?.[0];
+  const nowSec = Date.now() / 1000;
+  const YR = 365.25 * 86_400;
+  // The probability is for the FORECAST HORIZON (now → target), not the option's
+  // time-to-expiry. Using the expiry's T over- or under-states the horizon for
+  // any off-cycle date — a double-digit-pp error on N(d2). We read IV from the
+  // listed expiries that BRACKET the target and interpolate it to the horizon.
+  const tYears = Math.max((target - nowSec) / YR, 1 / 365);
+
   const nearest = (contracts: any[]): any | null => {
     let best: any = null;
     for (const c of contracts ?? []) {
@@ -2130,24 +2522,61 @@ export async function optionsImplied(
     }
     return best;
   };
-  const call = nearest(opt?.calls);
-  const put = nearest(opt?.puts);
-  const ivs = [call, put]
-    .filter((c) => c && Math.abs(Number(c.strike) - strike) <= Math.max(strike * 0.1, 1))
-    .map((c) => Number(c.impliedVolatility));
-  if (!ivs.length) throw new Error(`no liquid contracts near strike ${strike} for ${sym} at that expiry`);
-  const iv = ivs.reduce((s, v) => s + v, 0) / ivs.length;
-  const tYears = Math.max((expiry * 1000 - Date.now()) / (365.25 * 86_400_000), 1 / 365);
-  const probAbove = impliedProbAbove(spot, strike, iv, tYears);
-  if (probAbove === null) throw new Error("could not invert the chain into a probability");
+  const chainFor = async (exp: number): Promise<any> =>
+    exp === expirations[0] && root?.options?.[0]?.calls?.length
+      ? root
+      : ((await yahooOptionsGet(`${base}?date=${exp}`, signal)) as any)?.optionChain?.result?.[0];
+  // IV at the strike for one expiry (avg of call/put when both quote near K), plus
+  // its time-to-expiry in years — the (T, σ) knot for total-variance interpolation.
+  const knotFor = async (exp: number): Promise<{ T: number; iv: number; contracts: string } | null> => {
+    const opt = (await chainFor(exp))?.options?.[0];
+    const call = nearest(opt?.calls);
+    const put = nearest(opt?.puts);
+    const ivs = [call, put]
+      .filter((c) => c && Math.abs(Number(c.strike) - strike) <= Math.max(strike * 0.1, 1))
+      .map((c) => Number(c.impliedVolatility));
+    if (!ivs.length) return null;
+    return {
+      T: Math.max((exp * 1000 - Date.now()) / (YR * 1000), 1 / 365),
+      iv: ivs.reduce((s, v) => s + v, 0) / ivs.length,
+      contracts: [call?.contractSymbol, put?.contractSymbol].filter(Boolean).join(" + ") || "(nearest strikes)",
+    };
+  };
+
+  const sortedExp = [...expirations].sort((a, b) => a - b);
+  const below = sortedExp.filter((e) => e <= target);
+  const above = sortedExp.filter((e) => e >= target);
+  const eLo = below.length ? below[below.length - 1] : undefined;
+  const eHi = above.length ? above[0] : undefined;
+  // Gather the bracket knots (one or two distinct expiries).
+  const knots: { T: number; iv: number; contracts: string }[] = [];
+  const expUsed: number[] = [];
+  for (const e of [eLo, eHi]) {
+    if (e === undefined || expUsed.includes(e)) continue;
+    const k = await knotFor(e);
+    if (k) {
+      knots.push(k);
+      expUsed.push(e);
+    }
+  }
+  if (!knots.length) throw new Error(`no liquid contracts near strike ${strike} for ${sym} at the expiries bracketing ${byIso}`);
+
+  const { iv, interpolated } = interpIvToHorizon(knots, tYears);
+  const probAbove = impliedProbAbove(spot, strike, iv, tYears); // risk-neutral (the market's price)
+  const probAboveReal = impliedProbAbove(spot, strike, iv, tYears, RISK_FREE_DEFAULT, RISK_FREE_DEFAULT + EQUITY_RISK_PREMIUM); // real-world drift
+  if (probAbove === null || probAboveReal === null) throw new Error("could not invert the chain into a probability");
   return {
     symbol: sym,
     spot,
     strike,
-    expiry: new Date(expiry * 1000).toISOString().slice(0, 10),
+    horizonDate: byIso,
+    tYears,
     iv,
+    expiry: expUsed.map((e) => new Date(e * 1000).toISOString().slice(0, 10)).join(" / "),
+    interpolated,
     probAbove,
-    contractsUsed: [call?.contractSymbol, put?.contractSymbol].filter(Boolean).join(" + ") || "(nearest strikes)",
+    probAboveReal,
+    contractsUsed: knots.map((k) => k.contracts).join(" | "),
   };
 }
 

@@ -271,7 +271,7 @@ export interface RunSummary {
   pid: number | null;
   finalSummary?: string;
   /** Forecast runs: the headline aggregate once computed. */
-  forecast?: { p?: number; p50?: number; unit?: string; n: number; resolutionDate: string };
+  forecast?: { p?: number; p50?: number; unit?: string; kind?: "binary" | "numeric" | "mc" | "date"; n: number; resolutionDate: string };
 }
 
 export interface RunSnapshot {

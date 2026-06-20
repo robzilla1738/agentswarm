@@ -174,6 +174,7 @@ function RunView() {
                 <span className="mono text-2xs text-ink-faint">{metaLine}</span>
                 <button
                   className="mono text-2xs text-ink-faint hover:text-ink-dim transition-colors"
+                  aria-label="Copy run id"
                   title="Copy run id"
                   onClick={() => navigator.clipboard?.writeText(id).catch(() => {})}
                 >

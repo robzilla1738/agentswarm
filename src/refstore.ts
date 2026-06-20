@@ -17,6 +17,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { home } from "./config";
 import { ensureDir } from "./util";
+import { betaQuantile } from "./numerics";
 import type { ForecastKind } from "./types";
 import type { LedgerOutcome } from "./forecast";
 import type { TimeSeriesResult, TimeSeriesSource } from "./datatools";
@@ -58,6 +59,12 @@ export interface RefClassRecord {
   features?: Record<string, number | string>;
   /** Back-pointer to the ledger entry (also the de-dup / self-exclusion key). */
   ledgerId: string;
+  /** Open-question group id (sub-forecasts of one question share it) — for sibling de-dup. */
+  setId?: string;
+  /** The ledger id this entry superseded (a re-forecast of the SAME event) — for chain collapse. */
+  supersedes?: string;
+  /** True for rows imported from the bundled starter corpus (vs the engine's own resolved history). */
+  seeded?: boolean;
 }
 
 export function refstoreDir(): string {
@@ -320,6 +327,52 @@ export function loadRefClasses(): RefClassRecord[] {
 }
 
 /**
+ * Import a bundled starter corpus of COUNTED historical base rates so the
+ * outside-view drivers are live on day one instead of dormant until the engine's
+ * own ledger accrues resolutions. Idempotent: the existing seeded rows are
+ * replaced wholesale (an atomic rewrite) while the engine's accumulated real
+ * resolutions are preserved untouched. Seeded rows are marked `seeded:true` so
+ * they're auditable and never confused with self-generated history.
+ */
+export function seedRefClasses(corpus: RefClassRecord[]): { added: number; kept: number } {
+  ensureDir(refstoreDir());
+  const existing = loadRefClasses();
+  const kept = existing.filter((r) => !r.seeded); // drop prior seed, keep real resolutions
+  const marked = corpus.map((r) => ({ ...r, seeded: true as const }));
+  const all = [...kept, ...marked];
+  const tmp = refclassPath() + ".tmp";
+  fs.writeFileSync(tmp, all.map((r) => JSON.stringify(r)).join("\n") + (all.length ? "\n" : ""), "utf8");
+  fs.renameSync(tmp, refclassPath());
+  return { added: marked.length, kept: kept.length };
+}
+
+/**
+ * Collapse supersession chains so a re-forecast of the SAME event is counted
+ * ONCE: keep only each chain's head (the row nothing else supersedes). The walk
+ * is TRANSITIVE — following each row's `supersedes` pointer through every present
+ * ancestor — so a multi-link chain (e3→e2→e1) collapses to one, not two. A
+ * self-pointer (`supersedes === ledgerId`) and any cycle are guarded so a row is
+ * never dropped by its own chain. (Limitation: if a middle link's row is absent
+ * — e.g. it resolved `void`, which appends no refclass row — the lost pointer
+ * can't be reconstructed and the two ends count separately; that's information
+ * genuinely gone from the store, not a logic gap.)
+ */
+function collapseSupersessions(rows: RefClassRecord[]): RefClassRecord[] {
+  const byId = new Map(rows.map((r) => [r.ledgerId, r]));
+  const superseded = new Set<string>();
+  for (const r of rows) {
+    let cur = r.supersedes;
+    const seen = new Set<string>([r.ledgerId]); // never let a row supersede itself / cycle back
+    while (cur && !seen.has(cur)) {
+      seen.add(cur);
+      superseded.add(cur);
+      cur = byId.get(cur)?.supersedes;
+    }
+  }
+  return rows.filter((r) => !superseded.has(r.ledgerId));
+}
+
+/**
  * Counted reference-class summary for a (domain, refClass): the base rate over
  * resolved binary rows and the realized values over numeric rows. The caller
  * MUST pass a filter that excludes the current question's own ledger id when it
@@ -329,8 +382,24 @@ export function queryRefClass(
   domain: string,
   refClass: string,
   filter?: (r: RefClassRecord) => boolean,
-): { n: number; baseRate?: number; values: number[]; rows: RefClassRecord[] } {
-  let rows = loadRefClasses().filter((r) => r.domain === domain && r.refClass === refClass);
+): {
+  n: number;
+  /** Binary observations counted (yes + no). */
+  binaryN?: number;
+  /** Jeffreys-smoothed base rate (yes+½)/(n+1) — never 0 or 1 on a thin class. */
+  baseRate?: number;
+  /** Raw yes/n, undefined when n=0 — kept for display/diagnostics, NOT for driving a forecast. */
+  rawBaseRate?: number;
+  /** Central 90% Beta(yes+½, no+½) credible interval on the base rate. */
+  ci?: [number, number];
+  values: number[];
+  rows: RefClassRecord[];
+} {
+  // Collapse BEFORE the caller's filter: the self-exclusion filter can remove a
+  // chain's newest link, and removing it first would orphan its `supersedes`
+  // pointer and let the superseded prior leak back into the count. Collapse on
+  // the full chain set, THEN apply self-exclusion.
+  let rows = collapseSupersessions(loadRefClasses().filter((r) => r.domain === domain && r.refClass === refClass));
   if (filter) rows = rows.filter(filter);
   const values: number[] = [];
   let yes = 0;
@@ -345,5 +414,20 @@ export function queryRefClass(
       values.push(r.outcome);
     }
   }
-  return { n: rows.length, baseRate: binaryN ? yes / binaryN : undefined, values, rows };
+  if (!binaryN) return { n: rows.length, binaryN: 0, values, rows };
+  // Beta(½,½) (Jeffreys) posterior over the base rate: the mean is the smoothed
+  // estimate (so 5/5 → 11/12 ≈ 0.92, never a reckless 1.0 that a single later
+  // miss would punish with an unbounded log-loss), and the Beta quantiles give an
+  // honest credible interval that the caller can use to down-weight a thin class.
+  const a = yes + 0.5;
+  const b = binaryN - yes + 0.5;
+  return {
+    n: rows.length,
+    binaryN,
+    baseRate: a / (a + b),
+    rawBaseRate: yes / binaryN,
+    ci: [betaQuantile(0.05, a, b), betaQuantile(0.95, a, b)],
+    values,
+    rows,
+  };
 }
