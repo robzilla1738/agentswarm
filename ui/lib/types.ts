@@ -126,6 +126,8 @@ export interface LedgerEntry {
   panel: ForecastPanelist[];
   triggers?: string[];
   evidenceOverlap?: number;
+  domain?: string;
+  modelId?: string;
   origin?: ForecastOrigin;
   supersedes?: string;
   resolution?: {
@@ -147,6 +149,7 @@ export interface CalibrationStats {
   brierMean: number;
   bins: { lo: number; hi: number; n: number; meanP: number; hitRate: number }[];
   byMethod: Record<string, { n: number; brierMean: number }>;
+  byDomain?: Record<string, { n: number; brierMean: number }>;
 }
 
 export interface Task {

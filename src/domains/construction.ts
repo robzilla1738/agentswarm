@@ -1,0 +1,101 @@
+// Construction / project-delivery pack. Its power is STRUCTURAL DECOMPOSITION: a
+// project question becomes milestone sub-forecasts (permits, funding, tunneling,
+// schedule slip), which the simulation engine composes into a bottom-up
+// schedule-risk model. buildDrivers adds a COUNTED reference-class overrun rate
+// (from accumulated resolutions) once history exists. Resolution is left to the
+// web resolver (no single authoritative API).
+
+import { clampProb } from "../forecast";
+import { queryRefClass } from "../refstore";
+import type { ForecastQuestion, SimDriver } from "../types";
+import type { DomainCtx, DomainPack, IntentMatch } from "./pack";
+
+const CONSTRUCTION_RE =
+  /\b(construction|infrastructure|megaproject|project|build(?:ing)?|tunnel|bridge|highway|railway|rail line|metro|subway|pipeline|power plant|refinery|factory|facility|stadium|airport|dam|terminal)\b/i;
+const DELIVERY_RE = /\b(complete|completed|completion|operational|open(?:s|ed|ing)?|deliver(?:y|ed)?|finish(?:ed)?|on schedule|behind schedule|groundbreaking|topped out|in service|commission(?:ed|ing)?|by \d{4})\b/i;
+
+const REF_CLASS = "infra_schedule_slip";
+
+export const constructionPack: DomainPack = {
+  id: "construction",
+  label: "Construction / projects",
+  llmHint: "delivery/completion of a construction or infrastructure project — will it be built/operational/on schedule by a date",
+  knobs: ["panelSize", "decompose", "maxSubQuestions", "simulate"],
+
+  matchIntent(mission: string): IntentMatch | null {
+    if (!CONSTRUCTION_RE.test(mission) || !DELIVERY_RE.test(mission)) return null;
+    return { pack: "construction", confidence: 0.66, source: "deterministic" };
+  },
+
+  async plan(ctx: DomainCtx, _match: IntentMatch) {
+    // Decompose into milestone sub-conditions whose joint outcome determines the
+    // headline — the project-schedule-risk model. LLM proposes the milestones;
+    // the engine forecasts and (via the simulation) composes them.
+    const prompt = `You are decomposing a construction / infrastructure project-delivery question into 2-4 independently-resolvable MILESTONE sub-forecasts whose JOINT outcome determines the headline. Today is ${ctx.today}.
+
+MISSION
+${ctx.mission}
+${ctx.operatorDate ? `\nThe operator set the resolution horizon: ${ctx.operatorDate}.` : ""}
+
+Reply with ONLY JSON (no prose, no fence):
+{"brief":"one line on how the milestones combine","questions":[{"text":"...","kind":"binary|date|numeric","resolutionCriteria":"...","resolutionDate":"YYYY-MM-DD","refClass":"snake_case_class","unit":"months (numeric only)"}]}
+
+- Each milestone is a concrete, checkable gate: permits/approvals obtained, funding/financing secured, a construction phase complete (date), or schedule slip vs baseline (numeric, unit "months").
+- refClass: a normalized reference-class key for base-rate accumulation, e.g. "permit_approval", "funding_secured", "${REF_CLASS}".
+- resolutionDate: ISO, on or before the project horizon.
+- Keep it to the few milestones that genuinely drive the outcome.`;
+    let raw: string;
+    try {
+      raw = await ctx.ask(prompt, 1200);
+    } catch (e) {
+      ctx.log("info", `construction decomposition skipped: ${String((e as Error)?.message ?? e)}`);
+      return null;
+    }
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
+    if (start < 0 || end <= start) return null;
+    let parsed: any;
+    try {
+      parsed = JSON.parse(raw.slice(start, end + 1));
+    } catch {
+      return null;
+    }
+    const arr = Array.isArray(parsed?.questions) ? parsed.questions : [];
+    const questions: ForecastQuestion[] = [];
+    for (const o of arr.slice(0, ctx.maxSubQuestions)) {
+      // Milestones are gates: binary | date | numeric. "mc" is rejected — the
+      // prompt never offers it and this path never supplies an options list, so
+      // an mc milestone would be unforecastable/unresolvable.
+      const kind = o?.kind === "date" || o?.kind === "numeric" ? o.kind : "binary";
+      const date = /^\d{4}-\d{2}-\d{2}$/.test(String(o?.resolutionDate)) ? String(o.resolutionDate) : ctx.operatorDate;
+      if (!o?.text || !o?.resolutionCriteria || !date) continue;
+      questions.push({
+        text: String(o.text),
+        kind,
+        resolutionCriteria: String(o.resolutionCriteria),
+        resolutionDate: date,
+        ...(o.unit ? { unit: String(o.unit) } : {}),
+        domain: "construction",
+        ...(o.refClass ? { refClass: String(o.refClass) } : { refClass: REF_CLASS }),
+      });
+    }
+    if (!questions.length) return null;
+    return { questions, brief: String(parsed?.brief ?? "project delivery decomposed into milestone sub-forecasts") };
+  },
+
+  async buildDrivers(_ctx: DomainCtx, q: ForecastQuestion, _match: IntentMatch, siblings: SimDriver[]): Promise<SimDriver[]> {
+    const drivers = [...siblings];
+    // Counted reference-class overrun rate from accumulated resolutions (dormant
+    // until enough comparable projects have resolved). Exclude this question.
+    const rc = queryRefClass("construction", REF_CLASS, (r) => r.ledgerId !== q.id);
+    if (rc.n >= 5 && typeof rc.baseRate === "number") {
+      drivers.push({
+        id: "ref_overrun",
+        label: `Reference-class schedule overrun (n=${rc.n})`,
+        marginal: { kind: "binary", probability: clampProb(rc.baseRate) },
+        provenance: { kind: "base-rate", ref: `refstore:${REF_CLASS}`, label: `${rc.n} comparable projects, ${Math.round(rc.baseRate * 100)}% slipped` },
+      });
+    }
+    return drivers;
+  },
+};

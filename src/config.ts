@@ -49,6 +49,10 @@ export interface SwarmConfig {
   metaculusApiKey: string;
   /** The Odds API key (the-odds-api.com, free tier) — adds sportsbook consensus to market_odds. */
   oddsApiKey: string;
+  /** BLS key (free) for time_series source "bls" — without it the throttled keyless v1 is used. */
+  blsApiKey: string;
+  /** EIA energy-data key (free) for time_series source "eia". Degrades to keyless Yahoo futures. */
+  eiaApiKey: string;
   /** Forecast mode: independent forecaster panel size. */
   forecastPanelSize: number;
   /** Forecast mode: extremization exponent for the geometric-mean-of-odds aggregate. */
@@ -181,6 +185,8 @@ export const DEFAULTS: SwarmConfig = {
   fredApiKey: "",
   metaculusApiKey: "",
   oddsApiKey: "",
+  blsApiKey: "",
+  eiaApiKey: "",
   forecastPanelSize: 5,
   forecastExtremizeK: 2.5,
   forecastCoherenceProbe: true,
@@ -237,6 +243,8 @@ export const SECRET_ENV_KEYS: string[] = [
     "FRED_API_KEY",
     "METACULUS_API_KEY",
     "ODDS_API_KEY",
+    "BLS_API_KEY",
+    "EIA_API_KEY",
     "E2B_API_KEY",
     "MODAL_TOKEN_ID",
     "MODAL_TOKEN_SECRET",
@@ -308,6 +316,8 @@ export function loadConfig(): SwarmConfig {
   if (process.env.FRED_API_KEY) cfg.fredApiKey = process.env.FRED_API_KEY;
   if (process.env.METACULUS_API_KEY) cfg.metaculusApiKey = process.env.METACULUS_API_KEY;
   if (process.env.ODDS_API_KEY) cfg.oddsApiKey = process.env.ODDS_API_KEY;
+  if (process.env.BLS_API_KEY) cfg.blsApiKey = process.env.BLS_API_KEY;
+  if (process.env.EIA_API_KEY) cfg.eiaApiKey = process.env.EIA_API_KEY;
   if (process.env.E2B_API_KEY) cfg.e2bApiKey = process.env.E2B_API_KEY;
   if (process.env.MODAL_TOKEN_ID) cfg.modalTokenId = process.env.MODAL_TOKEN_ID;
   if (process.env.MODAL_TOKEN_SECRET) cfg.modalTokenSecret = process.env.MODAL_TOKEN_SECRET;
@@ -394,6 +404,8 @@ export const SETTABLE_KEYS: (keyof SwarmConfig)[] = [
   "fredApiKey",
   "metaculusApiKey",
   "oddsApiKey",
+  "blsApiKey",
+  "eiaApiKey",
   "forecastPanelSize",
   "forecastExtremizeK",
   "forecastCoherenceProbe",

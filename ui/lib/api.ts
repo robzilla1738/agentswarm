@@ -113,6 +113,27 @@ export interface PublicConfig {
   pricing: Record<string, { inMiss: number; inHit: number; out: number }>;
 }
 
+export interface DomainDetection {
+  domain: string;
+  label: string;
+  confidence: number;
+  source: "deterministic" | "llm" | "none" | "empty";
+  relevantKnobs: string[];
+  alternatives: { domain: string; label: string }[];
+}
+
+export interface ForecastModelView {
+  id: string;
+  name: string;
+  domain?: string;
+  tunables: Record<string, unknown>;
+  fitMode: "live" | "frozen";
+  fitted?: Record<string, unknown>;
+  createdAt: number;
+  updatedAt: number;
+  record: { n: number; resolved: number; brierMean?: number; vsMarket?: number };
+}
+
 export const api = {
   health: () => jget<{ ok: boolean; apiKey: boolean; version: string }>("/api/health"),
   getConfig: () => jget<PublicConfig>("/api/config"),
@@ -170,4 +191,11 @@ export const api = {
     }>("/api/forecasts/resolve", ids?.length ? { ids } : {}),
   resolveManual: (id: string, outcome: "yes" | "no" | "void" | number) =>
     jpost<{ ok: boolean }>(`/api/forecasts/${id}/resolve`, { outcome }),
+  detectDomain: (text: string) => jpost<DomainDetection>("/api/forecast/detect", { text }),
+  forecastModels: () => jget<{ models: ForecastModelView[] }>("/api/forecast-models"),
+  saveForecastModel: (m: Record<string, unknown>) => jpost<{ model: ForecastModelView }>("/api/forecast-models", m),
+  deleteForecastModel: async (id: string): Promise<void> => {
+    const res = await fetch(hubBase() + `/api/forecast-models/${id}`, { method: "DELETE" });
+    if (!res.ok) throw new Error((await res.text().catch(() => "")) || `${res.status}`);
+  },
 };

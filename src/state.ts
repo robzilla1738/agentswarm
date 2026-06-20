@@ -83,6 +83,8 @@ export class RunState {
   /** Forecast mode: all sub-forecasts (1 for a clean question), their aggregates, and the framing. */
   questions: ForecastQuestion[] = [];
   forecastBrief = "";
+  /** Forecast mode: the domain pack id that planned this run (restored on resume). */
+  domainPack?: string;
   aggregates: { questionId: string; aggregate: AggregateForecast; panel: RunState["forecastPanel"]; ledgerId?: string }[] = [];
   finalSummary?: string;
   finalReportPath?: string;
@@ -293,6 +295,7 @@ export class RunState {
       case "forecast.plan":
         if (Array.isArray(ev.questions)) this.questions = ev.questions as ForecastQuestion[];
         if (typeof ev.brief === "string") this.forecastBrief = ev.brief;
+        if (typeof ev.domain === "string") this.domainPack = ev.domain;
         break;
       case "forecast.question":
         // Primary = the first sub-forecast; later per-question events don't overwrite it.

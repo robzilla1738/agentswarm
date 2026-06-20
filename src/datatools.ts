@@ -1,5 +1,6 @@
 import { SwarmConfig } from "./config";
 import { errMsg, mergeSignal } from "./util";
+import { cachedRefTable, cachedSeries } from "./refstore";
 
 /**
  * Forecasting data sources: prediction-market odds and statistical time
@@ -14,6 +15,18 @@ const UA =
 async function apiGet(url: string, signal?: AbortSignal, headers: Record<string, string> = {}): Promise<Response> {
   const res = await fetch(url, {
     headers: { "user-agent": UA, accept: "application/json,text/csv,text/*;q=0.9", ...headers },
+    signal: mergeSignal(20_000, signal),
+    redirect: "follow",
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res;
+}
+
+async function apiPost(url: string, body: unknown, signal?: AbortSignal, headers: Record<string, string> = {}): Promise<Response> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "user-agent": UA, accept: "application/json", "content-type": "application/json", ...headers },
+    body: JSON.stringify(body),
     signal: mergeSignal(20_000, signal),
     redirect: "follow",
   });
@@ -1195,7 +1208,19 @@ export async function resolveFromPlatform(
 
 // ---------------------------------------------------------------- time series
 
-export type TimeSeriesSource = "fred" | "worldbank" | "yahoo" | "gdelt" | "gdelttone" | "openmeteo" | "nws" | "wikipageviews";
+export type TimeSeriesSource =
+  | "fred"
+  | "worldbank"
+  | "yahoo"
+  | "gdelt"
+  | "gdelttone"
+  | "openmeteo"
+  | "nws"
+  | "wikipageviews"
+  | "secfacts"
+  | "usaspending"
+  | "eia"
+  | "bls";
 
 export interface TimeSeriesResult {
   source: TimeSeriesSource;
@@ -1206,7 +1231,44 @@ export interface TimeSeriesResult {
   unit?: string;
 }
 
-/** FRED (St. Louis Fed) — economic series; needs the free fredApiKey. */
+/**
+ * Plain-word → FRED series id, so an agent can pass "unemployment" or "lumber"
+ * instead of memorizing FRED codes. Pure ergonomics over the same keyed API.
+ */
+export const FRED_ALIASES: Record<string, string> = {
+  // rates / macro
+  fedfunds: "DFF",
+  "10y": "DGS10",
+  "2y": "DGS2",
+  "3mo": "DGS3MO",
+  "30y": "DGS30",
+  treasury10y: "DGS10",
+  cpi: "CPIAUCSL",
+  corecpi: "CPILFESL",
+  inflation: "CPIAUCSL",
+  unemployment: "UNRATE",
+  payrolls: "PAYEMS",
+  nonfarm_payrolls: "PAYEMS",
+  gdp: "GDPC1",
+  realgdp: "GDPC1",
+  pce: "PCE",
+  vix: "VIXCLS",
+  sp500: "SP500",
+  // construction / materials (producer price indices)
+  permits: "PERMIT",
+  building_permits: "PERMIT",
+  housing_starts: "HOUST",
+  starts: "HOUST",
+  lumber: "WPU081",
+  steel: "WPU101",
+  cement: "WPU1322",
+  diesel: "GASDESW",
+  // housing
+  mortgage30: "MORTGAGE30US",
+  case_shiller: "CSUSHPINSA",
+};
+
+/** FRED (St. Louis Fed) — economic series; needs the free fredApiKey. Accepts a plain-word alias (FRED_ALIASES) or a raw series id. */
 async function fredSeries(
   cfg: SwarmConfig,
   series: string,
@@ -1219,7 +1281,8 @@ async function fredSeries(
       "FRED needs an API key — get a free one at https://fred.stlouisfed.org/docs/api/api_key.html and set fredApiKey in Settings (swarm config set fredApiKey <key>). Meanwhile, worldbank and yahoo work keyless."
     );
   }
-  const params = new URLSearchParams({ series_id: series, api_key: cfg.fredApiKey, file_type: "json" });
+  const id = FRED_ALIASES[series.trim().toLowerCase()] ?? series;
+  const params = new URLSearchParams({ series_id: id, api_key: cfg.fredApiKey, file_type: "json" });
   if (start) params.set("observation_start", start);
   if (end) params.set("observation_end", end);
   const res = await apiGet(`https://api.stlouisfed.org/fred/series/observations?${params}`, signal);
@@ -1227,7 +1290,7 @@ async function fredSeries(
   const points = (data?.observations ?? [])
     .map((o: any) => ({ date: String(o.date), value: Number(o.value) }))
     .filter((p: { value: number }) => Number.isFinite(p.value));
-  return { source: "fred", series, points, label: `FRED ${series}` };
+  return { source: "fred", series: id, points, label: `FRED ${id}${id !== series ? ` (${series})` : ""}` };
 }
 
 /** World Bank — country indicators, keyless. Series form: INDICATOR:COUNTRY, e.g. NY.GDP.MKTP.CD:US. */
@@ -1465,7 +1528,171 @@ export async function wikiSummary(title: string, signal?: AbortSignal): Promise<
   ].join("\n");
 }
 
-export async function timeSeries(
+// ---------------------------------------------------------------- SEC EDGAR (keyless)
+
+// SEC fair-access REQUIRES a declared "name email" User-Agent. A spoofed Chrome
+// UA is 403'd, and so is a URL/slash-style UA — SEC only accepts the documented
+// "Sample Company AdminContact@email" shape. No PII (generic project contact).
+const SEC_UA = "agentswarm-forecasting forecasts@agentswarm.dev";
+
+/** Resolve a ticker to its zero-padded CIK via the SEC ticker map (cached weekly in the refstore). */
+async function resolveCik(ticker: string, signal?: AbortSignal): Promise<{ cik10: string; title: string } | null> {
+  const map = await cachedRefTable<Record<string, { cik: string; title: string }>>("sec/company_tickers", 7, async () => {
+    const res = await apiGet("https://www.sec.gov/files/company_tickers.json", signal, { "user-agent": SEC_UA });
+    const data: any = await res.json();
+    const out: Record<string, { cik: string; title: string }> = {};
+    for (const k of Object.keys(data ?? {})) {
+      const row = data[k];
+      if (row?.ticker) out[String(row.ticker).toUpperCase()] = { cik: String(row.cik_str).padStart(10, "0"), title: String(row.title ?? "") };
+    }
+    return out;
+  });
+  const hit = map[ticker.trim().toUpperCase()];
+  return hit ? { cik10: hit.cik, title: hit.title } : null;
+}
+
+/**
+ * SEC XBRL company facts — quarterly/annual fundamentals as a labeled series,
+ * keyless (SEC requires a descriptive User-Agent, which apiGet sends). Series
+ * form "TICKER:us-gaap-tag", e.g. "AAPL:Revenues", "NVDA:NetIncomeLoss". Returns
+ * one value per 10-K/10-Q period end.
+ */
+async function secFactsSeries(series: string, signal?: AbortSignal): Promise<TimeSeriesResult> {
+  const [tk, tag = "Revenues"] = series.split(":").map((s) => s.trim());
+  if (!tk) throw new Error('secfacts series must be "TICKER:tag", e.g. "AAPL:Revenues" or "NVDA:NetIncomeLoss"');
+  const cik = await resolveCik(tk, signal);
+  if (!cik) throw new Error(`secfacts: unknown ticker "${tk}" (not in the SEC ticker map)`);
+  const res = await apiGet(`https://data.sec.gov/api/xbrl/companyconcept/CIK${cik.cik10}/us-gaap/${encodeURIComponent(tag)}.json`, signal, { "user-agent": SEC_UA });
+  const data: any = await res.json();
+  const units = data?.units ?? {};
+  const unitKey = Object.keys(units)[0]; // USD | shares | USD/shares
+  const rows: any[] = unitKey ? units[unitKey] : [];
+  const byEnd = new Map<string, number>();
+  for (const r of rows) {
+    if (r?.form !== "10-K" && r?.form !== "10-Q") continue;
+    if (!r.end || !Number.isFinite(Number(r.val))) continue;
+    byEnd.set(String(r.end), Number(r.val)); // later array entries (amendments) override
+  }
+  const points = [...byEnd.entries()].map(([date, value]) => ({ date, value })).sort((a, b) => (a.date < b.date ? -1 : 1));
+  if (!points.length) throw new Error(`secfacts: no 10-K/10-Q values for ${tk}:${tag} — check the us-gaap tag (try Revenues, NetIncomeLoss, Assets)`);
+  return { source: "secfacts", series: `${tk.toUpperCase()}:${tag}`, points, label: `${cik.title || tk} — ${tag}`, unit: unitKey };
+}
+
+// ---------------------------------------------------------------- USAspending.gov (keyless)
+
+/**
+ * Federal contract obligations over time for a recipient / agency / NAICS code,
+ * keyless. Series form "recipient:Name" | "agency:Name" | "naics:code". The
+ * month axis is the federal fiscal period the API groups by (ordered + evenly
+ * spaced — what a trend fit needs); not a literal calendar month.
+ */
+async function usaspendingSeries(series: string, start?: string, end?: string, signal?: AbortSignal): Promise<TimeSeriesResult> {
+  const idx = series.indexOf(":");
+  const kind = (idx >= 0 ? series.slice(0, idx) : "").trim().toLowerCase();
+  const value = (idx >= 0 ? series.slice(idx + 1) : "").trim();
+  if (!value) throw new Error('usaspending series must be "recipient:Name" | "agency:Name" | "naics:code"');
+  const filters: any = {
+    time_period: [{ start_date: start || `${new Date().getFullYear() - 3}-01-01`, end_date: end || new Date().toISOString().slice(0, 10) }],
+    award_type_codes: ["A", "B", "C", "D"], // contract awards
+  };
+  if (kind === "recipient") filters.recipient_search_text = [value];
+  else if (kind === "agency") filters.agencies = [{ type: "awarding", tier: "toptier", name: value }];
+  else if (kind === "naics") filters.naics_codes = [value];
+  else throw new Error('usaspending kind must be recipient | agency | naics');
+  const res = await apiPost("https://api.usaspending.gov/api/v2/search/spending_over_time/", { group: "month", filters }, signal);
+  const data: any = await res.json();
+  const points = (data?.results ?? [])
+    .map((r: any) => {
+      const tp = r.time_period ?? {};
+      const fy = Number(tp.fiscal_year ?? tp.year);
+      const fm = Number(tp.month ?? 1);
+      if (!Number.isFinite(fy) || !Number.isFinite(fm)) return null;
+      // The API groups by FEDERAL FISCAL month (1=Oct … 12=Sep). Convert to a
+      // real calendar date so OLS projection against a calendar target is honest.
+      const calMonth = ((fm + 8) % 12) + 1; // fm1→Oct(10), fm4→Jan(1), fm12→Sep(9)
+      const calYear = fy - (fm <= 3 ? 1 : 0); // Oct–Dec belong to the prior calendar year
+      return { date: `${calYear}-${String(calMonth).padStart(2, "0")}-01`, value: Number(r.aggregated_amount) };
+    })
+    .filter((p: { date: string; value: number } | null): p is { date: string; value: number } => !!p && Number.isFinite(p.value))
+    .sort((a: { date: string }, b: { date: string }) => (a.date < b.date ? -1 : 1));
+  if (!points.length) throw new Error(`usaspending: no obligations for ${kind} "${value}" — check the recipient/agency name or NAICS code`);
+  return { source: "usaspending", series, points, label: `Federal obligations — ${kind} ${value}`, unit: "USD/month" };
+}
+
+// ---------------------------------------------------------------- EIA energy (free key)
+
+function normPeriod(p: string): string {
+  const s = String(p);
+  if (/^\d{8}$/.test(s)) return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
+  if (/^\d{6}$/.test(s)) return `${s.slice(0, 4)}-${s.slice(4, 6)}-01`;
+  if (/^\d{4}-\d{2}$/.test(s)) return `${s}-01`;
+  return s;
+}
+
+/** EIA energy series (diesel, natural gas, electricity) via the v2 legacy-seriesid route. Free key; degrades to Yahoo futures. */
+async function eiaSeries(cfg: SwarmConfig, series: string, signal?: AbortSignal): Promise<TimeSeriesResult> {
+  if (!cfg.eiaApiKey) {
+    throw new Error(
+      "EIA needs a free API key — get one at https://www.eia.gov/opendata/register.php and set eiaApiKey. Meanwhile yahoo futures work keyless (CL=F crude, NG=F natural gas, HO=F heating oil)."
+    );
+  }
+  const res = await apiGet(`https://api.eia.gov/v2/seriesid/${encodeURIComponent(series)}?api_key=${cfg.eiaApiKey}`, signal);
+  const data: any = await res.json();
+  const rows = data?.response?.data ?? [];
+  const points = rows
+    .map((r: any) => ({ date: normPeriod(r.period), value: Number(r.value) }))
+    .filter((p: { date: string; value: number }) => /^\d{4}-/.test(p.date) && Number.isFinite(p.value))
+    .sort((a: { date: string }, b: { date: string }) => (a.date < b.date ? -1 : 1));
+  if (!points.length) throw new Error(`eia: no data for series "${series}" — check the EIA series id`);
+  return { source: "eia", series, points, label: data?.response?.["series-description"] || `EIA ${series}`, unit: data?.response?.units };
+}
+
+// ---------------------------------------------------------------- BLS (free key, degrades to v1)
+
+const BLS_ALIASES: Record<string, string> = {
+  nonfarm_payrolls: "CES0000000001",
+  unemployment_rate: "LNS14000000",
+  avg_hourly_earnings: "CES0500000003",
+  cpi: "CUUR0000SA0",
+  labor_force_participation: "LNS11300000",
+};
+
+/** BLS employment/wages/CPI series. Free key (v2); without it, the throttled keyless v1. Accepts an alias or a raw series id. */
+async function blsSeries(cfg: SwarmConfig, series: string, start?: string, end?: string, signal?: AbortSignal): Promise<TimeSeriesResult> {
+  const id = BLS_ALIASES[series.trim().toLowerCase()] ?? series.trim();
+  const startyear = (start ?? `${new Date().getFullYear() - 5}`).slice(0, 4);
+  const endyear = (end ?? `${new Date().getFullYear()}`).slice(0, 4);
+  let rows: any[];
+  if (cfg.blsApiKey) {
+    const res = await apiPost("https://api.bls.gov/publicAPI/v2/timeseries/data/", { seriesid: [id], startyear, endyear, registrationkey: cfg.blsApiKey }, signal);
+    const data: any = await res.json();
+    rows = data?.Results?.series?.[0]?.data ?? [];
+  } else {
+    const res = await apiGet(`https://api.bls.gov/publicAPI/v1/timeseries/data/${encodeURIComponent(id)}`, signal);
+    const data: any = await res.json();
+    rows = data?.Results?.series?.[0]?.data ?? [];
+  }
+  const points = rows
+    .map((r: any) => {
+      // Accept ONLY true monthly periods (M01–M12). Drop M13 (annual average)
+      // and S01/S02 (semiannual): mapping those to a month fabricates invalid
+      // ("2024-13-01") or colliding ("2024-01-01") dates that NaN-poison OLS.
+      const mm = /^M(0[1-9]|1[0-2])$/.exec(String(r.period ?? ""));
+      if (!mm) return null;
+      return { date: `${r.year}-${mm[1]}-01`, value: Number(r.value) };
+    })
+    .filter((p: { date: string; value: number } | null): p is { date: string; value: number } => !!p && /^\d{4}-/.test(p.date) && Number.isFinite(p.value))
+    .sort((a: { date: string }, b: { date: string }) => (a.date < b.date ? -1 : 1));
+  if (!points.length) {
+    throw new Error(
+      `bls: no data for "${series}"${cfg.blsApiKey ? "" : " (keyless v1 is throttled — a free key at https://data.bls.gov/registrationEngine/ raises the limit, set blsApiKey)"} — try an alias (nonfarm_payrolls, unemployment_rate, cpi) or a BLS series id`
+    );
+  }
+  return { source: "bls", series: id, points, label: `BLS ${id}` };
+}
+
+/** The raw per-source dispatch (no caching) — timeSeries wraps this with the refstore cache. */
+async function rawTimeSeries(
   cfg: SwarmConfig,
   source: TimeSeriesSource,
   series: string,
@@ -1490,9 +1717,102 @@ export async function timeSeries(
       return nwsSeries(series, signal);
     case "wikipageviews":
       return wikiPageviewsSeries(series, start, end, signal);
+    case "secfacts":
+      return secFactsSeries(series, signal);
+    case "usaspending":
+      return usaspendingSeries(series, start, end, signal);
+    case "eia":
+      return eiaSeries(cfg, series, signal);
+    case "bls":
+      return blsSeries(cfg, series, start, end, signal);
     default:
-      throw new Error(`unknown source "${source}" — use fred | worldbank | yahoo | gdelt | gdelttone | openmeteo | nws | wikipageviews`);
+      throw new Error(
+        `unknown source "${source}" — use fred | worldbank | yahoo | gdelt | gdelttone | openmeteo | nws | wikipageviews | secfacts | usaspending | eia | bls`
+      );
   }
+}
+
+/**
+ * The canonical cache key for a (source, series) request — resolves aliases and
+ * case the SAME way the fetchers do, so "unemployment"/"UNRATE" and
+ * "aapl:Revenues"/"AAPL:Revenues" share one cache entry instead of fragmenting.
+ */
+export function canonicalSeriesKey(source: TimeSeriesSource, series: string): string {
+  const s = series.trim();
+  if (source === "fred") return FRED_ALIASES[s.toLowerCase()] ?? s;
+  if (source === "bls") return BLS_ALIASES[s.toLowerCase()] ?? s;
+  if (source === "secfacts") {
+    const i = s.indexOf(":"); // uppercase the ticker; the us-gaap tag is case-sensitive
+    return i >= 0 ? `${s.slice(0, i).toUpperCase()}:${s.slice(i + 1)}` : s.toUpperCase();
+  }
+  return s;
+}
+
+/**
+ * Fetch a statistical time series, cache-through the refstore. Default-window
+ * requests (no start/end) are served from the persistent cache when fresh and
+ * accumulate history across runs; an explicit range is a one-off (uncached) so
+ * the caller always gets exactly the window asked for.
+ */
+export async function timeSeries(
+  cfg: SwarmConfig,
+  source: TimeSeriesSource,
+  series: string,
+  start?: string,
+  end?: string,
+  signal?: AbortSignal,
+  log?: (level: "info" | "warn", msg: string) => void
+): Promise<TimeSeriesResult> {
+  if (start || end) return rawTimeSeries(cfg, source, series, start, end, signal);
+  const key = canonicalSeriesKey(source, series);
+  return cachedSeries(source, key, () => rawTimeSeries(cfg, source, series, undefined, undefined, signal), { log });
+}
+
+// ---------------------------------------------------------------- data_feed (document/entity-shaped, keyless)
+
+export type DataFeed = "sec_filings" | "company";
+
+/**
+ * Pull a structured reference feed that isn't a plain time series — a company's
+ * SEC filings list or its registry/entity profile. Document-shaped output the
+ * time_series tool can't represent. Keyless (SEC needs a descriptive UA, sent).
+ */
+export async function dataFeed(
+  cfg: SwarmConfig,
+  args: { feed: DataFeed; query: string; metric?: string },
+  signal?: AbortSignal
+): Promise<string> {
+  const cik = await resolveCik(args.query, signal);
+  if (!cik) throw new Error(`data_feed: unknown ticker "${args.query}" (not in the SEC ticker map). Use a US-listed ticker like AAPL.`);
+  const res = await apiGet(`https://data.sec.gov/submissions/CIK${cik.cik10}.json`, signal, { "user-agent": SEC_UA });
+  const data: any = await res.json();
+  if (args.feed === "company") {
+    const addr = data?.addresses?.business ?? {};
+    return [
+      `${data?.name ?? cik.title} (CIK ${cik.cik10})`,
+      `Tickers: ${(data?.tickers ?? []).join(", ") || "—"} · Exchanges: ${(data?.exchanges ?? []).join(", ") || "—"}`,
+      `SIC: ${data?.sicDescription ?? "—"} (${data?.sic ?? "—"}) · FY end: ${data?.fiscalYearEnd ?? "—"}`,
+      `HQ: ${[addr.city, addr.stateOrCountry].filter(Boolean).join(", ") || "—"}`,
+      data?.description ? `\n${String(data.description).slice(0, 400)}` : "",
+      `Source: https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${cik.cik10}`,
+    ].filter(Boolean).join("\n");
+  }
+  // sec_filings
+  const r = data?.filings?.recent ?? {};
+  const forms: string[] = r.form ?? [];
+  const dates: string[] = r.filingDate ?? [];
+  const accession: string[] = r.accessionNumber ?? [];
+  const primary: string[] = r.primaryDocument ?? [];
+  const wantForm = args.metric?.trim().toUpperCase();
+  const lines: string[] = [];
+  for (let i = 0; i < forms.length && lines.length < 20; i++) {
+    if (wantForm && forms[i].toUpperCase() !== wantForm) continue;
+    const acc = (accession[i] ?? "").replace(/-/g, "");
+    const url = acc && primary[i] ? `https://www.sec.gov/Archives/edgar/data/${Number(cik.cik10)}/${acc}/${primary[i]}` : "";
+    lines.push(`${dates[i] ?? "?"} · ${forms[i]}${url ? ` · ${url}` : ""}`);
+  }
+  if (!lines.length) throw new Error(`data_feed sec_filings: no ${wantForm ?? ""} filings found for ${args.query}`);
+  return [`${data?.name ?? cik.title} — recent ${wantForm ?? ""} filings (SEC EDGAR):`, ...lines].join("\n");
 }
 
 export interface OlsProjection {
@@ -1539,6 +1859,9 @@ function tQuantile90(df: number): number {
  * band is no longer the optimistic i.i.d. one.
  */
 export function olsProject(points: { date: string; value: number }[], targetDate: string): OlsProjection | null {
+  // Drop any point whose date can't be parsed — one NaN interior date would
+  // otherwise NaN-poison the entire fit (defense in depth; fetchers also guard).
+  points = points.filter((p) => Number.isFinite(Date.parse(p.date)) && Number.isFinite(p.value));
   if (points.length < 3 || !/^\d{4}-\d{2}-\d{2}/.test(targetDate)) return null;
   const t0 = Date.parse(points[0].date);
   const target = Date.parse(targetDate);

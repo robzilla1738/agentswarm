@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { TopBar } from "@/components/TopBar";
 import { Spinner } from "@/components/atoms";
-import { api, ProviderView } from "@/lib/api";
+import { api, ProviderView, PublicConfig, ForecastModelView } from "@/lib/api";
 import { useConfig } from "@/lib/hooks";
 
 const NUM_FIELDS: { key: string; label: string; min: number; max: number; hint?: string }[] = [
@@ -569,7 +569,12 @@ export default function SettingsPage() {
             {config.metaculusKeySet && <ClearKey label="Metaculus" onClear={() => clearKey({ metaculusApiKey: "" })} />}
             {config.oddsKeySet && <ClearKey label="Odds API" onClear={() => clearKey({ oddsApiKey: "" })} />}
           </p>
+          <p className="text-2xs text-ink-faint">
+            Keyless data sources also feed the forecaster panel now: SEC EDGAR fundamentals & filings (time_series <span className="mono">secfacts</span>, the <span className="mono">data_feed</span> tool), federal contracts (<span className="mono">usaspending</span>), and FRED plain-word aliases (unemployment, cpi, lumber, 10y…). The optional BLS and EIA keys are set via <span className="mono">swarm config set blsApiKey / eiaApiKey</span>.
+          </p>
         </Card>
+
+        <SavedModelsCard config={config} />
 
         <Card
           title="Sandbox"
@@ -749,6 +754,105 @@ export default function SettingsPage() {
 }
 
 /** Inline "remove this saved secret" action — blank-to-keep fields can't clear. */
+const MODEL_DOMAINS = ["sports", "finance", "macro", "elections", "construction", "business"];
+
+/** Manage reusable forecast models: list with track records, delete, and save the current global settings as a named model. */
+function SavedModelsCard({ config }: { config: PublicConfig }) {
+  const [models, setModels] = useState<ForecastModelView[]>([]);
+  const [name, setName] = useState("");
+  const [domain, setDomain] = useState("");
+  const [fitMode, setFitMode] = useState<"live" | "frozen">("live");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const load = () => api.forecastModels().then((r) => setModels(r.models)).catch(() => {});
+  useEffect(() => { load(); }, []);
+  const save = async () => {
+    if (!name.trim()) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await api.saveForecastModel({
+        name: name.trim(),
+        domain: domain || undefined,
+        fitMode,
+        tunables: {
+          panelSize: config.forecastPanelSize,
+          extremizeK: config.forecastExtremizeK,
+          marketWeight: config.forecastMarketWeight,
+          sportsMarketWeight: config.forecastSportsMarketWeight,
+          maxSubQuestions: config.forecastMaxSubQuestions,
+          decompose: config.forecastDecompose,
+          coherenceProbe: config.forecastCoherenceProbe,
+          simulate: config.forecastSimulate,
+        },
+      });
+      setName("");
+      setDomain("");
+      setFitMode("live");
+      load();
+    } catch (e: any) {
+      setErr(e?.message || "save failed");
+    }
+    setBusy(false);
+  };
+  const del = async (id: string) => {
+    await api.deleteForecastModel(id).catch(() => {});
+    load();
+  };
+  return (
+    <Card
+      title="Saved prediction models"
+      sub="Reusable bundles of forecast settings — pick one in the composer's model dropdown to re-apply it to a new question. A frozen model also captures the current learned fit (recalibration, weights, dilation) so the run is reproducible and shareable; a live model re-learns from the ledger each run. Track records are derived from the ledger."
+    >
+      {models.length > 0 && (
+        <div className="space-y-2 mb-2">
+          {models.map((m) => (
+            <div key={m.id} className="tile flex items-center gap-3 px-3 py-2">
+              <div className="flex-1 min-w-0">
+                <div className="text-sm text-ink truncate">
+                  {m.name} {m.fitMode === "frozen" && <span title="frozen fit">❄</span>}
+                </div>
+                <div className="text-2xs text-ink-faint">
+                  {m.domain ?? "auto-detect"} · {m.record.resolved} resolved
+                  {typeof m.record.brierMean === "number" ? ` · Brier ${m.record.brierMean.toFixed(2)}` : ""}
+                  {typeof m.record.vsMarket === "number" ? ` · vs market ${m.record.vsMarket > 0 ? "+" : ""}${m.record.vsMarket.toFixed(2)}` : ""}
+                </div>
+              </div>
+              <Link href={`/forecasts?model=${m.id}`} className="text-2xs text-ink underline underline-offset-2">
+                history
+              </Link>
+              <button className="btn btn-ghost btn-sm" onClick={() => del(m.id)}>delete</button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 items-end">
+        <Field label="Name">
+          <input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Macro rates model" />
+        </Field>
+        <Field label="Domain">
+          <select className="input" value={domain} onChange={(e) => setDomain(e.target.value)}>
+            <option value="">auto-detect</option>
+            {MODEL_DOMAINS.map((d) => (
+              <option key={d} value={d}>{d}</option>
+            ))}
+          </select>
+        </Field>
+        <Field label="Fit" hint="frozen captures the current learned fit">
+          <select className="input" value={fitMode} onChange={(e) => setFitMode(e.target.value as "live" | "frozen")}>
+            <option value="live">live · re-learn each run</option>
+            <option value="frozen">frozen · capture now</option>
+          </select>
+        </Field>
+        <button className="btn btn-primary" disabled={!name.trim() || busy} onClick={save}>
+          {busy && <Spinner size={13} dark />} Save current settings
+        </button>
+      </div>
+      {err && <p className="text-2xs text-ink mt-2">{err}</p>}
+    </Card>
+  );
+}
+
 function ClearKey({ label, onClear }: { label?: string; onClear: () => void }) {
   return (
     <button

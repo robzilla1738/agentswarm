@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.18.0
+
+General-purpose forecasting via **domain packs**: the engine generalizes everything the sports path does — intent detection, engine-owned decomposition, per-quantity priors, data-grounded modeling, and exact auto-resolution — into a registry of domains (finance, macro, elections, construction, business, sports). Each domain learns its own calibration, and any setup can be saved as a reusable, freezable model. No breaking changes; an unmatched question takes the same generic panel+research path as before, and sports behavior is byte-identical (it became pack #1).
+
+### Domain packs
+- **A registered domain owns the forecast for its kind of question.** `detectDomain` runs cheap deterministic matchers first (a wrong domain is worse than the generic path); only when all abstain does one cheap LLM classifier run, and only over packs that opt in. Sports stays deterministic-only, so a sports question takes the identical path it always did. A pack can also decompose (the `planSportsGame` analogue), build a data-grounded Monte Carlo driver catalog, and auto-resolve from authoritative data.
+- **Finance/markets** — a "will TICKER close above X by DATE" or "what price" question builds a bottom-up model from the option market's own risk-neutral probability (Black-Scholes), an OLS price trend, and a VIX volatility regime, and resolves *exactly* from the closing price.
+- **Macro/economy** — grounds numeric questions in a real FRED series (OLS trend) and resolves "direct" rate series (unemployment, fed funds, 10y, mortgage) from the official print.
+- **Construction/projects** — decomposes a delivery question into milestone sub-forecasts (permits, funding, phase completion, schedule slip) that the simulation composes into a schedule-risk model, plus a counted reference-class overrun rate once comparable projects resolve.
+- **Elections** and **business** route for per-domain calibration and the right UI knobs, leaning on the market anchor and the new structured tools.
+
+### Per-domain learning + reference classes
+- **The calibration flywheel is now per-domain.** Every learned parameter (extremization k, market/sports anchor weights, recalibration, interval dilation, simulation weight, method weights) fits on the domain's own resolved history with a two-level backoff — per-domain fit → global fit → default — so a domain tunes itself exactly where it has earned the data and is identical to before everywhere else (old ledger rows carry no domain, so a thin domain transparently uses the global pool that still contains them). `swarm calibration` and the UI now show a per-domain track record.
+- **A reference-class store** (`~/.agentswarm/refstore/`) accumulates resolved outcomes by domain + class so a pack can read a *counted* base rate instead of an LLM guess, and caches fetched series so a run doesn't re-fetch (with stale-on-failure fallback and size-bounded compaction).
+
+### Deep data (free/keyless-first)
+- **New structured feeds, no key required for the high-value ones.** `time_series` gains **SEC EDGAR XBRL fundamentals** (`secfacts`, e.g. `AAPL:Revenues`), **USAspending** federal contract obligations, **EIA** energy, and **BLS** employment/wages; a new **`data_feed`** tool returns SEC filing lists and company profiles. FRED accepts plain-word aliases (`unemployment`, `cpi`, `fedfunds`, `10y`, `lumber`, `steel`, `cement`, `vix`…), and Yahoo futures symbols (`CL=F`, `LBS=F`, `HG=F`) are documented for keyless commodity spot. The optional free BLS/EIA keys are set via `swarm config set blsApiKey / eiaApiKey`.
+
+### Saved, reusable, freezable models
+- **Save a forecast setup and reuse it.** A saved model bundles a domain + tunables; a **frozen** model also captures the current learned fit (recalibration, weights, dilation) verbatim, so a run is reproducible and shareable, while a **live** model re-learns from the ledger each run. Pick one from the composer's model dropdown or manage them in Settings; each model accrues its own track record in the ledger (`/forecasts?model=<id>`).
+
+### UX: progressive disclosure + intent
+- **The composer shows almost nothing by default** — the question box, an auto-detected domain chip (overridable), and a saved-model dropdown. Everything else (resolution date, panel size, and only the tunables relevant to the detected domain) lives behind an Options disclosure. Per-run forecast tunables are now fully reproducible (promoted into the run's options, with the precedence: an explicit pin > a frozen model > the ledger-learned value > the configured default), so a run is self-describing and a resumed run keeps its domain, learning, and data-grounded drivers.
+
+### Performance
+- **The series cache no longer re-reads the whole file per call** (memoized by the file's size+mtime, invalidated on any write) and **compacts** itself when it crosses a size threshold (collapsing superseded snapshots to one record per series). The ledger is read once per run instead of once per binary sub-forecast, and a domain's independent data feeds are fetched concurrently rather than sequentially.
+
 ## 0.17.0
 
 Market-anchored sports forecasting and a forecasting-accuracy hardening pass. The headline addition: a head-to-head game is now decomposed by the engine into the facets a sharp betting line actually prices — who wins, the combined total, and the margin — each anchored to that line and resolved from the official box score. No breaking changes; everything is gated on a matched line and the free Odds API key.

@@ -6,7 +6,9 @@ import { SandboxRuntime } from "./sandbox";
 import { ForecastKind, RunMeta } from "./types";
 import { crawlSite, resolveCrawlBackend, slugForUrl } from "./crawltools";
 import {
+  DataFeed,
   TimeSeriesSource,
+  dataFeed,
   formatMarketHits,
   formatTables,
   formatTimeSeries,
@@ -570,15 +572,15 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
     schema: {
       name: "time_series",
       description:
-        "Fetch a statistical/financial/weather time series: fred (St. Louis Fed economic series, e.g. CPIAUCSL, UNRATE — needs the free fredApiKey), worldbank (INDICATOR:COUNTRY, e.g. NY.GDP.MKTP.CD:US — keyless), yahoo (daily market data: AAPL, ^GSPC, EURUSD=X, BTC-USD — keyless), gdelt (news-coverage volume for a query — keyless), gdelttone (media sentiment tone for a query — keyless), openmeteo (daily weather, series \"lat,lon[,variable]\" e.g. \"39.74,-104.99,snowfall_sum\" — past dates use the ERA5 archive, which turns weather base rates into counted frequencies; keyless), nws (official US hourly point forecast, series \"lat,lon\" — keyless), wikipageviews (daily Wikipedia pageviews for an article title — a public-attention leading indicator for elections, launches, and emerging events; keyless). Returns a stats summary, recent observations, and a ready-made ```chart block for reports. Use real data series to ground trend extrapolation instead of guessing.",
+        "Fetch a statistical/financial/weather time series. Sources: fred (St. Louis Fed — raw id like CPIAUCSL/UNRATE OR a plain-word alias: unemployment, cpi, fedfunds, 10y, 2y, gdp, vix, permits, housing_starts, lumber, steel, cement, mortgage30 — needs the free fredApiKey), worldbank (INDICATOR:COUNTRY — keyless), yahoo (daily market data incl. FUTURES: AAPL, ^GSPC, EURUSD=X, BTC-USD, CL=F crude, NG=F natgas, LBS=F lumber, HG=F copper, GC=F gold — keyless), secfacts (SEC XBRL fundamentals, series \"TICKER:tag\" e.g. \"AAPL:Revenues\", \"NVDA:NetIncomeLoss\" — keyless), usaspending (federal contract obligations over time, series \"recipient:Name\"|\"agency:Name\"|\"naics:code\" — keyless), eia (energy series id — free eiaApiKey, else use yahoo CL=F/NG=F), bls (employment/wages, alias nonfarm_payrolls/unemployment_rate/cpi or a series id — free key, throttled keyless v1 otherwise), gdelt (news-coverage volume — keyless), gdelttone (media sentiment — keyless), openmeteo (daily weather \"lat,lon[,variable]\" — ERA5 archive turns weather base rates into counted frequencies; keyless), nws (US hourly forecast \"lat,lon\" — keyless), wikipageviews (daily Wikipedia pageviews — attention leading indicator; keyless). Returns a stats summary, recent observations, and a ready-made ```chart block. Use real series to ground trend extrapolation instead of guessing.",
       parameters: {
         type: "object",
         properties: {
-          source: { type: "string", enum: ["fred", "worldbank", "yahoo", "gdelt", "gdelttone", "openmeteo", "nws", "wikipageviews"] },
+          source: { type: "string", enum: ["fred", "worldbank", "yahoo", "secfacts", "usaspending", "eia", "bls", "gdelt", "gdelttone", "openmeteo", "nws", "wikipageviews"] },
           series: {
             type: "string",
             description:
-              "FRED series id, World Bank INDICATOR:COUNTRY, Yahoo Finance symbol, GDELT search query, lat,lon[,variable] for weather sources, or a Wikipedia article title for wikipageviews",
+              "FRED id or alias, World Bank INDICATOR:COUNTRY, Yahoo symbol, secfacts TICKER:tag, usaspending recipient:/agency:/naics:, eia/bls series id, GDELT query, lat,lon[,variable] for weather, or a Wikipedia article title",
           },
           start: { type: "string", description: "Start date YYYY-MM-DD (optional)" },
           end: { type: "string", description: "End date YYYY-MM-DD (optional)" },
@@ -593,8 +595,8 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
     },
     run: async (args, ctx) => {
       const source = String(args.source) as TimeSeriesSource;
-      if (!["fred", "worldbank", "yahoo", "gdelt", "gdelttone", "openmeteo", "nws", "wikipageviews"].includes(source)) {
-        throw new Error("source must be fred | worldbank | yahoo | gdelt | gdelttone | openmeteo | nws | wikipageviews");
+      if (!["fred", "worldbank", "yahoo", "secfacts", "usaspending", "eia", "bls", "gdelt", "gdelttone", "openmeteo", "nws", "wikipageviews"].includes(source)) {
+        throw new Error("source must be fred | worldbank | yahoo | secfacts | usaspending | eia | bls | gdelt | gdelttone | openmeteo | nws | wikipageviews");
       }
       const r = await timeSeries(
         ctx.cfg,
@@ -602,7 +604,8 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
         String(args.series),
         args.start ? String(args.start) : undefined,
         args.end ? String(args.end) : undefined,
-        ctx.signal
+        ctx.signal,
+        (lvl, msg) => ctx.log?.(lvl, msg)
       );
       const projectTo = /^\d{4}-\d{2}-\d{2}$/.test(String(args.project_to ?? "")) ? String(args.project_to) : undefined;
       return formatTimeSeries(r, projectTo);
@@ -631,6 +634,28 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
         `Risk-neutral P(${r.symbol} > ${r.strike} at expiry) = ${(r.probAbove * 100).toFixed(1)}%  ·  P(below) = ${((1 - r.probAbove) * 100).toFixed(1)}%`,
         `Contracts used: ${r.contractsUsed}. Caveat: risk-neutral probabilities ≠ real-world for far-dated or high-risk-premium events — treat as a strong anchor, then adjust.`,
       ].join("\n");
+    },
+  };
+
+  tools.data_feed = {
+    schema: {
+      name: "data_feed",
+      description:
+        "Pull a structured reference feed that isn't a plain time series (keyless, SEC EDGAR). feed=sec_filings lists a US company's recent filings (query=ticker, optional metric=form like 10-K/8-K) with direct document URLs; feed=company returns its registry/entity profile (name, SIC industry, exchanges, HQ). For fundamentals AS A SERIES use time_series source secfacts; for contract spending use time_series source usaspending.",
+      parameters: {
+        type: "object",
+        properties: {
+          feed: { type: "string", enum: ["sec_filings", "company"] },
+          query: { type: "string", description: "US-listed ticker, e.g. AAPL, NVDA" },
+          metric: { type: "string", description: "sec_filings only: filter to a form (10-K, 10-Q, 8-K)" },
+        },
+        required: ["feed", "query"],
+      },
+    },
+    run: async (args, ctx) => {
+      const feed = String(args.feed) as DataFeed;
+      if (!["sec_filings", "company"].includes(feed)) throw new Error("feed must be sec_filings | company");
+      return dataFeed(ctx.cfg, { feed, query: String(args.query), metric: args.metric ? String(args.metric) : undefined }, ctx.signal);
     },
   };
 

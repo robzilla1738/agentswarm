@@ -15,6 +15,8 @@ import {
   supersededIds,
 } from "./forecast";
 import { resolveFromPlatform, sportsScore } from "./datatools";
+import { packById } from "./domains/registry";
+import type { DomainCtx } from "./domains/pack";
 import { questionBlock } from "./prompts";
 import { createSandbox } from "./sandbox";
 import { ToolCtx, ToolDef, workerToolset } from "./tools";
@@ -389,6 +391,38 @@ export async function resolveDue(
             continue;
           }
           opts.log?.("info", `${entry.id}: past the /scores window — trying a resolution agent`);
+        }
+      }
+      // Domain packs with an authoritative data source resolve from it directly
+      // (a finance close, a macro print) — exact ground truth, no agent. Falls
+      // through to the platform/web resolvers when the pack can't settle it yet.
+      const dom = entry.domain ?? entry.question.domain;
+      if (dom && dom !== "sports") {
+        const pack = packById(dom);
+        if (pack?.resolve) {
+          try {
+            const dctx: DomainCtx = {
+              cfg,
+              mission: entry.question.text,
+              today: new Date().toISOString().slice(0, 10),
+              operatorDate: entry.question.resolutionDate,
+              single: false,
+              decompose: true,
+              maxSubQuestions: 6,
+              signal,
+              ask: async () => { throw new Error("ask is unavailable during resolution"); },
+              log: (lvl, msg) => opts.log?.(lvl, msg),
+            };
+            const dr = await pack.resolve(dctx, entry);
+            if (dr) {
+              writeAudit(entry.id, { question: entry.question, domain: dom, verdict: dr });
+              const rec = resolveLedgerEntry(entry, dr.outcome, { evidence: dr.evidence, sources: dr.sources, resolvedBy: "swarm" });
+              result.resolved.push({ ...rec, question: qText });
+              continue;
+            }
+          } catch (e) {
+            opts.log?.("info", `${entry.id}: ${dom} auto-resolve unavailable (${errMsg(e)}) — trying the web resolver`);
+          }
         }
       }
       // Tournament questions carry their source market — the platform's own

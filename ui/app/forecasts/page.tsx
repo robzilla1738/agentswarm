@@ -126,7 +126,15 @@ export default function ForecastsPage() {
   const [filter, setFilter] = useState<"all" | "open" | "resolved">("all");
   const [resolving, setResolving] = useState<Set<string> | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [modelFilter, setModelFilter] = useState<string | null>(null);
   const now = Date.now();
+
+  // Honor /forecasts?model=<id> (from the saved-models card / composer picker).
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const m = new URLSearchParams(window.location.search).get("model");
+    setModelFilter(m && m.trim() ? m.trim() : null);
+  }, []);
 
   const load = useCallback(async () => {
     try {
@@ -145,11 +153,12 @@ export default function ForecastsPage() {
 
   const due = useMemo(() => (entries ?? []).filter((e) => isDue(e, now)), [entries, now]);
   const shown = useMemo(() => {
-    const list = entries ?? [];
+    let list = entries ?? [];
+    if (modelFilter) list = list.filter((e) => e.modelId === modelFilter);
     const filtered =
       filter === "open" ? list.filter((e) => !e.resolution) : filter === "resolved" ? list.filter((e) => e.resolution) : list;
     return [...filtered].sort((a, b) => b.t - a.t);
-  }, [entries, filter]);
+  }, [entries, filter, modelFilter]);
 
   const resolveNow = async (ids?: string[]) => {
     setResolving(new Set(ids ?? due.map((e) => e.id)));
@@ -257,7 +266,37 @@ export default function ForecastsPage() {
                 </p>
               </div>
             )}
+            {calibration.byDomain && Object.keys(calibration.byDomain).length > 0 && (
+              <div className="flex-1 min-w-[220px]">
+                <h2 className="label mb-3">By domain</h2>
+                <table className="w-full text-xs">
+                  <tbody>
+                    {Object.entries(calibration.byDomain)
+                      .sort((a, b) => a[1].brierMean - b[1].brierMean)
+                      .map(([d, s]) => (
+                        <tr key={d} className="border-b border-border-soft">
+                          <td className="py-1.5 text-ink-dim">{d}</td>
+                          <td className="py-1.5 mono text-right text-ink">{s.brierMean.toFixed(3)}</td>
+                          <td className="py-1.5 mono text-right text-ink-faint">n={s.n}</td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+                <p className="text-2xs text-ink-faint mt-2 leading-relaxed">
+                  Per-domain headline Brier (binary). Each domain learns its own k, anchor weights, and recalibration
+                  once it has enough resolved history — this is where that pays off.
+                </p>
+              </div>
+            )}
           </section>
+        )}
+
+        {modelFilter && (
+          <div className="tile flex items-center gap-2 px-3 py-2 mb-4 text-xs">
+            <span className="text-ink-dim">Showing only forecasts from saved model</span>
+            <span className="mono text-ink">{modelFilter}</span>
+            <button className="btn btn-ghost btn-sm ml-auto" onClick={() => setModelFilter(null)}>show all</button>
+          </div>
         )}
 
         {/* Filters + export */}

@@ -7,6 +7,8 @@ import {
   AggregateForecast,
   CombinerNode,
   CombinerSpec,
+  DomainId,
+  FittedParams,
   DriverCorrelation,
   Forecast,
   ForecastKind,
@@ -17,7 +19,8 @@ import {
   SportsLineSnapshot,
   SportsMeta,
 } from "./types";
-import { ensureDir, errMsg } from "./util";
+import { clip, ensureDir, errMsg } from "./util";
+import { appendRefClass } from "./refstore";
 
 /**
  * Deterministic forecasting math and the persistent forecast ledger.
@@ -556,11 +559,31 @@ export const MIN_MARKET_WEIGHT_N = 20;
 export const MANIFOLD_VOLUME_DISCOUNT = 50;
 
 /**
+ * Two-level backoff for the per-domain calibration flywheel: when the in-domain
+ * slice has enough resolved history, fit on it; otherwise fall back to ALL
+ * entries (the global fit, whose own N-threshold then backs off to the default).
+ * A domain thus learns its own parameters exactly where it has earned the data
+ * and is identical to global behavior everywhere else — including for old ledger
+ * entries written before the domain stamp existed (they carry no domain, so a
+ * thin domain transparently uses the global pool that still contains them).
+ */
+/** Generic per-domain sufficiency threshold for learners without their own named minimum. */
+export const MIN_DOMAIN_FIT_N = 20;
+
+function scopeToDomain(entries: LedgerEntry[], domain: DomainId | undefined, minN: number): LedgerEntry[] {
+  if (!domain) return entries;
+  const inDomain = entries.filter((e) => e.domain === domain);
+  const resolved = inDomain.reduce((n, e) => n + (e.resolution ? 1 : 0), 0);
+  return resolved >= minN ? inDomain : entries;
+}
+
+/**
  * Fit the market blend weight on the resolved track record: the w that would
  * have minimized mean log loss re-blending each stored panel aggregate with
  * its stored market price. Falls back below MIN_MARKET_WEIGHT_N resolutions.
  */
-export function chooseMarketWeight(entries = loadLedger(), fallback = DEFAULT_MARKET_WEIGHT): number {
+export function chooseMarketWeight(entries = loadLedger(), fallback = DEFAULT_MARKET_WEIGHT, domain?: DomainId): number {
+  entries = scopeToDomain(entries, domain, MIN_MARKET_WEIGHT_N);
   const usable = entries.filter(
     (e) =>
       e.question.kind === "binary" &&
@@ -751,7 +774,8 @@ export const MIN_SPORTS_MARKET_WEIGHT_N = 20;
  * chooseMarketWeight but in pinball space, re-applying the same −1/panelSize
  * residual the live path uses. Falls back to the high default below 20.
  */
-export function chooseSportsMarketWeight(entries = loadLedger(), fallback = DEFAULT_SPORTS_MARKET_WEIGHT): number {
+export function chooseSportsMarketWeight(entries = loadLedger(), fallback = DEFAULT_SPORTS_MARKET_WEIGHT, domain?: DomainId): number {
+  entries = scopeToDomain(entries, domain, MIN_SPORTS_MARKET_WEIGHT_N);
   const usable = entries.filter(
     (e) =>
       (e.question.kind === "numeric" || e.question.kind === "date") &&
@@ -797,7 +821,8 @@ export const METHOD_WEIGHT_PRIOR_N = 10;
  * say in the weighted GMO, shrunk toward 1 by sample size. Methods without
  * enough history (or absent entirely) weigh exactly 1.
  */
-export function methodWeights(entries = loadLedger()): Record<string, number> {
+export function methodWeights(entries = loadLedger(), domain?: DomainId): Record<string, number> {
+  entries = scopeToDomain(entries, domain, MIN_DOMAIN_FIT_N);
   let byMethod: CalibrationStats["byMethod"];
   try {
     byMethod = calibrationStats(entries).byMethod;
@@ -845,7 +870,8 @@ export const MIN_RECALIBRATION_N = 40;
  * The b intercept is the genuinely new dial vs adaptive-k: it corrects a
  * systematic YES-lean (LLM acquiescence bias) that no symmetric exponent can.
  */
-export function fitRecalibration(entries = loadLedger()): Recalibration | null {
+export function fitRecalibration(entries = loadLedger(), domain?: DomainId): Recalibration | null {
+  entries = scopeToDomain(entries, domain, MIN_RECALIBRATION_N);
   const pts: { p: number; outcome: 0 | 1 }[] = [];
   for (const e of entries) {
     if (e.question.kind !== "binary" || !e.resolution) continue;
@@ -937,8 +963,10 @@ export interface QuantileCalibration {
  */
 export function fitQuantileCalibration(
   entries = loadLedger(),
-  fallback = DEFAULT_QUANTILE_DILATION
+  fallback = DEFAULT_QUANTILE_DILATION,
+  domain?: DomainId
 ): QuantileCalibration {
+  entries = scopeToDomain(entries, domain, MIN_QCAL_N);
   const pts: { q: Quantiles; logSpace: boolean; outcome: number }[] = [];
   for (const e of entries) {
     if ((e.question.kind !== "numeric" && e.question.kind !== "date") || !e.resolution) continue;
@@ -963,6 +991,33 @@ export function fitQuantileCalibration(
     }
   }
   return { d: Number(bestD.toFixed(2)), n: pts.length, source: "learned" };
+}
+
+/**
+ * Snapshot the out-of-fold fit for a domain (or globally) into a reusable,
+ * freezable artifact. This is the engine's "fitted model": every parameter the
+ * flywheel learns, captured at a moment in time. A saved model can freeze this
+ * for reproducibility; the live default re-derives it each run.
+ */
+export function snapshotFittedParams(domain?: DomainId, entries = loadLedger()): FittedParams {
+  const recal = fitRecalibration(entries, domain);
+  const qcal = fitQuantileCalibration(entries, DEFAULT_QUANTILE_DILATION, domain);
+  const inDomain = domain ? entries.filter((e) => e.domain === domain) : entries;
+  const fitN = inDomain.reduce((n, e) => n + (e.resolution ? 1 : 0), 0);
+  return {
+    domain,
+    // Carry each fit's true sample count so a frozen run logs an honest n even
+    // when the learner backed off to the global pool.
+    recalibration: recal ? { a: recal.a, b: recal.b, n: recal.n } : null,
+    extremizeK: chooseExtremizeK(entries, DEFAULT_EXTREMIZE_K, domain),
+    marketWeight: chooseMarketWeight(entries, DEFAULT_MARKET_WEIGHT, domain),
+    sportsMarketWeight: chooseSportsMarketWeight(entries, DEFAULT_SPORTS_MARKET_WEIGHT, domain),
+    quantileDilation: qcal.d,
+    quantileDilationN: qcal.n,
+    methodWeights: methodWeights(entries, domain),
+    fitN,
+    fitAt: Date.now(),
+  };
 }
 
 // ---------------------------------------------------------------- scenario simulation
@@ -1121,7 +1176,8 @@ export const SIM_WEIGHT_CAP = 0.3;
  * Falls back to 0 (no influence) below MIN_SIM_WEIGHT_N — the simulation earns
  * its seat exactly the way the market anchor and recalibration do.
  */
-export function chooseSimulationWeight(entries = loadLedger(), kind: ForecastKind = "binary", fallback = DEFAULT_SIM_WEIGHT): number {
+export function chooseSimulationWeight(entries = loadLedger(), kind: ForecastKind = "binary", fallback = DEFAULT_SIM_WEIGHT, domain?: DomainId): number {
+  entries = scopeToDomain(entries, domain, MIN_SIM_WEIGHT_N);
   const grid = (score: (w: number) => number): number => {
     let bestW = fallback;
     let bestLoss = Infinity;
@@ -1518,6 +1574,10 @@ export interface LedgerCreated {
   triggers?: string[];
   /** Panel evidence overlap at creation — needed to re-tune k honestly later. */
   evidenceOverlap?: number;
+  /** The domain pack that planned/modeled this forecast — the per-domain calibration key. Absent = generic path. */
+  domain?: DomainId;
+  /** The saved model this forecast was produced with, for per-model track records. */
+  modelId?: string;
   /** Set for tournament-imported questions: source platform, id, and its price at import. */
   origin?: ForecastOrigin;
   /**
@@ -1709,6 +1769,28 @@ export function resolveLedgerEntry(
     }
   }
   appendLedger(rec);
+  // Mirror the resolved outcome into the reference-class store so a domain pack
+  // can later read a COUNTED base rate (queryRefClass) instead of parsing one
+  // from prose. Best-effort, dormant until a pack stamps question.refClass.
+  const refClass = entry.question.refClass;
+  const dom = entry.domain ?? entry.question.domain;
+  if (refClass && dom && settled !== "void") {
+    try {
+      appendRefClass({
+        v: 1,
+        kind: "refclass",
+        t: Date.now(),
+        domain: dom,
+        refClass,
+        question: clip(entry.question.text, 200),
+        qkind: kind,
+        outcome: settled,
+        ledgerId: entry.id,
+      });
+    } catch {
+      /* reference-class accumulation is best-effort */
+    }
+  }
   return rec;
 }
 
@@ -1735,6 +1817,8 @@ export interface CalibrationStats {
   mcBins: CalibrationBin[];
   /** Per-panel-method mean Brier (panelists scored against the outcome). */
   byMethod: Record<string, { n: number; brierMean: number }>;
+  /** Per-domain headline mean Brier over resolved binary forecasts (the per-domain track record). */
+  byDomain: Record<string, { n: number; brierMean: number }>;
 }
 
 /** Binary entries resolved to a hard 0/1 (voids and numerics don't calibrate a probability). */
@@ -1803,12 +1887,28 @@ export function calibrationStats(entries: LedgerEntry[]): CalibrationStats {
       bin.n++;
     }
   }
+  // Per-domain headline Brier over resolved binary forecasts — the slice that
+  // shows whether a domain's model is actually calibrated. Binary-only so the
+  // scale matches brierMean (mc Brier is 0–2).
+  const byDomain: Record<string, { n: number; brierMean: number }> = {};
+  for (const e of entries) {
+    if (e.question.kind !== "binary" || !e.resolution) continue;
+    const o = e.resolution.outcome;
+    const p = e.aggregate.probability;
+    if ((o !== 0 && o !== 1) || typeof p !== "number" || !Number.isFinite(p)) continue;
+    const dom = e.domain ?? e.question.domain ?? "generic";
+    const cur = byDomain[dom] ?? { n: 0, brierMean: 0 };
+    cur.brierMean = (cur.brierMean * cur.n + brierScore(p, o)) / (cur.n + 1);
+    cur.n++;
+    byDomain[dom] = cur;
+  }
   return {
     n: scored.length,
     brierMean: scored.length ? brierSum / scored.length : 0,
     bins: bins.filter((b) => b.n > 0),
     mcBins: mcBins.filter((b) => b.n > 0),
     byMethod,
+    byDomain,
   };
 }
 
@@ -1958,7 +2058,8 @@ const K_MAX = 6;
  */
 export const MIN_ADAPTIVE_N = 30;
 
-export function chooseExtremizeK(entries = loadLedger(), fallback = DEFAULT_EXTREMIZE_K): number {
+export function chooseExtremizeK(entries = loadLedger(), fallback = DEFAULT_EXTREMIZE_K, domain?: DomainId): number {
+  entries = scopeToDomain(entries, domain, MIN_ADAPTIVE_N);
   const usable = scoreable(entries).filter((s) => s.panel.filter((m) => Number.isFinite(m.probability)).length >= 2);
   if (usable.length < MIN_ADAPTIVE_N) return fallback;
   const meanBrier = (k: number): number => {

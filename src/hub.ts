@@ -13,8 +13,10 @@ import {
   saveConfig,
 } from "./config";
 import { appendControl } from "./control";
-import { ISO_DATE, calibrationStats, loadLedger, resolveLedgerEntry } from "./forecast";
+import { ISO_DATE, calibrationStats, loadLedger, resolveLedgerEntry, snapshotFittedParams } from "./forecast";
 import { resolveDue } from "./resolve";
+import { deleteModel, loadModels, modelTrackRecord, upsertModel } from "./models";
+import { PACKS, detectDomainSync, packById } from "./domains/registry";
 import { crawlSite, hasScrapeBackend, resolveCrawlBackend, scrapeUrl } from "./crawltools";
 import { searchEngines } from "./webtools";
 import { listModels, validateAuth } from "./deepseek";
@@ -34,7 +36,7 @@ import {
   resumeInfo,
 } from "./run";
 import { SANDBOX_KINDS, SandboxKind, dockerAvailable, resolveSandboxKind, testSandbox } from "./sandbox";
-import { RunOptions } from "./types";
+import { DOMAIN_IDS, DomainId, ForecastModel, ForecastOverrideFlags, RunOptions } from "./types";
 import { errMsg, pathInside } from "./util";
 
 const PKG_VERSION: string = (() => {
@@ -271,6 +273,47 @@ async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL
       resolvedBy: "operator",
     });
     return sendJson(res, 200, { ok: true, resolution: rec });
+  }
+
+  // ---- saved prediction models ----
+  if (p === "/api/forecast-models" && method === "GET") {
+    const ledger = loadLedger();
+    const models = loadModels().map((m) => ({ ...m, record: modelTrackRecord(m.id, ledger) }));
+    return sendJson(res, 200, { models });
+  }
+  if (p === "/api/forecast-models" && method === "POST") {
+    const body = await readBody(req);
+    if (!body.name || typeof body.name !== "string") return sendJson(res, 400, { error: "name is required" });
+    try {
+      return sendJson(res, 200, { model: upsertModel(sanitizeModel(body)) });
+    } catch (e) {
+      return sendJson(res, 400, { error: errMsg(e) });
+    }
+  }
+  const mm = p.match(/^\/api\/forecast-models\/([^/]+)$/);
+  if (mm && method === "DELETE") {
+    return deleteModel(mm[1]) ? sendJson(res, 200, { ok: true }) : sendJson(res, 404, { error: "model not found" });
+  }
+
+  // ---- domain / intent detection (instant, deterministic; powers the composer chip) ----
+  if (p === "/api/forecast/detect" && method === "POST") {
+    const body = await readBody(req);
+    const text = String(body.text || "").slice(0, 2000);
+    const alternatives = PACKS.map((pk) => ({ domain: pk.id, label: pk.label }));
+    if (!text.trim()) return sendJson(res, 200, { domain: "generic", label: "General", confidence: 0, source: "empty", relevantKnobs: GENERIC_KNOBS, alternatives });
+    const match = detectDomainSync(text);
+    if (!match) {
+      return sendJson(res, 200, { domain: "generic", label: "General", confidence: 0, source: "none", relevantKnobs: GENERIC_KNOBS, alternatives });
+    }
+    const pk = packById(match.pack);
+    return sendJson(res, 200, {
+      domain: match.pack,
+      label: pk?.label ?? match.pack,
+      confidence: match.confidence,
+      source: match.source,
+      relevantKnobs: pk?.knobs ?? GENERIC_KNOBS,
+      alternatives,
+    });
   }
 
   if (p === "/api/runs" && method === "GET") {
@@ -579,6 +622,62 @@ export function publicConfig(cfg: SwarmConfig) {
   };
 }
 
+/** Forecast knobs shown for a generic (undetected) domain. */
+const GENERIC_KNOBS = ["panelSize", "marketWeight", "extremizeK", "decompose", "coherenceProbe", "simulate", "maxSubQuestions"];
+
+/** Clamp + validate a saved-model payload; freezing snapshots the live fit server-side. */
+function sanitizeModel(raw: Record<string, unknown>): Partial<ForecastModel> & { name: string } {
+  const clampF = (v: unknown, lo: number, hi: number) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : undefined;
+  };
+  const clampI = (v: unknown, lo: number, hi: number) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.round(n))) : undefined;
+  };
+  const t = (raw.tunables ?? {}) as Record<string, unknown>;
+  const tunables: ForecastModel["tunables"] = {};
+  const ps = clampI(t.panelSize, 3, 11);
+  if (ps !== undefined) tunables.panelSize = ps;
+  const k = clampF(t.extremizeK, 1, 4);
+  if (k !== undefined) tunables.extremizeK = k;
+  const mw = clampF(t.marketWeight, 0, 1);
+  if (mw !== undefined) tunables.marketWeight = mw;
+  const smw = clampF(t.sportsMarketWeight, 0, 1);
+  if (smw !== undefined) tunables.sportsMarketWeight = smw;
+  const msq = clampI(t.maxSubQuestions, 1, 8);
+  if (msq !== undefined) tunables.maxSubQuestions = msq;
+  if (typeof t.decompose === "boolean") tunables.decompose = t.decompose;
+  if (typeof t.coherenceProbe === "boolean") tunables.coherenceProbe = t.coherenceProbe;
+  if (typeof t.simulate === "boolean") tunables.simulate = t.simulate;
+  if (t.overrides && typeof t.overrides === "object") {
+    const f = t.overrides as Record<string, unknown>;
+    const ov: ForecastOverrideFlags = {};
+    if (typeof f.extremizeK === "boolean") ov.extremizeK = f.extremizeK;
+    if (typeof f.marketWeight === "boolean") ov.marketWeight = f.marketWeight;
+    if (typeof f.sportsMarketWeight === "boolean") ov.sportsMarketWeight = f.sportsMarketWeight;
+    tunables.overrides = ov;
+  }
+  const domain = DOMAIN_IDS.includes(raw.domain as DomainId) ? (raw.domain as DomainId) : undefined;
+  const fitMode: "live" | "frozen" = raw.fitMode === "frozen" ? "frozen" : "live";
+  const out: Partial<ForecastModel> & { name: string } = {
+    name: String(raw.name),
+    domain,
+    tunables,
+    fitMode,
+    ...(typeof raw.id === "string" ? { id: raw.id } : {}),
+  };
+  // Freezing captures the live fit NOW — the genuine reusable fitted artifact.
+  if (fitMode === "frozen") {
+    try {
+      out.fitted = snapshotFittedParams(domain);
+    } catch {
+      /* leave unfitted → behaves as live */
+    }
+  }
+  return out;
+}
+
 function sanitizeOptions(raw: unknown): Partial<RunOptions> {
   if (!raw || typeof raw !== "object") return {};
   const o = raw as Record<string, unknown>;
@@ -586,6 +685,13 @@ function sanitizeOptions(raw: unknown): Partial<RunOptions> {
   const num = (k: keyof RunOptions, lo: number, hi: number) => {
     const v = Number(o[k]);
     if (Number.isFinite(v)) (out as any)[k] = Math.min(hi, Math.max(lo, Math.round(v)));
+  };
+  const flt = (k: keyof RunOptions, lo: number, hi: number) => {
+    const v = Number(o[k]);
+    if (Number.isFinite(v)) (out as any)[k] = Math.min(hi, Math.max(lo, v));
+  };
+  const bool = (k: keyof RunOptions) => {
+    if (typeof o[k] === "boolean") (out as any)[k] = o[k];
   };
   if (typeof o.model === "string" && o.model.trim()) out.model = o.model.trim();
   if (typeof o.conductorModel === "string" && o.conductorModel.trim()) out.conductorModel = o.conductorModel.trim();
@@ -610,6 +716,28 @@ function sanitizeOptions(raw: unknown): Partial<RunOptions> {
     out.resolutionDate = o.resolutionDate;
   }
   num("panelSize", 3, 11);
+  // Forecast tunables — same ranges as coerceConfigValue (config.ts) so a per-run
+  // override is clamped identically to the global default it overrides.
+  flt("forecastExtremizeK", 1, 4);
+  flt("forecastMarketWeight", 0, 1);
+  flt("forecastSportsMarketWeight", 0, 1);
+  num("forecastMaxSubQuestions", 1, 8);
+  bool("forecastDecompose");
+  bool("forecastCoherenceProbe");
+  bool("forecastSimulate");
+  bool("forecastSingle");
+  if (DOMAIN_IDS.includes(o.domainPack as DomainId)) out.domainPack = o.domainPack as DomainId;
+  if (typeof o.forecastModelId === "string" && o.forecastModelId.trim()) {
+    out.forecastModelId = o.forecastModelId.trim().slice(0, 64);
+  }
+  if (o.forecastOverrides && typeof o.forecastOverrides === "object") {
+    const f = o.forecastOverrides as Record<string, unknown>;
+    const ov: ForecastOverrideFlags = {};
+    if (typeof f.extremizeK === "boolean") ov.extremizeK = f.extremizeK;
+    if (typeof f.marketWeight === "boolean") ov.marketWeight = f.marketWeight;
+    if (typeof f.sportsMarketWeight === "boolean") ov.sportsMarketWeight = f.sportsMarketWeight;
+    out.forecastOverrides = ov;
+  }
   return out;
 }
 

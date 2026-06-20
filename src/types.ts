@@ -65,6 +65,17 @@ export interface ForecastQuestion {
    * aggregation anchors to it, and the keys the /scores resolver needs.
    */
   sports?: SportsMeta;
+  /**
+   * The domain pack that planned this question. Persisted on the question (not
+   * just the run) so a resumed run and the resolver still know the domain.
+   */
+  domain?: DomainId;
+  /**
+   * Normalized reference-class key the resolved outcome is filed under (e.g.
+   * "infra_project_schedule_slip"), so future forecasts can read a COUNTED base
+   * rate from accumulated history instead of an LLM guess. Set by the pack.
+   */
+  refClass?: string;
 }
 
 /** A sportsbook line snapshot — the values relevant to a game's three facets, and when it was taken. */
@@ -358,6 +369,58 @@ export type ReasoningEffort = "low" | "medium" | "high" | "max";
 /** Where sandboxed runs execute (resolved from config at launch). */
 export type SandboxRuntimeKind = "host" | "docker" | "e2b" | "modal" | "vercel";
 
+/**
+ * The forecasting domains a "domain pack" can register under. Each pack owns the
+ * intent match, decomposition, data-grounded model, anchoring, and (where exact
+ * ground truth exists) auto-resolution for its domain. Absent on a ledger entry
+ * means the generic panel+research path produced it. The runtime list and the
+ * union type are kept in sync (the const is the single source of truth).
+ */
+export const DOMAIN_IDS = [
+  "sports",
+  "finance",
+  "construction",
+  "macro",
+  "elections",
+  "business",
+] as const;
+export type DomainId = (typeof DOMAIN_IDS)[number];
+
+/**
+ * Which forecast knobs the operator pinned by hand this run. A flag here flips
+ * the precedence from "the ledger-learned value wins" to "this exact value
+ * wins" — only the three knobs that HAVE a learned chooser need a flag.
+ */
+export interface ForecastOverrideFlags {
+  extremizeK?: boolean;
+  marketWeight?: boolean;
+  sportsMarketWeight?: boolean;
+}
+
+/**
+ * A snapshot of the out-of-fold statistical fit the engine learns from the
+ * resolved ledger — the genuine "fitted artifact" a saved model can FREEZE and
+ * reuse. Computed by snapshotFittedParams (forecast.ts) from the per-domain (or
+ * global) record. A frozen snapshot makes a model reproducible and shareable;
+ * a "live" model re-fits these from the ledger every run (the default flywheel).
+ */
+export interface FittedParams {
+  domain?: DomainId;
+  /** Logistic recalibration (a·logit(p)+b) + the resolution count it was fit on; null when too few binary resolutions. */
+  recalibration: { a: number; b: number; n: number } | null;
+  extremizeK: number;
+  marketWeight: number;
+  sportsMarketWeight: number;
+  quantileDilation: number;
+  /** Resolutions the dilation factor was fit on (so a frozen run reports an honest n). */
+  quantileDilationN: number;
+  methodWeights: Record<string, number>;
+  /** In-domain resolved forecasts at snapshot time (informational; individual learners back off to the global pool below their own thresholds). */
+  fitN: number;
+  /** When the snapshot was taken (ms). */
+  fitAt: number;
+}
+
 export interface RunOptions {
   model: string;
   conductorModel: string;
@@ -384,11 +447,69 @@ export interface RunOptions {
   forecastSingle?: boolean;
   /** Forecast mode: force the scenario-simulation stage on (it also auto-triggers on decomposable questions). */
   forecastSimulate?: boolean;
+  /** Forecast: per-run extremization-k override. Undefined → cfg default, still beaten by the learned chooser unless pinned via forecastOverrides. */
+  forecastExtremizeK?: number;
+  /** Forecast: per-run market-anchor base weight. Undefined → cfg.forecastMarketWeight. */
+  forecastMarketWeight?: number;
+  /** Forecast: per-run sportsbook-line base weight. Undefined → cfg.forecastSportsMarketWeight. */
+  forecastSportsMarketWeight?: number;
+  /** Forecast: per-run decompose toggle. Undefined → cfg.forecastDecompose. */
+  forecastDecompose?: boolean;
+  /** Forecast: per-run sub-forecast cap. Undefined → cfg.forecastMaxSubQuestions. */
+  forecastMaxSubQuestions?: number;
+  /** Forecast: per-run coherence-probe toggle. Undefined → cfg.forecastCoherenceProbe. */
+  forecastCoherenceProbe?: boolean;
+  /** Forecast: which of k / market weight / sports weight the operator pinned (learned chooser bypassed for those). */
+  forecastOverrides?: ForecastOverrideFlags;
+  /** Forecast: domain pack chosen for this run (auto-detected or operator-picked). Recorded for reproducibility. */
+  domainPack?: DomainId;
+  /** Forecast: the saved-model id this run instantiated, for provenance + track-record linking. */
+  forecastModelId?: string;
   verification: Verification;
   thinking: boolean;
   reasoningEffort: ReasoningEffort;
   safeMode: boolean;
   sandboxRuntime: SandboxRuntimeKind;
+}
+
+/**
+ * A saved, reusable prediction "model": a named bundle of forecast settings the
+ * operator can re-apply to a new question, plus (optionally) a FROZEN fitted-
+ * parameter artifact so the run is reproducible/shareable. The track record is
+ * derived by joining the ledger on modelId — never stored here.
+ */
+export interface ForecastModel {
+  id: string;
+  name: string;
+  /** Domain pack this model targets; undefined = auto-detect each run. */
+  domain?: DomainId;
+  /** The tunable overrides this model pins (each maps onto a RunOptions field). */
+  tunables: Partial<{
+    panelSize: number;
+    extremizeK: number;
+    marketWeight: number;
+    sportsMarketWeight: number;
+    decompose: boolean;
+    maxSubQuestions: number;
+    coherenceProbe: boolean;
+    simulate: boolean;
+    overrides: ForecastOverrideFlags;
+  }>;
+  /** "live" re-fits parameters from the ledger each run; "frozen" uses the snapshot verbatim. */
+  fitMode: "live" | "frozen";
+  /** The frozen fitted artifact (present when fitMode === "frozen"). */
+  fitted?: FittedParams;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** A saved model's derived track record (calibration over its ledger rows). */
+export interface ModelRecord {
+  n: number;
+  resolved: number;
+  brierMean?: number;
+  /** Mean (model Brier − market-at-create Brier); negative = the model beat the market. */
+  vsMarket?: number;
 }
 
 export interface RunMeta {

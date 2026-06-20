@@ -3,9 +3,20 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
-import { api, PublicConfig } from "@/lib/api";
+import { api, PublicConfig, DomainDetection, ForecastModelView } from "@/lib/api";
 import { fmtTokens } from "@/lib/format";
 import { Spinner } from "./atoms";
+
+/** Which forecast knobs to surface per domain (mirrors each pack's declared knobs). */
+const KNOBS_BY_DOMAIN: Record<string, string[]> = {
+  sports: ["panelSize", "sportsMarketWeight", "simulate"],
+  finance: ["panelSize", "marketWeight", "extremizeK", "simulate"],
+  macro: ["panelSize", "marketWeight", "extremizeK", "decompose", "maxSubQuestions"],
+  elections: ["panelSize", "marketWeight", "extremizeK", "coherenceProbe"],
+  construction: ["panelSize", "decompose", "maxSubQuestions", "simulate"],
+  business: ["panelSize", "extremizeK", "decompose", "maxSubQuestions", "marketWeight"],
+  generic: ["panelSize", "marketWeight", "extremizeK", "decompose", "coherenceProbe", "simulate", "maxSubQuestions"],
+};
 
 const EXAMPLES = [
   ["Research", "Research the top 5 open-source vector databases in 2026 and produce a comparison table with a recommendation for a RAG app at 10M vectors."],
@@ -56,6 +67,22 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
   const [resolutionDate, setResolutionDate] = useState("");
   const [panelSize, setPanelSize] = useState(5);
 
+  // Forecast intent + saved models + per-run tunables.
+  const [savedModels, setSavedModels] = useState<ForecastModelView[]>([]);
+  const [modelId, setModelId] = useState("");
+  const [detected, setDetected] = useState<DomainDetection | null>(null);
+  const [domainOverride, setDomainOverride] = useState("");
+  const [fc, setFc] = useState({ extremizeK: 2.5, marketWeight: 0.4, sportsMarketWeight: 0.75, decompose: true, maxSubQuestions: 6, coherenceProbe: true, simulate: false });
+  const [fcTouched, setFcTouched] = useState<Record<string, boolean>>({});
+  const detectSeq = useRef(0);
+
+  const effectiveDomain = domainOverride || detected?.domain || "generic";
+  const relevantKnobs =
+    effectiveDomain === detected?.domain && detected?.relevantKnobs?.length
+      ? detected.relevantKnobs
+      : KNOBS_BY_DOMAIN[effectiveDomain] ?? KNOBS_BY_DOMAIN.generic;
+  const markFc = (k: string) => setFcTouched((t) => ({ ...t, [k]: true }));
+
   // Config arrives async; adopt its defaults unless the operator already
   // touched the options (useState initializers only run on first render).
   const touched = useRef(false);
@@ -69,7 +96,65 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
     setModel(config.model);
     setEffort(config.reasoningEffort);
     if (config.forecastPanelSize) setPanelSize(config.forecastPanelSize);
+    setFc({
+      extremizeK: config.forecastExtremizeK ?? 2.5,
+      marketWeight: config.forecastMarketWeight ?? 0.4,
+      sportsMarketWeight: config.forecastSportsMarketWeight ?? 0.75,
+      decompose: config.forecastDecompose ?? true,
+      maxSubQuestions: config.forecastMaxSubQuestions ?? 6,
+      coherenceProbe: config.forecastCoherenceProbe ?? true,
+      simulate: config.forecastSimulate ?? false,
+    });
   }, [config]);
+
+  // Load saved models once (forecast picker).
+  useEffect(() => {
+    api.forecastModels().then((r) => setSavedModels(r.models)).catch(() => {});
+  }, []);
+
+  // Debounced domain detection while typing a forecast question (race-guarded).
+  useEffect(() => {
+    if (mode !== "forecast" || !mission.trim()) {
+      setDetected(null);
+      return;
+    }
+    const seq = ++detectSeq.current;
+    const t = setTimeout(() => {
+      api
+        .detectDomain(mission.trim())
+        .then((d) => {
+          if (seq === detectSeq.current) setDetected(d);
+        })
+        .catch(() => {});
+    }, 500);
+    return () => clearTimeout(t);
+  }, [mission, mode]);
+
+  const applyModel = (m: ForecastModelView) => {
+    touched.current = true;
+    setModelId(m.id);
+    // An auto-detect model (no domain) must CLEAR any stale manual override,
+    // else effectiveDomain stays pinned to the old pick.
+    setDomainOverride(m.domain ?? "");
+    const t = m.tunables as Record<string, unknown>;
+    if (typeof t.panelSize === "number") setPanelSize(t.panelSize);
+    setFc((prev) => ({
+      extremizeK: typeof t.extremizeK === "number" ? t.extremizeK : prev.extremizeK,
+      marketWeight: typeof t.marketWeight === "number" ? t.marketWeight : prev.marketWeight,
+      sportsMarketWeight: typeof t.sportsMarketWeight === "number" ? t.sportsMarketWeight : prev.sportsMarketWeight,
+      decompose: typeof t.decompose === "boolean" ? t.decompose : prev.decompose,
+      maxSubQuestions: typeof t.maxSubQuestions === "number" ? t.maxSubQuestions : prev.maxSubQuestions,
+      coherenceProbe: typeof t.coherenceProbe === "boolean" ? t.coherenceProbe : prev.coherenceProbe,
+      simulate: typeof t.simulate === "boolean" ? t.simulate : prev.simulate,
+    }));
+    // Only mark recognized knobs as touched (panelSize is sent unconditionally;
+    // `overrides` is not a knob) so the launch payload + reset-button logic stay honest.
+    const nt: Record<string, boolean> = {};
+    for (const k of ["extremizeK", "marketWeight", "sportsMarketWeight", "decompose", "maxSubQuestions", "coherenceProbe", "simulate"]) {
+      if (k in t) nt[k] = true;
+    }
+    setFcTouched(nt);
+  };
 
   const noKey = config ? !config.apiKeySet : false;
   const needsCwd = workspace === "dir" && !cwd.trim();
@@ -124,8 +209,26 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
           model,
           reasoningEffort: effort,
           mode,
-          ...(mode === "forecast" && resolutionDate ? { resolutionDate } : {}),
-          ...(mode === "forecast" ? { panelSize: clamp(panelSize, 3, 11, 5) } : {}),
+          ...(mode === "forecast"
+            ? {
+                ...(resolutionDate ? { resolutionDate } : {}),
+                panelSize: clamp(panelSize, 3, 11, 5),
+                ...(effectiveDomain !== "generic" ? { domainPack: effectiveDomain } : {}),
+                ...(modelId ? { forecastModelId: modelId } : {}),
+                ...(fcTouched.extremizeK ? { forecastExtremizeK: fc.extremizeK } : {}),
+                ...(fcTouched.marketWeight ? { forecastMarketWeight: fc.marketWeight } : {}),
+                ...(fcTouched.sportsMarketWeight ? { forecastSportsMarketWeight: fc.sportsMarketWeight } : {}),
+                ...(fcTouched.decompose ? { forecastDecompose: fc.decompose } : {}),
+                ...(fcTouched.maxSubQuestions ? { forecastMaxSubQuestions: fc.maxSubQuestions } : {}),
+                ...(fcTouched.coherenceProbe ? { forecastCoherenceProbe: fc.coherenceProbe } : {}),
+                ...(fcTouched.simulate ? { forecastSimulate: fc.simulate } : {}),
+                forecastOverrides: {
+                  extremizeK: !!fcTouched.extremizeK,
+                  marketWeight: !!fcTouched.marketWeight,
+                  sportsMarketWeight: !!fcTouched.sportsMarketWeight,
+                },
+              }
+            : {}),
         },
       });
       router.push(`/run?id=${id}`);
@@ -172,25 +275,18 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
       />
 
       {mode === "forecast" && (
-        <div className="grid grid-cols-2 gap-3 mt-3">
-          <Field label="Resolution date" hint="optional — inferred if blank">
-            <input
-              type="date"
-              className="input"
-              value={resolutionDate}
-              onChange={(e) => setResolutionDate(e.target.value)}
-            />
-          </Field>
-          <Field label="Forecaster panel" hint="independent panelists">
-            <input
-              type="number"
-              className="input"
-              min={3}
-              max={11}
-              value={panelSize}
-              onChange={(e) => setPanelSize(+e.target.value)}
-            />
-          </Field>
+        <div className="flex flex-wrap items-center gap-2 mt-3">
+          <DomainPicker detected={detected} override={domainOverride} onChange={(d) => { setDomainOverride(d); markTouched(); }} />
+          <ModelPicker
+            models={savedModels}
+            value={modelId}
+            onPick={(id) => {
+              if (!id) { setModelId(""); return; }
+              const m = savedModels.find((x) => x.id === id);
+              if (m) applyModel(m);
+            }}
+          />
+          <span className="text-2xs text-ink-faint">model & settings tune automatically — open Options to adjust</span>
         </div>
       )}
 
@@ -228,6 +324,73 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
       <div className="collapse-v" data-open={advanced}>
         <div inert={!advanced}>
         <div className="mt-4 pt-4 space-y-4 border-t border-border-soft">
+          {mode === "forecast" && (
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <span className="text-2xs text-ink-faint">Forecast tuning</span>
+                <span className="chip text-ink">{effectiveDomain}</span>
+                {Object.keys(fcTouched).some((k) => fcTouched[k]) && (
+                  <button className="btn btn-ghost btn-sm" onClick={() => { setFcTouched({}); markTouched(); }}>
+                    reset to domain defaults
+                  </button>
+                )}
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <Field label="Resolution date" hint="inferred if blank">
+                  <input type="date" className="input" value={resolutionDate} onChange={(e) => { markTouched(); setResolutionDate(e.target.value); }} />
+                </Field>
+                {relevantKnobs.includes("panelSize") && (
+                  <Field label="Forecaster panel" hint="independent panelists">
+                    <input type="number" className="input" min={3} max={11} value={panelSize} onChange={(e) => { markTouched(); setPanelSize(+e.target.value); }} />
+                  </Field>
+                )}
+                {relevantKnobs.includes("extremizeK") && (
+                  <Field label="Extremize k" hint="confidence sharpening">
+                    <input type="number" className="input" min={1} max={4} step={0.1} value={fc.extremizeK} onChange={(e) => { markFc("extremizeK"); setFc((f) => ({ ...f, extremizeK: +e.target.value })); }} />
+                  </Field>
+                )}
+                {relevantKnobs.includes("marketWeight") && (
+                  <Field label="Market weight" hint="pull toward markets">
+                    <input type="number" className="input" min={0} max={1} step={0.05} value={fc.marketWeight} onChange={(e) => { markFc("marketWeight"); setFc((f) => ({ ...f, marketWeight: +e.target.value })); }} />
+                  </Field>
+                )}
+                {relevantKnobs.includes("sportsMarketWeight") && (
+                  <Field label="Sports line weight" hint="pull toward the book">
+                    <input type="number" className="input" min={0} max={1} step={0.05} value={fc.sportsMarketWeight} onChange={(e) => { markFc("sportsMarketWeight"); setFc((f) => ({ ...f, sportsMarketWeight: +e.target.value })); }} />
+                  </Field>
+                )}
+                {relevantKnobs.includes("maxSubQuestions") && (
+                  <Field label="Max sub-forecasts" hint="decomposition width">
+                    <input type="number" className="input" min={1} max={8} value={fc.maxSubQuestions} onChange={(e) => { markFc("maxSubQuestions"); setFc((f) => ({ ...f, maxSubQuestions: +e.target.value })); }} />
+                  </Field>
+                )}
+                {relevantKnobs.includes("decompose") && (
+                  <Field label="Decompose" hint="split into sub-forecasts">
+                    <select className="input" value={fc.decompose ? "yes" : "no"} onChange={(e) => { markFc("decompose"); setFc((f) => ({ ...f, decompose: e.target.value === "yes" })); }}>
+                      <option value="yes">yes</option>
+                      <option value="no">no — single question</option>
+                    </select>
+                  </Field>
+                )}
+                {relevantKnobs.includes("coherenceProbe") && (
+                  <Field label="Coherence probe" hint="inverted-framing check">
+                    <select className="input" value={fc.coherenceProbe ? "yes" : "no"} onChange={(e) => { markFc("coherenceProbe"); setFc((f) => ({ ...f, coherenceProbe: e.target.value === "yes" })); }}>
+                      <option value="yes">yes</option>
+                      <option value="no">no</option>
+                    </select>
+                  </Field>
+                )}
+                {relevantKnobs.includes("simulate") && (
+                  <Field label="Scenario simulation" hint="Monte Carlo cross-check">
+                    <select className="input" value={fc.simulate ? "yes" : "no"} onChange={(e) => { markFc("simulate"); setFc((f) => ({ ...f, simulate: e.target.value === "yes" })); }}>
+                      <option value="no">auto</option>
+                      <option value="yes">force on</option>
+                    </select>
+                  </Field>
+                )}
+              </div>
+            </div>
+          )}
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="text-2xs text-ink-faint mr-1">Size</span>
             <PresetChip active={preset === "quick"} onClick={() => applyPreset(QUICK)} title="4 agents · 16 tasks · small budget · no verification">
@@ -414,6 +577,55 @@ function FolderBrowser({ cwd, onPick, onClose }: { cwd: string; onPick: (p: stri
         </div>
       )}
     </div>
+  );
+}
+
+/** Auto-detected domain chip with an override dropdown. */
+function DomainPicker({ detected, override, onChange }: { detected: DomainDetection | null; override: string; onChange: (d: string) => void }) {
+  // Exclude the detected domain (it's the value="" auto option) and any
+  // "generic" entry (rendered once below) so nothing appears twice.
+  const alts = (detected?.alternatives ?? []).filter((a) => a.domain !== detected?.domain && a.domain !== "generic");
+  const current = override || detected?.domain || "";
+  const detLabel = detected && detected.domain !== "generic" ? `${detected.label}${override ? "" : " · auto"}` : "General";
+  return (
+    <label className="flex items-center gap-1.5" title="Detected forecasting domain — override if it's wrong">
+      <span className="text-2xs text-ink-faint" aria-hidden="true">🎯</span>
+      <select
+        className="input !py-1 !text-xs !w-auto"
+        aria-label="Forecast domain"
+        value={current}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        <option value="">{detLabel}</option>
+        {alts.map((a) => (
+          <option key={a.domain} value={a.domain}>
+            {a.label}
+          </option>
+        ))}
+        {detected?.domain !== "generic" && <option value="generic">General</option>}
+      </select>
+    </label>
+  );
+}
+
+/** Saved-model picker — "Auto" or a named reusable model with its track record. */
+function ModelPicker({ models, value, onPick }: { models: ForecastModelView[]; value: string; onPick: (id: string) => void }) {
+  return (
+    <label className="flex items-center gap-1.5" title="Apply a saved prediction model (settings + frozen fit)">
+      <span className="text-2xs text-ink-faint" aria-hidden="true">⚙</span>
+      <select className="input !py-1 !text-xs !w-auto" aria-label="Saved prediction model" value={value} onChange={(e) => onPick(e.target.value)}>
+        <option value="">Auto · no saved model</option>
+        {models.map((m) => {
+          const rec = m.record;
+          const tail = rec?.resolved ? ` · ${rec.resolved} resolved${typeof rec.brierMean === "number" ? ` · Brier ${rec.brierMean.toFixed(2)}` : ""}` : "";
+          return (
+            <option key={m.id} value={m.id}>
+              {m.name}{m.domain ? ` (${m.domain})` : ""}{m.fitMode === "frozen" ? " ❄" : ""}{tail}
+            </option>
+          );
+        })}
+      </select>
+    </label>
   );
 }
 

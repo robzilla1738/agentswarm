@@ -66,7 +66,6 @@ import {
   chooseSportsMarketWeight,
   clampProb,
   clampMarketProb,
-  classifySportsMission,
   daysToIso,
   evidenceOverlap,
   extractMethodLabel,
@@ -88,20 +87,22 @@ import {
   parseQuestionJson,
   parseSimStructure,
   scaleK,
-  sportsSigma,
   sportsWinnerMarket,
   TIMING_KINDS,
   validateForecastAnalytics,
   validateSimStructure,
 } from "./forecast";
-import { MarketHit, marketOdds, sportsbookLines, sportsDayIso } from "./datatools";
+import { MarketHit, marketOdds } from "./datatools";
 import { runSimulation } from "./simulation";
+import { detectDomain, packById } from "./domains/registry";
+import type { DomainCtx, IntentMatch } from "./domains/pack";
+import { getModel } from "./models";
 import { appendMemory, memoryBlock } from "./memory";
 import { canonicalizeUrl } from "./searchcore";
 import { aggregateSources, renderFinalHtml, sourcesBlock } from "./report";
 import { SandboxRuntime, createSandbox } from "./sandbox";
 import { RunState } from "./state";
-import { AggregateForecast, Forecast, ForecastQuestion, MarketAnchor, RunMeta, RunStatus, SimDriver, SourceRef, SportsLineSnapshot, Task, TaskSpec, Usage, usageCost } from "./types";
+import { AggregateForecast, DomainId, FittedParams, Forecast, ForecastQuestion, MarketAnchor, RunMeta, RunStatus, SimDriver, SourceRef, Task, TaskSpec, Usage, usageCost } from "./types";
 import { canonicalArtifactRel, clip, ensureDir, errMsg, oneLine, rid, sleep, truncateMiddle, validateArtifactFormat, withTimeout } from "./util";
 
 
@@ -195,6 +196,8 @@ export class Executor {
    * 2-6 when an open question decomposes), set before the conductor seeds.
    */
   private questions: ForecastQuestion[] = [];
+  /** Forecast mode: the domain pack that claimed this mission (null = generic path). Set at plan time. */
+  private domainMatch: IntentMatch | null = null;
   /** Forecast mode: the framing the sub-forecasts together answer (open questions). */
   private forecastBrief = "";
   /** Forecast mode: mechanical panel aggregates, keyed by question id, computed at synthesis. */
@@ -297,6 +300,12 @@ export class Executor {
     // aggregated).
     this.questions = state.questions.length ? state.questions : state.question ? [state.question] : [];
     this.forecastBrief = state.forecastBrief;
+    // Rehydrate the domain pack so per-domain learning, data-grounded drivers,
+    // the ledger domain stamp, and pack resolution survive a resume — without it
+    // a resumed non-sports forecast silently reverts to the generic path.
+    if (state.domainPack && packById(state.domainPack as DomainId)) {
+      this.domainMatch = { pack: state.domainPack as DomainId, confidence: 1, source: "operator" };
+    }
     for (const a of state.aggregates) this.aggregates.set(a.questionId, a.aggregate);
     for (const q of this.questions) {
       if (q.id && this.aggregates.has(q.id)) this.panelTasksByQ.set(q.id, this.panelFromTasks(q.id));
@@ -571,6 +580,111 @@ export class Executor {
     return Math.min(11, Math.max(3, Math.round(n)));
   }
 
+  // ---- forecast tunable precedence: per-run option → cfg default. For the
+  // three knobs that have a ledger-learned chooser, the learned value wins
+  // UNLESS the operator pinned it (forecastOverrides) — preserving the engine's
+  // "learned beats configured" discipline while making every run reproducible.
+  private fcDecompose(): boolean {
+    return this.meta.options.forecastDecompose ?? this.cfg.forecastDecompose;
+  }
+  private fcMaxSubQuestions(): number {
+    return Math.max(1, this.meta.options.forecastMaxSubQuestions ?? this.cfg.forecastMaxSubQuestions ?? 6);
+  }
+  private fcCoherenceProbe(): boolean {
+    return this.meta.options.forecastCoherenceProbe ?? this.cfg.forecastCoherenceProbe;
+  }
+  private fcSimulate(): boolean {
+    return this.meta.options.forecastSimulate ?? this.cfg.forecastSimulate;
+  }
+  /**
+   * The frozen fitted artifact of the active saved model, if any. A "frozen"
+   * model reuses a captured statistical fit verbatim — reproducible and beating
+   * the live learners (but never an explicit per-run override). Cached per run.
+   */
+  private _frozenFitted: FittedParams | null | undefined;
+  private frozenFitted(): FittedParams | null {
+    if (this._frozenFitted !== undefined) return this._frozenFitted;
+    const id = this.meta.options.forecastModelId;
+    if (!id) return (this._frozenFitted = null);
+    try {
+      const m = getModel(id);
+      this._frozenFitted = m && m.fitMode === "frozen" && m.fitted ? m.fitted : null;
+    } catch {
+      this._frozenFitted = null;
+    }
+    return this._frozenFitted;
+  }
+
+  private fcExtremizeK(ledger: ReturnType<typeof loadLedger>, domain?: DomainId): number {
+    const base = this.meta.options.forecastExtremizeK ?? this.cfg.forecastExtremizeK;
+    if (this.meta.options.forecastOverrides?.extremizeK) return base;
+    const fz = this.frozenFitted();
+    if (fz) return fz.extremizeK;
+    try {
+      return chooseExtremizeK(ledger, base, domain);
+    } catch {
+      return base;
+    }
+  }
+  private fcMarketWeight(ledger: ReturnType<typeof loadLedger>, domain?: DomainId): number {
+    const base = this.meta.options.forecastMarketWeight ?? this.cfg.forecastMarketWeight;
+    if (this.meta.options.forecastOverrides?.marketWeight) return base;
+    const fz = this.frozenFitted();
+    if (fz) return fz.marketWeight;
+    try {
+      return chooseMarketWeight(ledger, base, domain);
+    } catch {
+      return base;
+    }
+  }
+  private fcSportsMarketWeight(ledger: ReturnType<typeof loadLedger>, domain?: DomainId): number {
+    const base = this.meta.options.forecastSportsMarketWeight ?? this.cfg.forecastSportsMarketWeight;
+    if (this.meta.options.forecastOverrides?.sportsMarketWeight) return base;
+    const fz = this.frozenFitted();
+    if (fz) return fz.sportsMarketWeight;
+    try {
+      return chooseSportsMarketWeight(ledger, base, domain);
+    } catch {
+      return base;
+    }
+  }
+
+  /** The domain key for this forecast (q.sports keeps a resumed sports run keyed correctly). */
+  private forecastDomain(q?: ForecastQuestion): DomainId | undefined {
+    return this.domainMatch?.pack ?? (q?.sports ? "sports" : undefined);
+  }
+
+  /** Read-only context for the domain-pack hooks (registry detection, plan, etc.). */
+  private domainCtx(): DomainCtx {
+    return {
+      cfg: this.cfg,
+      mission: this.meta.mission,
+      today: new Date(this.meta.createdAt).toISOString().slice(0, 10),
+      operatorDate: this.meta.options.resolutionDate,
+      single: Boolean(this.meta.options.forecastSingle),
+      decompose: this.fcDecompose(),
+      maxSubQuestions: this.fcMaxSubQuestions(),
+      signal: this.ac.signal,
+      ask: async (prompt: string, maxTokens: number) => {
+        // Cheap tier — domain classification / milestone decomposition are
+        // mechanical, matching the other cheap-model sub-tasks (sim structure,
+        // coherence probe, market same-question check).
+        const model = this.cfg.cheapModel || this.meta.options.model;
+        const res = await chat(this.cfg, {
+          model,
+          priority: "high",
+          messages: [{ role: "user", content: prompt }],
+          thinking: false,
+          maxTokens,
+          signal: this.ac.signal,
+        });
+        this.onUsage(model, res.usage);
+        return res.content || "";
+      },
+      log: (level, msg) => this.journal.append("log", { level, msg }),
+    };
+  }
+
   /** calibrationBlock reads the ledger from disk — a corrupt file must never kill a run. */
   private safeCalibrationBlock(): string {
     try {
@@ -593,7 +707,9 @@ export class Executor {
     const commit = (qs: ForecastQuestion[], brief: string) => {
       this.questions = qs.map((q, i) => ({ ...q, id: q.id ?? `sf${i + 1}` }));
       this.forecastBrief = brief;
-      this.journal.append("forecast.plan", { brief, questions: this.questions });
+      // Carry the domain so a resumed run rehydrates domainMatch (and thus
+      // per-domain learning + data-grounded drivers); the reducer restores it.
+      this.journal.append("forecast.plan", { brief, questions: this.questions, domain: this.domainMatch?.pack ?? null });
       // Per-question events keep the primary-question state path working.
       for (const q of this.questions) this.journal.append("forecast.question", { question: q });
       // Human-readable echo so a detached run surfaces its interpretation in
@@ -604,6 +720,24 @@ export class Executor {
             this.questions.map((q) => `  • [${q.id}] (${q.kind}, by ${q.resolutionDate}) ${oneLine(q.text, 110)}`).join("\n")
           : `forecasting: ${oneLine(this.questions[0]?.text ?? "", 140)} (${this.questions[0]?.kind}, resolves ${this.questions[0]?.resolutionDate})`;
       this.journal.append("log", { level: "info", msg: echo });
+      // A durable receipt of the run's settings. The toggles + domain are the
+      // EFFECTIVE values; the three *Base weights are the configured inputs
+      // BEFORE frozen/ledger learning (the actual learned values land per
+      // sub-forecast in the forecast.aggregated/ledger records). Ignored by the
+      // state reducer — purely a receipt for the UI/operator.
+      this.journal.append("forecast.config", {
+        domain: this.domainMatch?.pack ?? null,
+        panelSize: this.panelSize(),
+        decompose: this.fcDecompose(),
+        maxSubQuestions: this.fcMaxSubQuestions(),
+        coherenceProbe: this.fcCoherenceProbe(),
+        simulate: this.fcSimulate(),
+        extremizeKBase: this.meta.options.forecastExtremizeK ?? this.cfg.forecastExtremizeK,
+        marketWeightBase: this.meta.options.forecastMarketWeight ?? this.cfg.forecastMarketWeight,
+        sportsMarketWeightBase: this.meta.options.forecastSportsMarketWeight ?? this.cfg.forecastSportsMarketWeight,
+        overrides: this.meta.options.forecastOverrides ?? {},
+        modelId: this.meta.options.forecastModelId ?? null,
+      });
     };
 
     // Tournament imports arrive already sharp (the platform wrote the precise
@@ -614,28 +748,42 @@ export class Executor {
       return;
     }
 
-    // Sports games: if the mission names both teams of a real upcoming game, the
-    // engine OWNS the decomposition — winner / total / margin, each anchored to
-    // the sharp betting line and resolvable from the official box score. An
-    // exact final score is not a single resolvable quantity, so we never forecast
-    // it; these three are. Deterministic (no reliance on the LLM emitting the
-    // right shape). Tournament imports keep their own sharp question.
+    // Domain packs: if a registered domain claims the mission, it OWNS the
+    // decomposition — e.g. sports → winner/total/margin, each anchored to the
+    // sharp betting line and resolvable from the box score. Deterministic
+    // matchers run first (free); the generic planner below is the fallback for
+    // any mission no pack claims, so this never regresses the open-ended path.
+    // Tournament imports keep their own sharp question (origin set).
     if (!this.meta.options.forecastOrigin) {
       try {
-        const facets = await this.planSportsGame();
-        if (facets) {
-          commit(facets, "head-to-head game — winner, total points, and margin of victory, each anchored to the sportsbook line");
-          return;
+        const ctx = this.domainCtx();
+        // An operator/UI domain pick wins over auto-detection; otherwise detect.
+        const picked = this.meta.options.domainPack;
+        const match: IntentMatch | null =
+          picked && packById(picked)
+            ? { pack: picked, confidence: 1, source: "operator" }
+            : await detectDomain(ctx);
+        if (match) {
+          this.domainMatch = match;
+          const pack = packById(match.pack);
+          const planned = await pack?.plan?.(ctx, match);
+          if (planned && planned.questions.length) {
+            commit(planned.questions, planned.brief);
+            return;
+          }
+          // Pack matched but declined to decompose (e.g. no upcoming game / no
+          // API key): keep the match for the aggregation/sim/resolve seams and
+          // fall through to the generic planner.
         }
       } catch (e) {
-        this.journal.append("log", { level: "info", msg: `sports decomposition skipped: ${errMsg(e)}` });
+        this.journal.append("log", { level: "info", msg: `domain decomposition skipped: ${errMsg(e)}` });
       }
     }
 
     const today = new Date(this.meta.createdAt).toISOString().slice(0, 10);
     const operatorDate = this.meta.options.resolutionDate;
-    const maxN = Math.max(1, this.cfg.forecastMaxSubQuestions ?? 6);
-    const decompose = this.cfg.forecastDecompose && !this.meta.options.forecastSingle;
+    const maxN = this.fcMaxSubQuestions();
+    const decompose = this.fcDecompose() && !this.meta.options.forecastSingle;
     // A "when will X happen" mission must be forecast as TIMING (date/numeric).
     // The planner on a small model sometimes swaps it for a "which party" (mc)
     // or "will it" (binary) question — a different quantity entirely. Detect it
@@ -738,85 +886,6 @@ export class Executor {
       });
     }
     commit([parsed], "");
-  }
-
-  /**
-   * If the mission names both teams of a real upcoming game, build the three
-   * resolvable, market-benchmarked facets — winner (mc), total points, and
-   * favorite margin (numeric) — each stamped with the matched sportsbook line
-   * (lineAtCreate) and the keys the /scores resolver needs. Returns null when
-   * no key is set or no game matches (the normal planner then runs).
-   */
-  private async planSportsGame(): Promise<ForecastQuestion[] | null> {
-    if (!this.cfg.oddsApiKey) return null;
-    // Classify the mission (also the cheap gate before spending an Odds API
-    // credit): null → not a clean winner/total/margin game question, leave it to
-    // the normal planner so the forecast target is never silently rewritten.
-    const ask = classifySportsMission(this.meta.mission);
-    if (!ask) return null;
-    // Match on the game date FROM THE MISSION TEXT, not the --by resolution
-    // deadline (which can be later than the game). sportsbookLines parses the
-    // date out of the mission query itself.
-    const line = await sportsbookLines(this.cfg, this.meta.mission, { signal: this.ac.signal });
-    if (!line) return null;
-    const { home, away, sportTitle, sportKey, eventId, commence } = line;
-    // Label with the game's LOCAL sports day (what the user asked for), not the
-    // raw UTC date — a US night game tipping after UTC midnight still reads as
-    // its local date. The resolution deadline is end-of-day UTC; a game that
-    // finishes after that simply stays open one extra resolve cycle (the /scores
-    // resolver returns null until it's final).
-    const resolutionDate = sportsDayIso(Date.parse(commence), sportKey);
-    const favorite: "home" | "away" =
-      line.spread?.favorite ?? (line.h2h && line.h2h.pAway > line.h2h.pHome ? "away" : "home");
-    const favName = favorite === "home" ? home : away;
-    const dogName = favorite === "home" ? away : home;
-    // 3-way books (soccer and the like) price a Draw — the winner facet must
-    // include it as an option, or a level final score voids instead of resolving.
-    const threeWay = typeof line.h2h?.pDraw === "number";
-    const lineAtCreate: SportsLineSnapshot = {
-      t: Date.now(),
-      ...(line.h2h ? { pHome: line.h2h.pHome } : {}),
-      ...(threeWay ? { pDraw: line.h2h!.pDraw, pAway: line.h2h!.pAway } : {}),
-      ...(line.spread ? { spread: line.spread.line } : {}),
-      ...(line.total ? { total: line.total.line } : {}),
-    };
-    const base = { sportKey, eventId, sportTitle, home, away, commence, favorite, lineAtCreate };
-    const matchup = `${away} @ ${home} on ${resolutionDate}`;
-    const winner: ForecastQuestion = {
-      text: `Who wins ${matchup}: ${home}, ${away}${threeWay ? ", or a draw" : ""}?`,
-      kind: "mc",
-      options: threeWay ? [home, "Draw", away] : [home, away],
-      resolutionCriteria: threeWay
-        ? 'Resolves to the team with more goals in the official final score, or "Draw" if the scores are level. Voided if the game is not played as scheduled.'
-        : "Resolves to the team with more points in the official final box score. Voided if the game is not played as scheduled.",
-      resolutionDate,
-      sports: { ...base, facet: "winner" },
-    };
-    const total: ForecastQuestion = {
-      text: `What will the combined final score (both teams) be in ${matchup}?`,
-      kind: "numeric",
-      unit: "points",
-      resolutionCriteria: "The sum of both teams' points in the official final box score, including overtime.",
-      resolutionDate,
-      sports: { ...base, facet: "total", ...(sportsSigma(sportTitle, "total") ? { sigma: sportsSigma(sportTitle, "total")! } : {}) },
-    };
-    const margin: ForecastQuestion = {
-      text: `By how many points will ${favName} beat ${dogName} in ${matchup}? (negative if ${favName} loses)`,
-      kind: "numeric",
-      unit: "points",
-      resolutionCriteria: `${favName}'s points minus ${dogName}'s points in the official final box score (can be negative).`,
-      resolutionDate,
-      sports: { ...base, facet: "margin", ...(sportsSigma(sportTitle, "margin") ? { sigma: sportsSigma(sportTitle, "margin")! } : {}) },
-    };
-    // Return only what the mission asks for (classifySportsMission decided): an
-    // explicit single-facet ask yields just that facet; "full" (a generic "final
-    // score" or bare matchup) gets winner+total+margin, collapsed to the winner
-    // headline under --single.
-    if (ask === "total") return [total];
-    if (ask === "margin") return [margin];
-    if (ask === "winner") return [winner];
-    const single = this.cfg.forecastDecompose === false || this.meta.options.forecastSingle;
-    return single ? [winner] : [winner, total, margin];
   }
 
   /**
@@ -1039,12 +1108,11 @@ export class Executor {
       });
       return;
     }
-    let k = this.cfg.forecastExtremizeK;
-    try {
-      k = chooseExtremizeK(ledger, this.cfg.forecastExtremizeK);
-    } catch {
-      /* keep the configured k */
-    }
+    // The domain pack behind this forecast — the per-domain calibration key for
+    // every learner below and the ledger stamp. q.sports keeps a resumed sports
+    // run keyed correctly even when domainMatch was not re-set.
+    const domain = this.forecastDomain(q);
+    const k = this.fcExtremizeK(ledger, domain);
     // Extremization assumes independent evidence: a panel that cited the same
     // pages holds fewer independent views than it has members, so k shrinks
     // with the panel's source overlap. Probability-shaped kinds only.
@@ -1054,7 +1122,8 @@ export class Executor {
         : 0;
     let mw: Record<string, number> = {};
     try {
-      mw = q.kind === "binary" || q.kind === "mc" ? methodWeights(ledger) : {};
+      const fzmw = this.frozenFitted();
+      mw = q.kind === "binary" || q.kind === "mc" ? (fzmw ? fzmw.methodWeights : methodWeights(ledger, domain)) : {};
     } catch {
       /* equal weights */
     }
@@ -1095,7 +1164,8 @@ export class Executor {
     // kept so the next fit refits on un-dilated values — never circular. pNever
     // is a separate binary-style mass and stays untouched.
     if ((q.kind === "numeric" || q.kind === "date") && agg.quantiles) {
-      const cal = fitQuantileCalibration(ledger);
+      const fz = this.frozenFitted();
+      const cal = fz ? { d: fz.quantileDilation, n: fz.quantileDilationN, source: "learned" as const } : fitQuantileCalibration(ledger, undefined, domain);
       agg.predilationQuantiles = agg.quantiles;
       agg.dilation = { d: cal.d, source: cal.source, n: cal.n };
       if (cal.d !== 1) {
@@ -1113,7 +1183,7 @@ export class Executor {
       const sm = q.sports;
       const lineVal = sm?.facet === "total" ? sm.lineAtCreate?.total : sm?.facet === "margin" ? sm.lineAtCreate?.spread : undefined;
       if (sm && (sm.facet === "total" || sm.facet === "margin") && typeof lineVal === "number" && typeof sm.sigma === "number" && sm.sigma > 0) {
-        const base = chooseSportsMarketWeight(ledger, this.cfg.forecastSportsMarketWeight);
+        const base = this.fcSportsMarketWeight(ledger, domain);
         const wEff = Math.max(0, base - 1 / panel.length);
         if (wEff > 0) {
           const mq = lineToQuantiles(lineVal, sm.sigma);
@@ -1136,7 +1206,7 @@ export class Executor {
       const market = sportsWinnerMarket(sm);
       // Every market option must be a real facet option (guards a name mismatch).
       if (Object.keys(market).every((o) => o in agg.optionProbs!)) {
-        const wEff = Math.max(0, this.cfg.forecastSportsMarketWeight - 1 / panel.length);
+        const wEff = Math.max(0, this.fcSportsMarketWeight(ledger, domain) - 1 / panel.length);
         if (wEff > 0) {
           const before = agg.optionProbs[sm.home];
           agg.optionProbs = blendOptionProbs(agg.optionProbs, market, wEff);
@@ -1153,7 +1223,7 @@ export class Executor {
       agg.components = { panelGmo: agg.gmo, extremized: agg.probability };
       // Market anchor: blend toward a verified market price in log-odds space
       // AFTER extremization (the market is already an aggregate).
-      const anchor = await this.marketAnchor(q);
+      const anchor = await this.marketAnchor(q, ledger);
       if (anchor) {
         // The panel already carries ~one share of the market via its
         // market-anchored lens (forecasters consult market_odds), so the
@@ -1174,7 +1244,8 @@ export class Executor {
       }
       // Recalibration: fitted on the ledger's own resolved record (pre-recalibration values).
       try {
-        const recal = fitRecalibration(ledger);
+        const fzr = this.frozenFitted();
+        const recal = fzr ? fzr.recalibration : fitRecalibration(ledger, domain);
         if (recal) {
           const r = applyRecalibration(agg.probability!, recal);
           agg.components.recalibrated = r;
@@ -1213,6 +1284,7 @@ export class Executor {
     const origin = this.meta.options.forecastOrigin;
     const supersedes = this.meta.options.supersedes;
     const multi = this.questions.length > 1;
+    const modelId = this.meta.options.forecastModelId;
     const rec: LedgerCreated = {
       v: 1,
       rec: "created",
@@ -1224,6 +1296,8 @@ export class Executor {
       panel: panelRecs,
       ...(triggers.length ? { triggers } : {}),
       ...(q.kind === "binary" || q.kind === "mc" ? { evidenceOverlap: overlap } : {}),
+      ...(domain ? { domain } : {}),
+      ...(modelId ? { modelId } : {}),
       ...(origin ? { origin } : {}),
       ...(supersedes ? { supersedes } : {}),
       // Sub-forecasts of one open question group by the run id + share the brief.
@@ -1248,18 +1322,17 @@ export class Executor {
    * anchor is worse than none, so the match must clear a term-overlap bar AND
    * a cheap-model same-question check.
    */
-  private async marketAnchor(q: ForecastQuestion): Promise<MarketAnchor | null> {
-    let base = this.cfg.forecastMarketWeight;
-    if (!(base > 0)) return null;
+  private async marketAnchor(q: ForecastQuestion, ledger: ReturnType<typeof loadLedger>): Promise<MarketAnchor | null> {
+    // The pinned/cfg base gates the anchor: a configured 0 means "no market
+    // anchoring", decided BEFORE any learned fit (so a learner can't resurrect
+    // it). fcMarketWeight then applies the ledger-learned weight (unless pinned).
+    const pinned = this.meta.options.forecastMarketWeight ?? this.cfg.forecastMarketWeight;
+    if (!(pinned > 0)) return null;
     // Tournament leakage rule: a question imported FROM a market must not be
     // anchored back to market prices — the ledger's "did the panel beat the
     // market" signal (and every weight fitted on it) would become circular.
     if (this.meta.options.forecastOrigin) return null;
-    try {
-      base = chooseMarketWeight(loadLedger(), this.cfg.forecastMarketWeight);
-    } catch {
-      /* keep the configured weight */
-    }
+    const base = this.fcMarketWeight(ledger, this.forecastDomain(q));
     const deadline = withTimeout(this.ac.signal, 45_000);
     try {
       const hits = await marketOdds(this.cfg, q.text, 8, deadline.signal);
@@ -1351,7 +1424,7 @@ Same event, same direction (the market's YES means this question's YES), compati
    * sub-conditions exist to compose. Never blocks the run.
    */
   private shouldRunSimulation(): boolean {
-    if (this.meta.options.forecastSimulate || this.cfg.forecastSimulate) return true;
+    if (this.fcSimulate()) return true;
     return this.questions.length >= 2;
   }
 
@@ -1436,12 +1509,23 @@ Same event, same direction (the market's YES means this question's YES), compati
     // journal on resume — the stage has already run; don't start a second one on
     // a different question.
     if (this.questions.some((q) => q.id && this.aggregates.get(q.id)?.simulationResult)) return;
-    const forced = Boolean(this.meta.options.forecastSimulate || this.cfg.forecastSimulate);
+    const forced = this.fcSimulate();
+    const pack = this.domainMatch ? packById(this.domainMatch.pack) : undefined;
     for (const q of this.questions) {
       if (!q.id) continue;
       const agg = this.aggregates.get(q.id);
       if (!agg || agg.simulationResult) continue; // idempotent across resume
-      const catalog = this.buildDriverCatalog(q);
+      // The generic catalog (sibling sub-forecasts + base rates) is the baseline.
+      // A matched domain pack extends it with data-grounded drivers (options-
+      // implied, OLS trends, counted reference classes) — the "deep modeling".
+      let catalog = this.buildDriverCatalog(q);
+      if (pack?.buildDrivers) {
+        try {
+          catalog = await pack.buildDrivers(this.domainCtx(), q, this.domainMatch!, catalog);
+        } catch (e) {
+          this.journal.append("log", { level: "info", msg: `domain drivers skipped (${q.id}): ${errMsg(e)}` });
+        }
+      }
       if (catalog.length < 2) continue;
       if (this.budgetExceeded()) {
         this.journal.append("log", { level: "info", msg: "scenario simulation skipped — budget is in the synthesis reserve" });
@@ -1494,7 +1578,7 @@ Same event, same direction (the market's YES means this question's YES), compati
     const result = runSimulation(v.drivers, v.spec, v.deps, 10_000, 1738, agg);
     let w = 0;
     try {
-      w = chooseSimulationWeight(ledger, q.kind);
+      w = chooseSimulationWeight(ledger, q.kind, undefined, this.forecastDomain(q));
     } catch {
       /* weight stays 0 — pure cross-check */
     }
@@ -1609,7 +1693,7 @@ Same event, same direction (the market's YES means this question's YES), compati
    * loses it and the idempotence gate re-probes on resume.
    */
   private async coherenceProbe(): Promise<void> {
-    if (!this.cfg.forecastCoherenceProbe || !this.forecastMode()) return;
+    if (!this.fcCoherenceProbe() || !this.forecastMode()) return;
     if (this.ac.signal.aborted || this.finishReason.includes("cancel")) return;
     // Probe each binary sub-forecast (cap to bound cost on a wide decomposition).
     const binaryQs = this.questions.filter((q) => q.kind === "binary").slice(0, 4);

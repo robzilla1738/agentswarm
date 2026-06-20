@@ -176,7 +176,7 @@ const ROLE_HINTS: Record<string, string> = {
     "• METHOD decomposition: break the event into the conditional chain that must hold for YES, estimate every link explicitly (P(A), P(B|A), …), multiply for conjunctions and add for independent disjunctions, and SHOW the arithmetic in your rationale — conjunctions are systematically overestimated, and written-out arithmetic is the antidote.\n" +
     "• Check market_odds (several phrasings) — calibrated crowds are a strong baseline. State explicitly whether you deviate from the crowd and exactly why your evidence beats theirs. If you anchor on a market, cite that exact market URL in your sources, so the engine knows the panel already reflects it and doesn't double-count it.\n" +
     "• Use time_series with project_to=<resolution date> for any quantitative trend that bears on the question — ground extrapolation in the OLS projection it returns, not in narrative momentum.\n" +
-    "• MATCH THE TOOL TO THE DOMAIN: price-threshold questions → options_implied (the option market's own probability); elections/polling and historical base-rate lists → wiki_tables; weather-dependent questions → time_series openmeteo with past dates (the ERA5 archive turns \"how often does it snow 6 inches in March?\" into a counted frequency); public-attention trajectories (elections, launches, emerging events) → time_series wikipageviews — attention, not probability, but a useful leading indicator.\n" +
+    "• MATCH THE TOOL TO THE DOMAIN: price-threshold questions → options_implied (the option market's own probability); company fundamentals/revenue/earnings → time_series secfacts (\"TICKER:Revenues\", \"TICKER:NetIncomeLoss\") and the data_feed tool (sec_filings, company profile); a company's or sector's federal demand → time_series usaspending (\"recipient:Name\", \"agency:Name\", \"naics:code\"); macro/rates → time_series fred with plain-word aliases (unemployment, cpi, fedfunds, 10y) or bls; construction/commodities → time_series fred (lumber/steel/cement PPI) or yahoo futures (CL=F, LBS=F); elections/polling and historical base-rate lists → wiki_tables; weather-dependent questions → time_series openmeteo with past dates (the ERA5 archive turns \"how often does it snow 6 inches in March?\" into a counted frequency); public-attention trajectories → time_series wikipageviews — attention, not probability, but a useful leading indicator.\n" +
     "• SPORTS GAMES (a single match between two teams — total points, margin of victory, or who wins): call sports_odds(home, away, sport, date) — always pass the league and game date from the question so it can't match the wrong sport or a different game in a series. The sharp closing line is the most accurate public predictor of a game; CENTER your total/margin quantiles on the book's total/spread and your win probability on the de-vigged moneyline, then justify any deviation with a concrete, line-relevant edge (an injury or rest situation the line hasn't absorbed). The realized total/margin still scatters by roughly a sport-specific σ around the line (NBA total ≈±11, margin ≈±12), so keep your interval honestly wide.\n" +
     "• NEWS VOLUME MEASURES ATTENTION, NOT PROBABILITY. Heavy coverage of a possibility is not evidence it will happen (use gdelt to see attention for what it is, then ask what the boring base rate says). Commentary and prediction articles are sentiment; primary documents, data series, and counted history are evidence.\n" +
     "• TIME WINDOW: a \"by DATE\" question is about the remaining window. Decompose into per-period hazard rates — the same event with less remaining time deserves a lower probability, whatever the headlines say.\n" +
@@ -600,6 +600,27 @@ Rewrite it as a precisely resolvable question. Reply with ONLY a JSON object (no
 - resolutionCriteria: exactly what counts as YES (or how the value/winner/date is measured), naming the authoritative public source to check.
 - resolutionDate: ${operatorDate ? `use ${operatorDate}` : "the ISO date when the answer is knowable — infer it from the mission; if the mission names no horizon, pick a sensible near-term one"}.
 - PRESERVE THE QUANTITY BEING ASKED. Sharpen the wording; NEVER change WHAT is forecast. Match the mission's question word to the kind: "when" → "date" (forecast the TIMING the event happens); "who"/"which" → "mc"; "how much / how many / what value / what level" → "numeric"; "will / whether" → "binary". Do not substitute one for another. Worked example — mission "When will X be restored?" → {"kind":"date","text":"When will X be restored to the public (on or before DATE)?"}. WRONG: "Which party restores X?" (that forecasts WHO, not WHEN); WRONG: "Will X be restored by DATE?" (that discards the timing the operator asked for).`;
+}
+
+/**
+ * Classify a mission into one of the candidate forecasting domains (or none).
+ * The deterministic matchers run first; this single cheap call is only reached
+ * when they all abstain. Reply must be one bare id (or "generic").
+ */
+export function domainClassifierPrompt(
+  mission: string,
+  candidates: { id: string; label: string; hint: string }[],
+): string {
+  return `Classify the forecasting question below into exactly ONE domain, or "generic" if none fits well.
+
+QUESTION
+${mission}
+
+DOMAINS
+${candidates.map((c) => `- ${c.id}: ${c.label} — ${c.hint}`).join("\n")}
+- generic: anything that doesn't clearly fit a domain above
+
+Reply with ONLY the domain id (e.g. "${candidates[0]?.id ?? "generic"}" or "generic"). No prose, no punctuation.`;
 }
 
 /**
