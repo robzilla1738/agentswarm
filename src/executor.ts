@@ -52,8 +52,9 @@ import {
   aggregateMc,
   aggregateQuantiles,
   appendLedger,
-  applyQuantileDilation,
+  applyAsymmetricDilation,
   applyRecalibration,
+  applyMcRecalibration,
   blendOptionProbs,
   blendQuantiles,
   blendQuantilesWithMarket,
@@ -61,16 +62,19 @@ import {
   calibrationBlock,
   canonicalMethodLabel,
   chooseExtremizeK,
+  chooseExtremizeKMc,
   chooseMarketWeight,
   chooseSimulationWeight,
   chooseSportsMarketWeight,
+  preSimBinaryHeadline,
   clampProb,
   clampMarketProb,
   daysToIso,
   evidenceOverlap,
   extractMethodLabel,
   extractQuestionRef,
-  fitQuantileCalibration,
+  fitIntervalCalibration,
+  fitMcRecalibration,
   fitRecalibration,
   ISO_DATE,
   isoToDays,
@@ -580,10 +584,12 @@ export class Executor {
     return Math.min(11, Math.max(3, Math.round(n)));
   }
 
-  // ---- forecast tunable precedence: per-run option → cfg default. For the
-  // three knobs that have a ledger-learned chooser, the learned value wins
-  // UNLESS the operator pinned it (forecastOverrides) — preserving the engine's
-  // "learned beats configured" discipline while making every run reproducible.
+  // ---- forecast tunable precedence: per-run option → cfg default. For the four
+  // knobs that have a ledger-learned chooser (binary k, mc k, market weight,
+  // sports market weight), the learned value wins UNLESS the operator pinned it
+  // (forecastOverrides) — preserving the engine's "learned beats configured"
+  // discipline while making every run reproducible. The shared ladder is
+  // learnedTunable(); each fc* below only supplies the four parts that differ.
   private fcDecompose(): boolean {
     return this.meta.options.forecastDecompose ?? this.cfg.forecastDecompose;
   }
@@ -615,38 +621,63 @@ export class Executor {
     return this._frozenFitted;
   }
 
+  /**
+   * Resolve a ledger-learned tunable under the fixed precedence: an explicit
+   * per-run pin wins, else a frozen saved model's captured fit, else the live
+   * ledger-learned value, else the static base (also the fallback when the
+   * learner throws). Encoded once so a new learned knob is a four-field call,
+   * not another copy of this ladder.
+   */
+  private learnedTunable<T>(p: { base: T; pinned?: boolean; frozen: (fz: FittedParams) => T; learn: () => T }): T {
+    if (p.pinned) return p.base;
+    const fz = this.frozenFitted();
+    if (fz) return p.frozen(fz);
+    try {
+      return p.learn();
+    } catch {
+      return p.base;
+    }
+  }
+
   private fcExtremizeK(ledger: ReturnType<typeof loadLedger>, domain?: DomainId): number {
     const base = this.meta.options.forecastExtremizeK ?? this.cfg.forecastExtremizeK;
-    if (this.meta.options.forecastOverrides?.extremizeK) return base;
-    const fz = this.frozenFitted();
-    if (fz) return fz.extremizeK;
-    try {
-      return chooseExtremizeK(ledger, base, domain);
-    } catch {
-      return base;
-    }
+    return this.learnedTunable({
+      base,
+      pinned: this.meta.options.forecastOverrides?.extremizeK,
+      frozen: (fz) => fz.extremizeK,
+      learn: () => chooseExtremizeK(ledger, base, domain),
+    });
+  }
+  private fcExtremizeKMc(ledger: ReturnType<typeof loadLedger>, domain?: DomainId): number {
+    // Multiple-choice extremization: a separate exponent from the binary k (the
+    // per-option GMO+renormalize geometry has a different optimum). Pinned by its
+    // own extremizeKMc flag, inheriting the binary extremizeK pin when unset — so
+    // pinning binary k still pins mc k (old behavior) until an operator detaches them.
+    const base = this.meta.options.forecastExtremizeK ?? this.cfg.forecastExtremizeK;
+    return this.learnedTunable({
+      base,
+      pinned: this.meta.options.forecastOverrides?.extremizeKMc ?? this.meta.options.forecastOverrides?.extremizeK,
+      frozen: (fz) => fz.extremizeKMc ?? fz.extremizeK,
+      learn: () => chooseExtremizeKMc(ledger, base, domain),
+    });
   }
   private fcMarketWeight(ledger: ReturnType<typeof loadLedger>, domain?: DomainId): number {
     const base = this.meta.options.forecastMarketWeight ?? this.cfg.forecastMarketWeight;
-    if (this.meta.options.forecastOverrides?.marketWeight) return base;
-    const fz = this.frozenFitted();
-    if (fz) return fz.marketWeight;
-    try {
-      return chooseMarketWeight(ledger, base, domain);
-    } catch {
-      return base;
-    }
+    return this.learnedTunable({
+      base,
+      pinned: this.meta.options.forecastOverrides?.marketWeight,
+      frozen: (fz) => fz.marketWeight,
+      learn: () => chooseMarketWeight(ledger, base, domain),
+    });
   }
   private fcSportsMarketWeight(ledger: ReturnType<typeof loadLedger>, domain?: DomainId): number {
     const base = this.meta.options.forecastSportsMarketWeight ?? this.cfg.forecastSportsMarketWeight;
-    if (this.meta.options.forecastOverrides?.sportsMarketWeight) return base;
-    const fz = this.frozenFitted();
-    if (fz) return fz.sportsMarketWeight;
-    try {
-      return chooseSportsMarketWeight(ledger, base, domain);
-    } catch {
-      return base;
-    }
+    return this.learnedTunable({
+      base,
+      pinned: this.meta.options.forecastOverrides?.sportsMarketWeight,
+      frozen: (fz) => fz.sportsMarketWeight,
+      learn: () => chooseSportsMarketWeight(ledger, base, domain),
+    });
   }
 
   /** The domain key for this forecast (q.sports keeps a resumed sports run keyed correctly). */
@@ -1112,7 +1143,9 @@ export class Executor {
     // every learner below and the ledger stamp. q.sports keeps a resumed sports
     // run keyed correctly even when domainMatch was not re-set.
     const domain = this.forecastDomain(q);
-    const k = this.fcExtremizeK(ledger, domain);
+    // mc gets its own learned exponent (kMc); binary and date-pNever use the
+    // binary k. aggregateQuantiles ignores k entirely (dilation handles width).
+    const k = q.kind === "mc" ? this.fcExtremizeKMc(ledger, domain) : this.fcExtremizeK(ledger, domain);
     // Extremization assumes independent evidence: a panel that cited the same
     // pages holds fewer independent views than it has members, so k shrinks
     // with the panel's source overlap. Probability-shaped kinds only.
@@ -1165,14 +1198,19 @@ export class Executor {
     // is a separate binary-style mass and stays untouched.
     if ((q.kind === "numeric" || q.kind === "date") && agg.quantiles) {
       const fz = this.frozenFitted();
-      const cal = fz ? { d: fz.quantileDilation, n: fz.quantileDilationN, source: "learned" as const } : fitQuantileCalibration(ledger, undefined, domain);
+      // Asymmetric (per-tail) interval calibration (B3): widen the lower and upper
+      // tails by their own learned factors. Frozen models carry dLo/dUp; older
+      // ones fall back to the symmetric quantileDilation on both tails.
+      const cal = fz
+        ? { dLo: fz.quantileDilationLo ?? fz.quantileDilation, dUp: fz.quantileDilationUp ?? fz.quantileDilation, n: fz.quantileDilationN, source: "learned" as const }
+        : fitIntervalCalibration(ledger, undefined, domain);
       agg.predilationQuantiles = agg.quantiles;
-      agg.dilation = { d: cal.d, source: cal.source, n: cal.n };
-      if (cal.d !== 1) {
-        agg.quantiles = applyQuantileDilation(agg.quantiles, cal.d, Boolean(agg.logSpace));
+      agg.dilation = { d: Number(((cal.dLo + cal.dUp) / 2).toFixed(2)), dLo: cal.dLo, dUp: cal.dUp, source: cal.source, n: cal.n };
+      if (cal.dLo !== 1 || cal.dUp !== 1) {
+        agg.quantiles = applyAsymmetricDilation(agg.quantiles, cal.dLo, cal.dUp, Boolean(agg.logSpace));
         this.journal.append("log", {
           level: "info",
-          msg: `interval dilation (${q.id}, ×${cal.d}, ${cal.source}, n=${cal.n}): p10–p90 widened around the median`,
+          msg: `interval dilation (${q.id}, lo×${cal.dLo}/up×${cal.dUp}, ${cal.source}, n=${cal.n}): tails widened around the median`,
         });
       }
       // Sports line anchor: pull the DILATED panel toward the sharp total/margin
@@ -1218,6 +1256,29 @@ export class Executor {
         }
       }
     }
+    if (q.kind === "mc" && agg.optionProbs) {
+      // mc recalibration (B2): the multiple-choice analogue of binary
+      // recalibration — a learned shared logistic correcting systematic mc
+      // over/under-confidence, applied per-option then renormalized. Best-effort.
+      try {
+        const fzm = this.frozenFitted();
+        const mcRecal = fzm ? fzm.mcRecalibration ?? null : fitMcRecalibration(ledger, domain);
+        if (mcRecal) {
+          // Snapshot the PRE-recalibration option probs so the next mc-recal fit
+          // reads un-recalibrated numbers (never circular — mirrors binary's
+          // components.blended/extremized and numeric's predilationQuantiles).
+          agg.components = agg.components ?? {};
+          agg.components.preRecalOptionProbs = { ...agg.optionProbs };
+          agg.optionProbs = applyMcRecalibration(agg.optionProbs, mcRecal);
+          this.journal.append("log", {
+            level: "info",
+            msg: `mc recalibration (${q.id}, a=${mcRecal.a}, b=${mcRecal.b}, n=${mcRecal.n}): option probabilities recalibrated`,
+          });
+        }
+      } catch {
+        /* mc recalibration is best-effort */
+      }
+    }
     if (q.kind === "binary") {
       agg.evidenceOverlap = overlap;
       agg.components = { panelGmo: agg.gmo, extremized: agg.probability };
@@ -1259,6 +1320,46 @@ export class Executor {
         }
       } catch {
         /* recalibration is best-effort */
+      }
+    }
+    // H2: sequential Bayesian-style update on a re-forecast. When this run
+    // SUPERSEDES a prior forecast of the same question, the prior's published
+    // posterior is real information — blend toward it (log-odds for binary,
+    // per-tau for numeric/date, per-option for mc) instead of discarding it and
+    // re-litigating the base rate from scratch, which is higher-variance. The
+    // prior-trust weight is a fixed default for now (learnable from
+    // supersede→resolved chains later); the new panel still dominates at 0.7.
+    const supersedesId = this.meta.options.supersedes;
+    if (supersedesId) {
+      const prior = ledger.find((e) => e.id === supersedesId);
+      const PRIOR_W = 0.3;
+      // Only blend when the prior is genuinely a re-forecast of THIS question:
+      // same kind and same question text. Guards a multi-question run from
+      // applying one supersedes id to every sub-question, or a kind mismatch.
+      if (prior && prior.question?.kind === q.kind && prior.question?.text === q.text) {
+        if (q.kind === "binary" && typeof agg.probability === "number" && typeof prior.aggregate.probability === "number") {
+          const updated = blendWithMarket(agg.probability, prior.aggregate.probability, PRIOR_W);
+          this.journal.append("log", {
+            level: "info",
+            msg: `sequential update (${q.id}, supersedes ${supersedesId}, prior weight ${PRIOR_W}): ${Math.round(agg.probability * 100)}% → ${Math.round(updated * 100)}%`,
+          });
+          agg.probability = updated;
+          // Record the post-supersede value in the component chain so the later
+          // simulation blend builds on TOP of the sequential update (it reads the
+          // chain, not agg.probability) instead of silently discarding it — and so
+          // the sim-weight refit scores the true published headline of a re-forecast.
+          agg.components = agg.components ?? {};
+          agg.components.superseded = updated;
+        } else if ((q.kind === "numeric" || q.kind === "date") && agg.quantiles && prior.aggregate.quantiles) {
+          agg.quantiles = blendQuantiles(agg.quantiles, prior.aggregate.quantiles, PRIOR_W);
+          // pNever is a published, scored mass too — update it toward the prior in
+          // log-odds so a date re-forecast doesn't keep a stale never-by-horizon.
+          if (typeof agg.pNever === "number" && typeof prior.aggregate.pNever === "number") {
+            agg.pNever = blendWithMarket(agg.pNever, prior.aggregate.pNever, PRIOR_W);
+          }
+        } else if (q.kind === "mc" && agg.optionProbs && prior.aggregate.optionProbs && Object.keys(prior.aggregate.optionProbs).every((o) => o in agg.optionProbs!)) {
+          agg.optionProbs = blendOptionProbs(agg.optionProbs, prior.aggregate.optionProbs, PRIOR_W);
+        }
       }
     }
     if (q.id) {
@@ -1575,7 +1676,10 @@ Same event, same direction (the market's YES means this question's YES), compati
       this.journal.append("log", { level: "info", msg: `scenario simulation (${q.id}) rejected: ${v.reason}${v.dropped.length ? ` (dropped ungrounded: ${v.dropped.join(", ")})` : ""}` });
       return;
     }
-    const result = runSimulation(v.drivers, v.spec, v.deps, 10_000, 1738, agg);
+    // A matched pack may request a Student-t copula (ν) for joint tail dependence
+    // among its grounded drivers; otherwise the Gaussian copula (ν=∞).
+    const copulaDf = this.domainMatch ? packById(this.domainMatch.pack)?.copulaDf : undefined;
+    const result = runSimulation(v.drivers, v.spec, v.deps, 10_000, 1738, agg, copulaDf);
     let w = 0;
     try {
       w = chooseSimulationWeight(ledger, q.kind, undefined, this.forecastDomain(q));
@@ -1587,7 +1691,10 @@ Same event, same direction (the market's YES means this question's YES), compati
     const pct = (p: number) => Math.round(p * 100);
     if (q.kind === "binary" && typeof sa.probability === "number") {
       c.simulated = sa.probability;
-      const pre = c.recalibrated ?? c.blended ?? c.extremized ?? agg.probability ?? 0.5;
+      // The SAME chain the sim-weight fit scores (preSimBinaryHeadline): superseded
+      // (H2) first, so the blend builds ON TOP of a re-forecast's sequential update
+      // rather than silently rebuilding from the pre-supersede base.
+      const pre = preSimBinaryHeadline(c, agg.probability ?? 0.5);
       const lod = (p: number) => Math.log(clampProb(p) / (1 - clampProb(p)));
       c.simDivergence = Number(Math.abs(lod(sa.probability) - lod(pre)).toFixed(3));
       c.simBlendWeight = w;
@@ -1599,6 +1706,10 @@ Same event, same direction (the market's YES means this question's YES), compati
       c.simulatedQ = sa.quantiles;
       c.simDivergence = Number(result.coherence.divergence.toFixed(3));
       c.simBlendWeight = w;
+      // Snapshot the pre-sim headline (unconditionally, even at w=0) so a future
+      // sim-weight refit reads the non-circular pre-blend value, mirroring the
+      // binary components chain and preRecalOptionProbs.
+      if (agg.quantiles) c.preSimQuantiles = { ...agg.quantiles };
       if (w > 0 && agg.quantiles) {
         agg.quantiles = blendQuantiles(agg.quantiles, sa.quantiles, w);
         this.journal.append("log", { level: "info", msg: `simulation blend (${q.id}): interval blended toward the bottom-up sim at w=${w}` });
@@ -1607,6 +1718,7 @@ Same event, same direction (the market's YES means this question's YES), compati
       c.simulatedOptionProbs = sa.optionProbs;
       c.simDivergence = Number(result.coherence.divergence.toFixed(3));
       c.simBlendWeight = w;
+      if (agg.optionProbs) c.preSimOptionProbs = { ...agg.optionProbs };
       if (w > 0 && agg.optionProbs) {
         agg.optionProbs = blendOptionProbs(agg.optionProbs, sa.optionProbs, w);
         this.journal.append("log", { level: "info", msg: `simulation blend (${q.id}): option probabilities blended toward the sim at w=${w}` });

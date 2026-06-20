@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.19.0
+
+An accuracy-hardening pass: a multi-expert audit of the forecasting math drove fixes across four layers — deterministic correctness bugs that mis-stated numbers, train/serve skews in the learning flywheel, calibration expressiveness, and cold-start. No breaking changes; every new method reduces to prior behavior in its no-op limit, and sports/binary behavior is unchanged where it should be.
+
+### Deterministic correctness (these moved real numbers)
+- **Options-implied probability is now computed to the forecast's TARGET date, not the option's expiry** — interpolating implied vol across the bracketing expiries in total-variance space. An off-cycle date previously used the wrong horizon (a double-digit-pp error on `N(d2)`).
+- **The Monte-Carlo trend driver samples a true Student-t** with the OLS fit's own `sePred`/`df` instead of treating the t-band as a Gaussian one — correct heavy tails for a small-n fit (the old path was both center-too-wide and tail-too-thin).
+- **SEC fundamentals no longer mix 10-K annual and 10-Q quarterly periods on one axis** (a 4× sawtooth that wrecked the trend); one consistent frequency is kept.
+- **Reference-class base rates are Beta-Binomial (Jeffreys) smoothed** — 5/5 reads as ~92%, never a reckless 100% that one later miss would punish — and carry a credible interval.
+- **Equity/crypto price trends fit in log space** (multiplicative, lognormal predictive) and **"inflation" projects the CPI YoY rate**, not the ever-rising index level.
+- **open-meteo windows that span today** fetch both the ERA5 archive and the forecast and merge them, instead of silently dropping the forecast horizon.
+
+### Stronger trend models
+- **Random-walk-with-drift is the default projector** (it beats a linear OLS extrapolation out-of-sample on most price/rate series), with a damped-trend option; `swarm backtest` now includes a walk-forward **projector gate** that proves which projector generalizes best on your accumulated series.
+
+### Flywheel train/serve consistency
+- **The extremization-`k` learner now optimizes the estimator that's actually served** — overlap-scaled and method-weighted — instead of the raw one, and **out-of-fold backtest folds are time-respecting** (forward-chaining by resolution time), so a learner can't be flattered by future outcomes.
+- **Multiple-choice questions get their own learned exponent (`kMc`) and their own recalibration** (mc previously got neither), each gated in `swarm backtest`.
+- **Per-domain calibration uses partial pooling** — a thin in-domain fit shrinks toward the global pool by its own usable sample size, instead of a hard switch that regressed right at the threshold (and never toward the cold default).
+
+### Calibration expressiveness + missing methods
+- **Asymmetric (per-tail) interval calibration** widens the lower and upper tails by their own learned factors — lopsided miscoverage is fixed on the side that needs it.
+- **Student-t copula** option for the scenario simulation (per-pack `ν`; finance uses ν=6) adds the joint tail dependence a Gaussian copula lacks — correlated shocks co-occur; ν=∞ recovers the Gaussian exactly.
+- **Shin de-vig** for sportsbook moneylines corrects the favorite-longshot bias the proportional method leaves in.
+- **Options drivers use the real-world drift** (`r + ERP`) for the engine's forecast while the `options_implied` tool still reports the market's risk-neutral price.
+- **Sequential update on a re-forecast**: a superseding forecast blends toward the prior published posterior in log-odds instead of re-litigating the base rate from scratch.
+- **Beta calibration** (Kull 2017) is offered as a backtest-gated alternative to logistic recalibration.
+
+### Cold-start + proving accuracy
+- **`swarm refclass seed`** imports a bundled, provenance-documented corpus of counted historical base rates (construction overruns, business survival, recession frequency, incumbency) so the outside-view drivers are live on day one; the engine's own resolutions refine and eventually dominate them. `swarm refclass list` shows the current classes.
+- **Supersession chains are de-duplicated** in reference-class counts (a re-forecast of the same event counts once), and a sub-question's own reference class is queried when it carries one.
+- **`swarm calibration` shows an outside-view discipline check** — whether the panel's deviations from its committed base-rate prior actually pay off.
+
+### Quality hardening (full-codebase sweep)
+A second adversarial sweep (7 dimensions × verify-each-finding) over the whole tool — correctness, the learning flywheel, efficiency, CLI/UX, and the web UI — fixed every confirmed issue:
+- **`swarm backtest` is dramatically faster and now grades the model that actually ships.** The binary/mc backtests hoist each out-of-fold fit once per entry instead of refitting (and re-scoring) from scratch on every strategy — an O(n²·gridsize) replay becomes O(n). Each fold is also fit with the entry's **own domain**, so the regression gate measures the per-domain partial-pooled estimator the live path serves, not the global pool.
+- **A binary re-forecast (`--supersedes`) no longer loses its sequential update when the simulation has earned weight** — the post-supersede headline is recorded in the component chain, so the sim blends on top of it; numeric/mc sim-weight fits now learn from previously-blended entries via a non-circular pre-sim snapshot, matching the binary path.
+- **Finance questions phrased "beneath / less than / greater than / at least / at most" now extract their strike** (strike + direction from ONE boundary-anchored regex match, so they can't drift or match a keyword inside another word), restoring options grounding and exact resolution; the resolver never settles from a post-deadline close; the IV term structure holds vol flat outside the listed expiries instead of silently re-scaling it.
+- **A "close BELOW $X" binary now gets a correctly-oriented grounded simulation.** The scenario combiner's `threshold` op gained an optional `dir:"lt"` (fire below; default still "gt"), and the finance options/trend drivers emit in the question's own polarity — previously a below-strike question's bottom-up P(YES) was the inverse of how it resolves.
+- **The multiple-choice exponent can be pinned independently** of the binary one (`extremizeKMc` override).
+- **Web UI:** date/numeric run cards render `~2026-01-14` / a rounded value (not a raw epoch-day or a long float); a due numeric/date/mc forecast can be **manually resolved with its real value** (not just voided), end-to-end through the hub; keyboard Enter on a card's delete button deletes instead of navigating away; the "due" list ticks on its own; icon-only buttons carry accessible labels.
+- **Internal:** one shared logistic-recalibration kernel (binary + mc), one interval-dilation kernel (symmetric delegates to asymmetric), one tunable-precedence helper for the four learned knobs, and hoisted Monte-Carlo allocations. `npm test` now rebuilds first so it can never test stale output.
+
 ## 0.18.0
 
 General-purpose forecasting via **domain packs**: the engine generalizes everything the sports path does — intent detection, engine-owned decomposition, per-quantity priors, data-grounded modeling, and exact auto-resolution — into a registry of domains (finance, macro, elections, construction, business, sports). Each domain learns its own calibration, and any setup can be saved as a reusable, freezable model. No breaking changes; an unmatched question takes the same generic panel+research path as before, and sports behavior is byte-identical (it became pack #1).

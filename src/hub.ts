@@ -13,7 +13,7 @@ import {
   saveConfig,
 } from "./config";
 import { appendControl } from "./control";
-import { ISO_DATE, calibrationStats, loadLedger, resolveLedgerEntry, snapshotFittedParams } from "./forecast";
+import { ISO_DATE, calibrationStats, isoToDays, loadLedger, resolveLedgerEntry, snapshotFittedParams } from "./forecast";
 import { resolveDue } from "./resolve";
 import { deleteModel, loadModels, modelTrackRecord, upsertModel } from "./models";
 import { PACKS, detectDomainSync, packById } from "./domains/registry";
@@ -260,13 +260,27 @@ async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL
     const entry = loadLedger().find((e) => e.id === fm[1]);
     if (!entry) return sendJson(res, 404, { error: "forecast not found" });
     if (entry.resolution) return sendJson(res, 409, { error: "already resolved" });
+    // Mirror the `swarm resolve set` CLI surface so the web UI can settle every
+    // kind, not just binary/void: numeric value, date (ISO → epoch-days, or
+    // "never"), and an mc option matched case/space-insensitively.
     const raw = body.outcome;
-    let outcome: 0 | 1 | number | "void";
-    if (raw === "yes") outcome = 1;
-    else if (raw === "no") outcome = 0;
-    else if (raw === "void") outcome = "void";
-    else if (entry.question.kind === "numeric" && Number.isFinite(Number(raw))) outcome = Number(raw);
-    else return sendJson(res, 400, { error: 'outcome must be "yes", "no", "void"' + (entry.question.kind === "numeric" ? ", or a number" : "") });
+    const kind = entry.question.kind;
+    let outcome: 0 | 1 | number | string | "void";
+    if (raw === "void") outcome = "void";
+    else if (kind === "binary" && raw === "yes") outcome = 1;
+    else if (kind === "binary" && raw === "no") outcome = 0;
+    else if (kind === "numeric" && Number.isFinite(Number(raw))) outcome = Number(raw);
+    else if (kind === "date" && raw === "never") outcome = "never";
+    else if (kind === "date" && typeof raw === "string" && ISO_DATE.test(raw) && isoToDays(raw) !== null) outcome = isoToDays(raw)!;
+    else if (kind === "date" && typeof raw === "number" && Number.isFinite(raw)) outcome = raw;
+    else if (kind === "mc") {
+      const match = (entry.question.options ?? []).find((o) => o.trim().toLowerCase() === String(raw).trim().toLowerCase());
+      if (!match) return sendJson(res, 400, { error: `outcome must be void or one of: ${(entry.question.options ?? []).join(" | ")}` });
+      outcome = match;
+    } else {
+      const hint = kind === "numeric" ? '"void" or a number' : kind === "date" ? '"void", "never", or YYYY-MM-DD' : '"yes", "no", or "void"';
+      return sendJson(res, 400, { error: `outcome must be ${hint}` });
+    }
     const rec = resolveLedgerEntry(entry, outcome, {
       evidence: String(body.evidence || "operator override"),
       sources: [],
@@ -654,6 +668,7 @@ function sanitizeModel(raw: Record<string, unknown>): Partial<ForecastModel> & {
     const f = t.overrides as Record<string, unknown>;
     const ov: ForecastOverrideFlags = {};
     if (typeof f.extremizeK === "boolean") ov.extremizeK = f.extremizeK;
+    if (typeof f.extremizeKMc === "boolean") ov.extremizeKMc = f.extremizeKMc;
     if (typeof f.marketWeight === "boolean") ov.marketWeight = f.marketWeight;
     if (typeof f.sportsMarketWeight === "boolean") ov.sportsMarketWeight = f.sportsMarketWeight;
     tunables.overrides = ov;
@@ -734,6 +749,7 @@ function sanitizeOptions(raw: unknown): Partial<RunOptions> {
     const f = o.forecastOverrides as Record<string, unknown>;
     const ov: ForecastOverrideFlags = {};
     if (typeof f.extremizeK === "boolean") ov.extremizeK = f.extremizeK;
+    if (typeof f.extremizeKMc === "boolean") ov.extremizeKMc = f.extremizeKMc;
     if (typeof f.marketWeight === "boolean") ov.marketWeight = f.marketWeight;
     if (typeof f.sportsMarketWeight === "boolean") ov.sportsMarketWeight = f.sportsMarketWeight;
     out.forecastOverrides = ov;

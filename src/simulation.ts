@@ -13,6 +13,7 @@ import {
 } from "./types";
 import { QUANTILE_TAUS, clampProb, mulberry32 } from "./forecast";
 import { normCdf } from "./datatools";
+import { regIncBeta, betaQuantile } from "./numerics";
 
 /**
  * Grounded scenario simulation: a pure, deterministic, seeded Monte Carlo over
@@ -69,6 +70,33 @@ export function normInv(p: number): number {
   return z - u;
 }
 
+// ---------------------------------------------------------------- Student-t
+
+/**
+ * Student-t CDF P(T ≤ t) for ν>0 degrees of freedom, via the incomplete beta:
+ * P(|T|>t) = I_x(ν/2, 1/2) with x = ν/(ν+t²). Converges to Φ as ν→∞.
+ */
+export function studentTCdf(t: number, df: number): number {
+  if (!(df > 0) || df > 1e7) return normCdf(t);
+  const x = df / (df + t * t);
+  const tail = 0.5 * regIncBeta(x, df / 2, 0.5); // = P(|T|>|t|), halved for one side
+  return t >= 0 ? 1 - tail : tail;
+}
+
+/**
+ * Student-t quantile (inverse CDF) for ν>0. Inverts the incomplete-beta relation
+ * t = sign·√(ν(1−x)/x) where x solves I_x(ν/2,1/2)=2·min(p,1−p) via betaQuantile.
+ * Falls back to the normal quantile for large ν. Accurate to ~5e-7 (bounded by
+ * normInv's Acklam+Newton precision, not the beta inversion).
+ */
+export function studentTQuantile(p: number, df: number): number {
+  const pc = Math.max(1e-12, Math.min(1 - 1e-12, p));
+  if (!(df > 0) || df > 1e7) return normInv(pc);
+  const x = betaQuantile(2 * Math.min(pc, 1 - pc), df / 2, 0.5);
+  const t = Math.sqrt((df * (1 - x)) / x);
+  return pc < 0.5 ? -t : t;
+}
+
 // ---------------------------------------------------------------- marginal sampling
 
 /**
@@ -80,11 +108,27 @@ export function normInv(p: number): number {
  * monotone on the log scale and the draw is always positive. `dTau<=0` guards
  * make a point mass (p10=p50=p90) degenerate cleanly to its value.
  */
-export function sampleFromQuantiles(q: Quantiles, u: number, logSpace = false): number {
-  const knots = QUANTILE_TAUS.filter(({ key }) => typeof q[key] === "number").map(({ key, tau }) => ({
+/** One piecewise-linear CDF knot: cumulative prob τ ↦ (log-)value v. */
+interface QuantileKnot {
+  tau: number;
+  v: number;
+}
+
+/**
+ * Build the CDF knots for a Quantiles object — the u-INDEPENDENT half of the
+ * inverse-CDF. Hoisted out of sampleFromQuantiles so the Monte-Carlo loop can
+ * prepare them once per driver instead of rebuilding the array (and re-running a
+ * Math.log per knot in log space) on every one of N≈10k draws.
+ */
+function prepareQuantileKnots(q: Quantiles, logSpace = false): QuantileKnot[] {
+  return QUANTILE_TAUS.filter(({ key }) => typeof q[key] === "number").map(({ key, tau }) => ({
     tau,
     v: logSpace ? Math.log(q[key] as number) : (q[key] as number),
   }));
+}
+
+/** Invert the prepared piecewise-linear quantile function at uniform u∈[0,1]. */
+function sampleFromKnots(knots: QuantileKnot[], u: number, logSpace = false): number {
   if (!knots.length) throw new Error("sampleFromQuantiles: empty Quantiles");
   const out = (v: number) => (logSpace ? Math.exp(v) : v);
   if (knots.length === 1) return out(knots[0].v);
@@ -112,28 +156,74 @@ export function sampleFromQuantiles(q: Quantiles, u: number, logSpace = false): 
   return out(last.v);
 }
 
-/** Draw the marginal value for one driver given a correlated standard normal z. */
-function drawMarginal(m: DriverMarginal, z: number): number {
-  // Every kind maps HIGH latent z → HIGH driver value, so the copula's sign is
-  // consistent across kinds. A numeric/trend driver's value increases with z;
-  // a binary driver must therefore FIRE on high z (not low), or a positive
-  // specified correlation between a binary and a numeric driver would realize as
-  // a negative one. The marginal P(fire)=p is preserved: P(Φ(z) ≥ 1−p) = p.
-  if (m.kind === "binary") return normCdf(z) >= 1 - clampProb(m.probability) ? 1 : 0;
-  if (m.kind === "quantiles") {
-    const v = sampleFromQuantiles(m.quantiles, normCdf(z), Boolean(m.logSpace));
-    // A logSpace marginal whose quantiles disagree (a non-positive knot slipping
-    // past the upstream shouldUseLogSpace guard) would log()→NaN and poison the
-    // whole simulated distribution. Fall back to the median rather than propagate.
-    return Number.isFinite(v) ? v : m.quantiles.p50;
+/**
+ * Invert a single Quantiles object's piecewise-linear CDF at uniform u∈[0,1].
+ * Replicates the CDF geometry of mixtureQuantiles (forecast.ts) for one
+ * panelist: the QUANTILE_TAUS knots define a quantile function, linearly
+ * interpolated inside and linearly extrapolated in the tails. `logSpace`
+ * operates in log(value) space (right-skewed positives) so the inverse stays
+ * monotone on the log scale and the draw is always positive. `dTau<=0` guards
+ * make a point mass (p10=p50=p90) degenerate cleanly to its value.
+ */
+export function sampleFromQuantiles(q: Quantiles, u: number, logSpace = false): number {
+  return sampleFromKnots(prepareQuantileKnots(q, logSpace), u, logSpace);
+}
+
+/**
+ * Build a per-draw sampler for one driver's marginal, hoisting every
+ * u-INDEPENDENT cost (the quantile knots, the binary fire threshold, the legacy
+ * Gaussian σ) out of the Monte-Carlo loop so it runs once per driver, not once
+ * per draw. The returned closure maps a copula uniform u∈[0,1] to the driver
+ * value. Every kind maps HIGH u → HIGH driver value, so the copula's sign is
+ * consistent across kinds: a numeric/trend value increases with u, and a binary
+ * driver therefore FIRES on high u (not low), or a positive specified
+ * correlation between a binary and a numeric driver would realize as a negative
+ * one. The marginal P(fire)=p is preserved: P(u ≥ 1−p) = p.
+ */
+function makeMarginalSampler(m: DriverMarginal): (u: number) => number {
+  if (m.kind === "binary") {
+    const fire = 1 - clampProb(m.probability);
+    return (u) => (u >= fire ? 1 : 0);
   }
-  // trend: a Gaussian marginal whose (lo,hi) is treated as an 80% band, so
-  // σ = (hi−lo)/(2·z₀.₉) with z₀.₉=1.282. NOTE: when sourcing this from
-  // olsProject (a Student-t band at df=n−2), the constructor must convert the
-  // t-band to a Gaussian-equivalent 80% band first, or σ is overstated for
-  // small n. Producers of trend marginals are responsible for that conversion.
+  if (m.kind === "quantiles") {
+    const logSpace = Boolean(m.logSpace);
+    const knots = prepareQuantileKnots(m.quantiles, logSpace);
+    const p50 = m.quantiles.p50;
+    return (u) => {
+      const v = sampleFromKnots(knots, u, logSpace);
+      // A logSpace marginal whose quantiles disagree (a non-positive knot slipping
+      // past the upstream shouldUseLogSpace guard) would log()→NaN and poison the
+      // whole simulated distribution. Fall back to the median rather than propagate.
+      return Number.isFinite(v) ? v : p50;
+    };
+  }
+  // trend: a location-scale Student-t predictive (the OLS projection). When the
+  // producer carries the honest scale + df (olsProject does), sample the t
+  // exactly via the Gaussian-copula uniform u=Φ(z) → projected + sePred·t_df⁻¹(u).
+  // This keeps the small-n heavy tails the t-band encodes (a Gaussian band of
+  // width (hi−lo) would be both center-too-wide AND tail-too-thin). Legacy
+  // producers without sePred/df degrade to the old Gaussian-band behavior.
+  if (typeof m.sePred === "number" && typeof m.df === "number" && m.sePred >= 0 && m.df > 0) {
+    const { sePred, df, projected } = m;
+    const logSpace = Boolean(m.logSpace);
+    return (u) => {
+      const t = studentTQuantile(u, df);
+      if (logSpace) {
+        // Multiplicative (lognormal) predictive — sePred is in LOG units and
+        // `projected` is the linear median: sample exp(log(median) + sePred·t).
+        // A small-df t draw (df=1 ≈ Cauchy) can push the exponent past ~709 and
+        // overflow exp() to +Infinity, which would poison the whole simulated
+        // distribution — fail closed to the median, mirroring the quantiles branch.
+        const v = projected > 0 ? Math.exp(Math.log(projected) + sePred * t) : projected;
+        return Number.isFinite(v) ? v : projected;
+      }
+      const lin = projected + sePred * t;
+      return Number.isFinite(lin) ? lin : projected;
+    };
+  }
   const sigma = Math.max(0, (m.hi - m.lo) / (2 * 1.282));
-  return m.projected + z * sigma;
+  const projected = m.projected;
+  return (u) => projected + normInv(u) * sigma;
 }
 
 // ---------------------------------------------------------------- Gaussian copula
@@ -177,12 +267,28 @@ function shrinkToPD(M: number[], D: number): number[] {
 }
 
 /**
- * Build a sampler that yields D correlated standard normals per call. The
+ * Build a sampler that yields D correlated copula UNIFORMS u∈[0,1] per call. The
  * correlation matrix is assembled from the LLM's pairwise edges (clamped,
  * repaired to PD), Cholesky-factored once, and applied to independent
- * Box-Muller normals: Z = L·W with W ~ N(0,I).
+ * Box-Muller normals: Z = L·W with W ~ N(0,I), then mapped to uniforms.
+ *
+ * `df` selects the copula family:
+ *  - undefined / ∞ → GAUSSIAN copula: u = Φ(Z). Zero tail dependence.
+ *  - finite ν      → STUDENT-T copula: scale each draw by √(ν/S), S~χ²_ν shared
+ *    across dimensions, then u = T_ν(Z·√(ν/S)). The shared χ² gives joint tail
+ *    dependence — extremes co-occur — which a Gaussian copula cannot represent.
+ *    ν→∞ recovers the Gaussian exactly.
+ *
+ * Returning uniforms (not normals) keeps the copula and the marginals cleanly
+ * separated: each driver's marginal sampler consumes u directly, identical for
+ * either family.
  */
-export function buildCopulaSampler(drivers: SimDriver[], deps: DriverCorrelation[], rand: () => number): () => number[] {
+export function buildCopulaSampler(
+  drivers: SimDriver[],
+  deps: DriverCorrelation[],
+  rand: () => number,
+  df?: number
+): () => number[] {
   const D = drivers.length;
   const idxOf = new Map(drivers.map((d, i) => [d.id, i]));
   const R: number[] = Array.from({ length: D * D }, (_, k) => (Math.floor(k / D) === k % D ? 1 : 0));
@@ -197,6 +303,7 @@ export function buildCopulaSampler(drivers: SimDriver[], deps: DriverCorrelation
   let L = cholesky(R, D);
   if (!L) L = cholesky(shrinkToPD(R, D), D) ?? R.map((_, idx) => (Math.floor(idx / D) === idx % D ? 1 : 0));
   const Lf = L;
+  const tCopula = typeof df === "number" && df > 0 && df < 1e7;
 
   // Box-Muller normal generator over the mulberry32 stream (spare-value cached).
   let spare: number | null = null;
@@ -212,12 +319,42 @@ export function buildCopulaSampler(drivers: SimDriver[], deps: DriverCorrelation
     spare = r * Math.cos(2 * Math.PI * u2);
     return r * Math.sin(2 * Math.PI * u2);
   };
+  // χ²_ν as a sum of ν' standard normals plus a fractional-df gamma tail is
+  // overkill here; ν is a small integer in practice, so draw χ²_⌊ν⌋ as a sum of
+  // squared normals and treat ν as that integer. (ν≥3 typical.)
+  const chi2 = (nu: number): number => {
+    const k = Math.max(1, Math.round(nu));
+    let s = 0;
+    for (let i = 0; i < k; i++) {
+      const z = nextNormal();
+      s += z * z;
+    }
+    return s;
+  };
 
+  // Scratch buffers reused across draws — this closure runs N≈10k times, so the
+  // per-draw W/Z/out allocations (and the Array.from/map closures) were pure GC
+  // churn. The sole caller reads the returned uniforms into dvals before the next
+  // draw, so handing back the same `out` buffer each time is safe.
+  const W = new Array<number>(D);
+  const Z = new Array<number>(D);
+  const out = new Array<number>(D);
+  const nu = tCopula ? Math.round(df as number) : 0;
   return (): number[] => {
-    const W = Array.from({ length: D }, nextNormal);
-    const Z = new Array(D).fill(0);
-    for (let i = 0; i < D; i++) for (let j = 0; j <= i; j++) Z[i] += Lf[i * D + j] * W[j];
-    return Z;
+    for (let i = 0; i < D; i++) W[i] = nextNormal();
+    for (let i = 0; i < D; i++) {
+      let acc = 0;
+      for (let j = 0; j <= i; j++) acc += Lf[i * D + j] * W[j];
+      Z[i] = acc;
+    }
+    if (!tCopula) {
+      for (let i = 0; i < D; i++) out[i] = normCdf(Z[i]);
+      return out;
+    }
+    // One shared χ²_ν scale per draw couples the tails across all dimensions.
+    const scale = Math.sqrt(nu / Math.max(1e-9, chi2(nu)));
+    for (let i = 0; i < D; i++) out[i] = studentTCdf(Z[i] * scale, nu);
+    return out;
   };
 }
 
@@ -235,8 +372,12 @@ export function evalCombiner(node: CombinerNode, idx: Map<string, number>, dvals
       return node.children.every((c) => evalCombiner(c, idx, dvals) > 0.5) ? 1 : 0;
     case "or":
       return node.children.some((c) => evalCombiner(c, idx, dvals) > 0.5) ? 1 : 0;
-    case "threshold":
-      return evalCombiner(node.child, idx, dvals) > node.above ? 1 : 0;
+    case "threshold": {
+      // dir "lt" fires BELOW the threshold (a close-under-strike question); "gt"
+      // (default, and every pre-existing node) fires above.
+      const x = evalCombiner(node.child, idx, dvals);
+      return (node.dir === "lt" ? x < node.above : x > node.above) ? 1 : 0;
+    }
     case "sum":
       return node.children.reduce((s, c) => s + evalCombiner(c, idx, dvals), 0);
     case "weighted_sum": {
@@ -289,14 +430,21 @@ function empiricalQuantile(sorted: number[], tau: number): number {
 
 /** Roll a set of simulated outcome scalars into the canonical aggregate for the question kind. */
 export function aggregateSimOutcomes(rawOutcomes: number[], combiner: CombinerSpec): AggregateForecast {
-  const N = rawOutcomes.length;
+  // Defense in depth: drop any non-finite draw (a heavy-tailed marginal can in
+  // principle overflow) so one bad sample can't poison an empirical quantile or
+  // force a binary fire. The marginal sampler already fails closed, so this is
+  // belt-and-suspenders; if EVERYTHING is non-finite we keep the raw set so the
+  // empty-draw guard below still fires rather than silently emptying.
+  const finite = rawOutcomes.filter((v) => Number.isFinite(v));
+  const outcomes = finite.length ? finite : rawOutcomes;
+  const N = outcomes.length;
   if (!N) throw new Error("aggregateSimOutcomes: no draws");
   if (combiner.kind === "binary") {
-    const p = rawOutcomes.reduce((s, v) => s + (v > 0.5 ? 1 : 0), 0) / N;
+    const p = outcomes.reduce((s, v) => s + (v > 0.5 ? 1 : 0), 0) / N;
     return { probability: clampProb(p), k: 1, n: N, spread: 0 };
   }
   if (combiner.kind === "numeric" || combiner.kind === "date") {
-    const sorted = [...rawOutcomes].sort((a, b) => a - b);
+    const sorted = [...outcomes].sort((a, b) => a - b);
     const quantiles = {} as Quantiles;
     for (const { key, tau } of QUANTILE_TAUS) quantiles[key] = empiricalQuantile(sorted, tau);
     return { quantiles, k: 1, n: N, spread: 0 };
@@ -308,7 +456,7 @@ export function aggregateSimOutcomes(rawOutcomes: number[], combiner: CombinerSp
   const opts = combiner.mcOptions ?? [];
   const counts: Record<string, number> = {};
   for (const o of opts) counts[o] = 0;
-  for (const v of rawOutcomes) {
+  for (const v of outcomes) {
     const i = Math.max(0, Math.min(opts.length - 1, Math.round(v)));
     counts[opts[i]]++;
   }
@@ -333,7 +481,7 @@ function fireThreshold(d: SimDriver): number {
 
 function fired(d: SimDriver, thr: number, val: number): number {
   if (d.marginal.kind === "binary") return val > 0.5 ? 1 : 0;
-  return val > thr ? 1 : 0;
+  return (d.thresholdDir === "below" ? val < thr : val > thr) ? 1 : 0;
 }
 
 /**
@@ -495,21 +643,25 @@ export function runSimulation(
   deps: DriverCorrelation[],
   N = 10_000,
   seed = 1738,
-  topDown?: AggregateForecast
+  topDown?: AggregateForecast,
+  copulaDf?: number
 ): SimulationResult {
   if (drivers.length < 1) throw new Error("runSimulation: need at least one driver");
   const rand = mulberry32(seed);
-  const drawNormals = buildCopulaSampler(drivers, deps, rand);
+  const drawUniforms = buildCopulaSampler(drivers, deps, rand, copulaDf);
   const idx = new Map(drivers.map((d, i) => [d.id, i]));
   const thresholds = drivers.map(fireThreshold);
+  // Prepare each driver's marginal sampler once (knot construction etc.) rather
+  // than re-deriving it on every draw.
+  const samplers = drivers.map((d) => makeMarginalSampler(d.marginal));
 
   const rawOutcomes = new Array<number>(N);
   const driverDraws = drivers.map(() => new Array<number>(N));
   const driverFired = drivers.map(() => new Array<number>(N));
 
   for (let s = 0; s < N; s++) {
-    const Z = drawNormals();
-    const dvals = drivers.map((d, i) => drawMarginal(d.marginal, Z[i]));
+    const U = drawUniforms();
+    const dvals = samplers.map((samp, i) => samp(U[i]));
     rawOutcomes[s] = evalCombiner(combiner.root, idx, dvals);
     for (let i = 0; i < drivers.length; i++) {
       driverDraws[i][s] = dvals[i];

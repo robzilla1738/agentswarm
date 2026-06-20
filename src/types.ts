@@ -190,6 +190,14 @@ export interface AggregateComponents {
   blended?: number;
   /** After ledger-fitted recalibration — when present, this is the headline. */
   recalibrated?: number;
+  /**
+   * After the H2 sequential update on a re-forecast (--supersedes) — when present,
+   * this is the published binary headline, so the simulation blend (and the
+   * sim-weight refit) read the post-supersede value instead of discarding it.
+   */
+  superseded?: number;
+  /** mc option probabilities BEFORE the learned recalibration — what the next mc-recal fit must read, so it is never circular. */
+  preRecalOptionProbs?: Record<string, number>;
   /** Scenario-simulation bottom-up headline (binary/mc) — a cross-check, blended only once it earns weight. */
   simulated?: number;
   /** Scenario-simulation bottom-up quantiles (numeric/date) — the interval cross-check. */
@@ -200,6 +208,10 @@ export interface AggregateComponents {
   simDivergence?: number;
   /** The simulation blend weight actually applied to the headline (0 until the ledger earns it trust). */
   simBlendWeight?: number;
+  /** Numeric/date quantiles BEFORE the simulation blend — what a future sim-weight refit must read so it is never circular (mirrors preRecalOptionProbs). */
+  preSimQuantiles?: Quantiles;
+  /** mc option probabilities BEFORE the simulation blend — the non-circular value a future sim-weight refit reads. */
+  preSimOptionProbs?: Record<string, number>;
   /**
    * The sportsbook line a numeric sports facet (total/margin) was anchored to,
    * and how hard. Present only when the facet matched a betting line.
@@ -227,7 +239,7 @@ export interface AggregateForecast {
   /** The combined quantiles BEFORE interval dilation — the value future dilation refits on (never circular). */
   predilationQuantiles?: Quantiles;
   /** The interval dilation actually applied to the quantiles, and where the factor came from. */
-  dilation?: { d: number; source: "default" | "learned"; n: number };
+  dilation?: { d: number; source: "default" | "learned"; n: number; dLo?: number; dUp?: number };
   /** Per-option probabilities, extremized GMO renormalized to sum 1 (mc). */
   optionProbs?: Record<string, number>;
   /** GMO of the panel's P(never by horizon) — date questions. */
@@ -267,11 +279,20 @@ export interface DriverProvenance {
   label: string;
 }
 
-/** A driver's marginal distribution and how it is sampled. */
+/**
+ * A driver's marginal distribution and how it is sampled.
+ *
+ * A `trend` marginal is a location-scale Student-t predictive (the OLS
+ * projection). `sePred`/`df` are the honest scale + degrees of freedom; the
+ * simulator samples `projected + sePred·t_df`, which has the correct heavy
+ * tails for a small-n fit. `lo`/`hi` are kept as the displayed ~80% band. When
+ * `sePred`/`df` are absent (legacy/non-OLS producers) the simulator falls back
+ * to a Gaussian band derived from (hi−lo).
+ */
 export type DriverMarginal =
   | { kind: "binary"; probability: number }
   | { kind: "quantiles"; quantiles: Quantiles; logSpace?: boolean }
-  | { kind: "trend"; lo: number; projected: number; hi: number };
+  | { kind: "trend"; lo: number; projected: number; hi: number; sePred?: number; df?: number; logSpace?: boolean };
 
 /** One grounded simulation driver (a random variable in the Monte Carlo). */
 export interface SimDriver {
@@ -280,8 +301,10 @@ export interface SimDriver {
   label: string;
   marginal: DriverMarginal;
   provenance: DriverProvenance;
-  /** Numeric/trend drivers: the value above which the driver "fires" for scenario clustering. */
+  /** Numeric/trend drivers: the value at which the driver "fires" for scenario clustering. */
   threshold?: number;
+  /** Which side of `threshold` counts as "fired" — "above" (default) or "below" (a close-under-strike question). */
+  thresholdDir?: "above" | "below";
 }
 
 /**
@@ -292,7 +315,7 @@ export type CombinerNode =
   | { op: "driver"; id: string }
   | { op: "and"; children: CombinerNode[] }
   | { op: "or"; children: CombinerNode[] }
-  | { op: "threshold"; child: CombinerNode; above: number }
+  | { op: "threshold"; child: CombinerNode; above: number; dir?: "gt" | "lt" }
   | { op: "sum"; children: CombinerNode[] }
   | { op: "weighted_sum"; children: CombinerNode[]; weights: number[] }
   | { op: "max"; children: CombinerNode[] }
@@ -389,10 +412,14 @@ export type DomainId = (typeof DOMAIN_IDS)[number];
 /**
  * Which forecast knobs the operator pinned by hand this run. A flag here flips
  * the precedence from "the ledger-learned value wins" to "this exact value
- * wins" — only the three knobs that HAVE a learned chooser need a flag.
+ * wins" — one per knob that HAS a learned chooser. `extremizeKMc` is optional:
+ * when unset it inherits the `extremizeK` pin (so pinning binary k still pins
+ * the mc exponent, as before), and only an explicit value detaches the two.
  */
 export interface ForecastOverrideFlags {
   extremizeK?: boolean;
+  /** Pin the multiple-choice exponent independently of the binary one; defaults to the extremizeK pin when unset. */
+  extremizeKMc?: boolean;
   marketWeight?: boolean;
   sportsMarketWeight?: boolean;
 }
@@ -408,10 +435,17 @@ export interface FittedParams {
   domain?: DomainId;
   /** Logistic recalibration (a·logit(p)+b) + the resolution count it was fit on; null when too few binary resolutions. */
   recalibration: { a: number; b: number; n: number } | null;
+  /** Shared logistic recalibration for mc option probabilities (B2). Optional for models frozen before it existed. */
+  mcRecalibration?: { a: number; b: number; n: number } | null;
   extremizeK: number;
+  /** Separate multiple-choice extremization exponent (the mc GMO+renormalize geometry differs from binary). Optional for models frozen before it existed → fall back to extremizeK. */
+  extremizeKMc?: number;
   marketWeight: number;
   sportsMarketWeight: number;
   quantileDilation: number;
+  /** Asymmetric per-tail dilation (B3). Optional for models frozen before it existed → fall back to the symmetric quantileDilation. */
+  quantileDilationLo?: number;
+  quantileDilationUp?: number;
   /** Resolutions the dilation factor was fit on (so a frozen run reports an honest n). */
   quantileDilationN: number;
   methodWeights: Record<string, number>;
@@ -622,7 +656,7 @@ export interface RunSummary {
   sourceCount?: number;
   finalSummary?: string;
   /** Forecast runs: the headline aggregate once computed. */
-  forecast?: { p?: number; p50?: number; unit?: string; n: number; resolutionDate: string; count?: number };
+  forecast?: { p?: number; p50?: number; unit?: string; kind?: ForecastKind; n: number; resolutionDate: string; count?: number };
 }
 
 /**

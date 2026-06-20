@@ -13,6 +13,16 @@ export function fmtMoney(n: number): string {
   return "$" + n.toFixed(2);
 }
 
+/** Compact numeric display: thousands-separated above 1000, else 4 significant figures. */
+export function fmtNum(v: number): string {
+  return Math.abs(v) >= 1000 ? Math.round(v).toLocaleString() : String(Number(v.toPrecision(4)));
+}
+
+/** Epoch-days (how date forecasts store their quantiles) → ISO yyyy-mm-dd. */
+export function daysToIso(days: number): string {
+  return new Date(Math.round(days) * 86_400_000).toISOString().slice(0, 10);
+}
+
 export function fmtBytes(n: number): string {
   if (n < 1024) return n + " B";
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";

@@ -186,10 +186,10 @@ export const api = {
   forecasts: () => jget<{ forecasts: LedgerEntry[]; calibration: CalibrationStats }>("/api/forecasts"),
   resolveForecasts: (ids?: string[]) =>
     jpost<{
-      resolved: { id: string; outcome: 0 | 1 | number | "void"; brier?: number; question: string }[];
+      resolved: { id: string; outcome: 0 | 1 | number | string | "void"; brier?: number; question: string }[];
       skipped: { id: string; question: string; reason: string }[];
     }>("/api/forecasts/resolve", ids?.length ? { ids } : {}),
-  resolveManual: (id: string, outcome: "yes" | "no" | "void" | number) =>
+  resolveManual: (id: string, outcome: "yes" | "no" | "void" | "never" | number | string) =>
     jpost<{ ok: boolean }>(`/api/forecasts/${id}/resolve`, { outcome }),
   detectDomain: (text: string) => jpost<DomainDetection>("/api/forecast/detect", { text }),
   forecastModels: () => jget<{ models: ForecastModelView[] }>("/api/forecast-models"),

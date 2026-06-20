@@ -35,6 +35,12 @@ const {
   calibrationStats,
   calibrationBlock,
   chooseExtremizeK,
+  chooseExtremizeKMc,
+  chooseSimulationWeight,
+  preSimBinaryHeadline,
+  MIN_SIM_WEIGHT_N,
+  backtest,
+  backtestMc,
   blendWithMarket,
   liquidityFactor,
   chooseMarketWeight,
@@ -52,7 +58,9 @@ const {
   isoToDays,
   daysToIso,
   applyQuantileDilation,
+  applyAsymmetricDilation,
   fitQuantileCalibration,
+  fitIntervalCalibration,
   backtestNumeric,
   MIN_CALIBRATION_N,
   MIN_ADAPTIVE_N,
@@ -1053,6 +1061,96 @@ test("applyQuantileDilation widens around p50, is identity at d=1, stays monoton
   near(lg.p10, 25, 1e-6); // (50/100)² · 100
 });
 
+test("applyQuantileDilation is EXACTLY the symmetric case of applyAsymmetricDilation (one shared kernel)", () => {
+  // The symmetric function now delegates to the asymmetric one; this locks the
+  // equivalence so the log/linear stretch kernel can never drift between them.
+  const shapes = [
+    { p10: 10, p50: 20, p90: 30 },
+    { p5: 5, p10: 10, p25: 15, p50: 20, p75: 25, p90: 30, p95: 35 },
+    { p10: 50, p50: 100, p90: 200 },
+  ];
+  for (const q of shapes) {
+    for (const d of [0.6, 1, 1.5, 2.4]) {
+      for (const ls of [false, true]) {
+        assert.deepEqual(applyQuantileDilation(q, d, ls), applyAsymmetricDilation(q, d, d, ls), `d=${d} logSpace=${ls}`);
+      }
+    }
+  }
+});
+
+test("preSimBinaryHeadline reads superseded-first, then the recalibration chain (one source for fit + serve)", () => {
+  // H2 supersede value wins over everything below it.
+  near(preSimBinaryHeadline({ extremized: 0.5, recalibrated: 0.6, superseded: 0.9 }, 0.5), 0.9, 1e-12);
+  near(preSimBinaryHeadline({ extremized: 0.5, blended: 0.55, recalibrated: 0.6 }, 0.5), 0.6, 1e-12);
+  near(preSimBinaryHeadline({ extremized: 0.5, blended: 0.55 }, 0.5), 0.55, 1e-12);
+  near(preSimBinaryHeadline({ extremized: 0.5 }, 0.3), 0.5, 1e-12);
+  // empty / undefined components → fallback
+  near(preSimBinaryHeadline(undefined, 0.42), 0.42, 1e-12);
+  near(preSimBinaryHeadline({}, 0.42), 0.42, 1e-12);
+});
+
+test("chooseSimulationWeight(binary) reads the post-supersede headline as the pre-sim value (H2)", () => {
+  // 30 resolved YES binaries. The simulation (0.7) is BETTER than the panel
+  // (extremized 0.5) but WORSE than the post-supersede headline (0.9). So:
+  //  · superseded present → pre=0.9, blending toward 0.7 only hurts → w stays 0.
+  //  · superseded absent  → pre=0.5, blending toward 0.7 helps      → w > 0.
+  // A fit that ignored `superseded` (read extremized) would pick w>0 in BOTH.
+  const mk = (withSuperseded) =>
+    Array.from({ length: MIN_SIM_WEIGHT_N }, (_, i) => ({
+      v: 1,
+      id: `s${i}`,
+      runId: "r",
+      t: i,
+      question: { ...QUESTION, kind: "binary" },
+      aggregate: {
+        probability: 0.7,
+        k: 2.5,
+        n: 3,
+        spread: 0.1,
+        components: { extremized: 0.5, simulated: 0.7, ...(withSuperseded ? { superseded: 0.9 } : {}) },
+      },
+      panel: [],
+      resolution: { v: 1, rec: "resolved", id: `s${i}`, t: i + 1, outcome: 1, evidence: "", sources: [], resolvedBy: "operator" },
+    }));
+  const wWith = chooseSimulationWeight(mk(true), "binary", 0);
+  const wWithout = chooseSimulationWeight(mk(false), "binary", 0);
+  assert.equal(wWith, 0, "a strong post-supersede headline shouldn't be dragged toward a weaker sim");
+  assert.ok(wWithout > 0, "without the supersede update, the weaker panel benefits from the sim");
+});
+
+test("chooseSimulationWeight(numeric) learns from previously-blended entries via the pre-sim snapshot (non-circular)", () => {
+  // Entries that were already sim-blended (simBlendWeight set) used to be dropped
+  // wholesale; now they feed the fit through components.preSimQuantiles (the
+  // honest pre-blend value), exactly like the binary path. Outcome ≈ 100; the
+  // pre-sim band sits far below it and the sim is centered on it, so the fit
+  // should learn w>0 — but ONLY because the snapshot lets it read a pre-sim value.
+  const mk = (withSnapshot) =>
+    Array.from({ length: MIN_SIM_WEIGHT_N }, (_, i) => ({
+      v: 1,
+      id: `n${i}`,
+      runId: "r",
+      t: i,
+      question: { ...QUESTION, kind: "numeric" },
+      aggregate: {
+        quantiles: { p10: 95, p50: 100, p90: 105 }, // post-blend headline (already moved toward sim)
+        k: 2.5,
+        n: 3,
+        spread: 0.1,
+        components: {
+          simulatedQ: { p10: 95, p50: 100, p90: 105 },
+          simBlendWeight: 0.2, // marks the entry as ALREADY blended
+          ...(withSnapshot ? { preSimQuantiles: { p10: 5, p50: 10, p90: 15 } } : {}),
+        },
+      },
+      panel: [],
+      resolution: { v: 1, rec: "resolved", id: `n${i}`, t: i + 1, outcome: 100 + (i % 5), evidence: "", sources: [], resolvedBy: "operator" },
+    }));
+  const wSnapshot = chooseSimulationWeight(mk(true), "numeric", 0);
+  const wNone = chooseSimulationWeight(mk(false), "numeric", 0);
+  assert.ok(wSnapshot > 0, "with the pre-sim snapshot the blended entries are usable and the sim earns weight");
+  assert.equal(wNone, 0, "without a snapshot, already-blended entries stay excluded (avoids the circular fit)");
+});
+
 test("fitQuantileCalibration widens systematically over-narrow intervals, falls back below MIN, doesn't widen well-covered ones", () => {
   const mk = (outcome) => ({
     v: 1,
@@ -1359,7 +1457,7 @@ test("backtestNumeric replays interval forecasts, scores coverage, and credits d
     return mkNum([q, { ...q }], center + 5.5);
   });
   const r = backtestNumeric(entries);
-  assert.equal(r.rows.length, 4);
+  assert.equal(r.rows.length, 5); // +asymmetric dilation row (B3)
   for (const row of r.rows) {
     assert.equal(row.n, 12);
     assert.ok(row.coverage >= 0 && row.coverage <= 1);
@@ -1409,4 +1507,273 @@ test("bootstrapCi uses the exact percentile indices of the sorted bootstrap mean
 
 test.after(() => {
   fs.rmSync(TMP_HOME, { recursive: true, force: true });
+});
+
+// ============================================================ Phase 2: flywheel train/serve consistency
+
+const olEntry = (id, probs, overlap, outcome) => ({
+  v: 1,
+  id,
+  runId: "r",
+  t: 1,
+  question: { kind: "binary", text: "q", resolutionCriteria: "", resolutionDate: "2030-01-01" },
+  aggregate: { probability: 0.65, k: 2.5, n: probs.length, spread: 0, evidenceOverlap: overlap },
+  evidenceOverlap: overlap,
+  panel: probs.map((p, i) => ({ taskId: `T${i}`, method: "outside-view", probability: p })),
+  resolution: { v: 1, rec: "resolved", id, t: 2, outcome, evidence: "", sources: [], resolvedBy: "swarm" },
+});
+
+// 40 entries: panel says 0.65 but YES resolves 80% of the time → underconfident,
+// so extremization (k>1) lowers Brier; optimal effective exponent ≈ 2.24.
+const overlapLedger = (overlap) =>
+  Array.from({ length: 40 }, (_, i) => olEntry(`o${overlap}_${i}`, [0.65, 0.65, 0.65], overlap, i < 32 ? 1 : 0));
+
+test("A1: chooseExtremizeK replays the SERVED estimator (scaleK+weights) — overlap raises the fitted raw k", () => {
+  const kLow = chooseExtremizeK(overlapLedger(0), DEFAULT_EXTREMIZE_K);
+  const kHigh = chooseExtremizeK(overlapLedger(0.6), DEFAULT_EXTREMIZE_K);
+  // The live path applies scaleK(k, overlap) < k, so to reach the same Brier-optimal
+  // sharpening the learner must pick a LARGER raw k when overlap is high. Fitting raw
+  // k (the old skew) would return the same value regardless of overlap.
+  assert.ok(kHigh > kLow + 0.3, `kHigh ${kHigh} should exceed kLow ${kLow} by overlap compensation`);
+  // Sanity: the fitted k actually beats no-extremization on the served path.
+  const probs = [0.65, 0.65, 0.65];
+  const servedBrier = (k) => {
+    let s = 0;
+    for (let i = 0; i < 40; i++) s += Math.pow(aggregateBinary(probs, scaleK(k, 0)).probability - (i < 32 ? 1 : 0), 2);
+    return s / 40;
+  };
+  assert.ok(servedBrier(kLow) < servedBrier(1), "fitted k beats k=1 on the served estimator");
+});
+
+const mcEntry2 = (id, realized, overlap = 0) => ({
+  v: 1,
+  id,
+  runId: "r",
+  t: 1,
+  question: { kind: "mc", text: "q", resolutionCriteria: "", resolutionDate: "2030-01-01", options: ["A", "B", "C"] },
+  aggregate: { optionProbs: { A: 0.5, B: 0.3, C: 0.2 }, n: 3, spread: 0, evidenceOverlap: overlap },
+  evidenceOverlap: overlap,
+  panel: [0, 1, 2].map((i) => ({ taskId: `T${i}`, method: "outside-view", optionProbs: { A: 0.5, B: 0.3, C: 0.2 } })),
+  resolution: { v: 1, rec: "resolved", id, t: 2, outcome: realized, evidence: "", sources: [], resolvedBy: "swarm" },
+});
+
+// A wins 70%, panel only gives it 0.5 → an underconfident-but-correct mc panel wants sharpening.
+const mcLedger = Array.from({ length: 40 }, (_, i) => mcEntry2(`m${i}`, i < 28 ? "A" : i < 34 ? "B" : "C"));
+
+test("A2: chooseExtremizeKMc fits a SEPARATE mc exponent and sharpens an underconfident correct panel", () => {
+  const k = chooseExtremizeKMc(mcLedger, DEFAULT_EXTREMIZE_K);
+  assert.ok(k >= 1 && k <= 6, `kMc in [1,6], got ${k}`);
+  assert.ok(k > 1.1, `underconfident-but-correct mc panel should sharpen (k>1), got ${k}`);
+});
+
+test("A2: backtestMc replays mc entries with an adaptive-kMc row scored on multiclass Brier/log-loss", () => {
+  const rep = backtestMc(mcLedger);
+  assert.ok(rep.rows.length >= 3, "has published/static/adaptive rows");
+  assert.ok(rep.rows.some((r) => /kMc/.test(r.config)), "has an adaptive-kMc row");
+  assert.ok(rep.rows.every((r) => r.n === 40 && Number.isFinite(r.brierMean) && Number.isFinite(r.logLossMean)));
+});
+
+const domAnchored = (id, domain, marketP, outcome) => ({
+  v: 1,
+  id,
+  runId: "r",
+  t: 1,
+  domain,
+  question: { kind: "binary", text: "q", resolutionCriteria: "", resolutionDate: "2030-01-01" },
+  aggregate: {
+    probability: 0.5,
+    k: 2.5,
+    n: 3,
+    spread: 0,
+    components: { extremized: 0.5, market: { platform: "polymarket", url: "u", probability: marketP, volume: 100_000, weight: 0.4 } },
+  },
+  panel: [{ taskId: "T0", method: "outside-view", probability: 0.5 }, { taskId: "T1", method: "outside-view", probability: 0.5 }, { taskId: "T2", method: "outside-view", probability: 0.5 }],
+  resolution: { v: 1, rec: "resolved", id, t: 2, outcome, evidence: "", sources: [], resolvedBy: "swarm" },
+});
+
+test("A5: per-domain partial pooling — a market reliable in one domain earns more weight there than in a domain where it's wrong", () => {
+  // macro: market always WRONG (anti-correlated) → wants weight 0.
+  // finance: market always RIGHT → wants high weight. Mixed global is intermediate.
+  const macro = Array.from({ length: 25 }, (_, i) => domAnchored(`ma${i}`, "macro", i % 2 ? 0.1 : 0.9, i % 2 ? 1 : 0));
+  const finance = Array.from({ length: 25 }, (_, i) => domAnchored(`fi${i}`, "finance", i % 2 ? 0.9 : 0.1, i % 2 ? 1 : 0));
+  const all = [...macro, ...finance];
+  const wFinance = chooseMarketWeight(all, DEFAULT_MARKET_WEIGHT, "finance");
+  const wMacro = chooseMarketWeight(all, DEFAULT_MARKET_WEIGHT, "macro");
+  assert.ok(wFinance > wMacro + 0.3, `finance weight ${wFinance} should exceed macro weight ${wMacro} (pooling toward the in-domain fit)`);
+});
+
+// ---- Phase-2 review fixes: pooling guard + multi-method exercise ----
+
+const mcDomEntry = (id, domain, realized) => ({
+  v: 1, id, runId: "r", t: 1, domain,
+  question: { kind: "mc", text: "q", resolutionCriteria: "", resolutionDate: "2030-01-01", options: ["A", "B", "C"] },
+  aggregate: { optionProbs: { A: 0.5, B: 0.3, C: 0.2 }, n: 3, spread: 0, evidenceOverlap: 0 },
+  evidenceOverlap: 0,
+  panel: [0, 1, 2].map((i) => ({ taskId: `T${i}`, method: "outside-view", optionProbs: { A: 0.5, B: 0.3, C: 0.2 } })),
+  resolution: { v: 1, rec: "resolved", id, t: 2, outcome: realized, evidence: "", sources: [], resolvedBy: "swarm" },
+});
+const binDomEntry = (id, domain, p, outcome) => ({
+  v: 1, id, runId: "r", t: 1, domain,
+  question: { kind: "binary", text: "q", resolutionCriteria: "", resolutionDate: "2030-01-01" },
+  aggregate: { probability: p, k: 2.5, n: 3, spread: 0, evidenceOverlap: 0 },
+  evidenceOverlap: 0,
+  panel: [0, 1, 2].map((i) => ({ taskId: `T${i}`, method: "outside-view", probability: p })),
+  resolution: { v: 1, rec: "resolved", id, t: 2, outcome, evidence: "", sources: [], resolvedBy: "swarm" },
+});
+
+test("A5 pooling guard: a thin in-domain mc slice rests on the GLOBAL mc k, never the cold default", () => {
+  // 35 mc entries (domain macro) where A wins 90% → a learnable, high global mc k.
+  const macroMc = Array.from({ length: 35 }, (_, i) => mcDomEntry(`gm${i}`, "macro", i < 31 ? "A" : i < 33 ? "B" : "C"));
+  // finance: 40 binary resolutions (irrelevant to the mc fit) + only 3 mc (< MIN_ADAPTIVE_N).
+  const finBin = Array.from({ length: 40 }, (_, i) => binDomEntry(`fb${i}`, "finance", 0.6, i < 32 ? 1 : 0));
+  const finMc = Array.from({ length: 3 }, (_, i) => mcDomEntry(`fm${i}`, "finance", "A"));
+  const all = [...macroMc, ...finBin, ...finMc];
+  const globalK = chooseExtremizeKMc(all, DEFAULT_EXTREMIZE_K);
+  const financeK = chooseExtremizeKMc(all, DEFAULT_EXTREMIZE_K, "finance");
+  // The finance local mc fit can't learn (3 < 30), so pooling must return the
+  // global mc k verbatim — NOT blend it toward the default driven by 40 binary rows.
+  near(financeK, globalK, 1e-9, "thin in-domain mc rests on the global pool");
+  assert.ok(Math.abs(financeK - DEFAULT_EXTREMIZE_K) > 0.1, `should not regress to the default ${DEFAULT_EXTREMIZE_K}, got ${financeK}`);
+});
+
+test("A5 pooling guard: a domain with no usable market history keeps the GLOBAL market weight, not the fallback", () => {
+  // Global: 30 binary anchored entries where the market is always right → high global weight.
+  const global = Array.from({ length: 30 }, (_, i) => ({ ...anchoredEntry(0.5, i % 2 ? 0.9 : 0.1, i % 2 ? 1 : 0), id: `g${i}`, domain: "macro" }));
+  // finance: binary resolutions with NO market component (not usable for the market-weight fit).
+  const finance = Array.from({ length: 25 }, (_, i) => binDomEntry(`f${i}`, "finance", 0.6, i % 2));
+  const all = [...global, ...finance];
+  const globalW = chooseMarketWeight(all, DEFAULT_MARKET_WEIGHT);
+  const financeW = chooseMarketWeight(all, DEFAULT_MARKET_WEIGHT, "finance");
+  near(financeW, globalW, 1e-9, "no usable in-domain market history ⇒ global weight, not fallback");
+});
+
+test("chooseExtremizeK handles a multi-method panel without error (weighted served replay)", () => {
+  // Two methods of differing accuracy → non-uniform weights exercise the weighted path.
+  const entries = Array.from({ length: 35 }, (_, i) => ({
+    v: 1, id: `mm${i}`, runId: "r", t: 1,
+    question: { kind: "binary", text: "q", resolutionCriteria: "", resolutionDate: "2030-01-01" },
+    aggregate: { probability: 0.6, k: 2.5, n: 2, spread: 0, evidenceOverlap: 0.2 },
+    evidenceOverlap: 0.2,
+    panel: [
+      { taskId: "T0", method: "outside-view", probability: i < 30 ? 0.7 : 0.3 },
+      { taskId: "T1", method: "trend", probability: 0.5 },
+    ],
+    resolution: { v: 1, rec: "resolved", id: `mm${i}`, t: 2, outcome: i < 28 ? 1 : 0, evidence: "", sources: [], resolvedBy: "swarm" },
+  }));
+  const k = chooseExtremizeK(entries, DEFAULT_EXTREMIZE_K);
+  assert.ok(k >= 1 && k <= 6 && Number.isFinite(k), `multi-method fit returns a valid k, got ${k}`);
+});
+
+// ---- B3: asymmetric (per-tail) interval calibration ----
+
+test("applyAsymmetricDilation widens each tail by its own factor; dLo=dUp ≡ symmetric", () => {
+  const q = { p10: 90, p25: 95, p50: 100, p75: 105, p90: 110 };
+  // Upper-only dilation (dLo=1, dUp=2): p50 fixed, lower untouched, upper widened.
+  const up = applyAsymmetricDilation(q, 1, 2, false);
+  assert.equal(up.p50, 100);
+  assert.equal(up.p10, 90, "lower tail unchanged at dLo=1");
+  assert.equal(up.p90, 100 + 2 * 10, "upper tail widened by dUp");
+  assert.equal(up.p75, 100 + 2 * 5);
+  // dLo=dUp matches the symmetric path exactly.
+  const asym = applyAsymmetricDilation(q, 1.3, 1.3, false);
+  const sym = applyQuantileDilation(q, 1.3, false);
+  for (const k of ["p10", "p25", "p50", "p75", "p90"]) near(asym[k], sym[k], 1e-9, k);
+});
+
+test("fitIntervalCalibration learns a wider dilation on the tail that is systematically too narrow", () => {
+  // Panels symmetric & narrow, but outcomes land BELOW the band (lower tail too
+  // tight) — the lower dilation should learn larger than the upper.
+  const mk = (id, center, outcome) => ({
+    v: 1, id, runId: "r", t: 1,
+    question: { kind: "numeric", text: "q", resolutionCriteria: "", resolutionDate: "2030-01-01" },
+    aggregate: { quantiles: { p10: center - 5, p50: center, p90: center + 5 }, predilationQuantiles: { p10: center - 5, p50: center, p90: center + 5 }, k: 2.5, n: 2, spread: 0 },
+    panel: [{ taskId: "T0", method: "trend", quantiles: { p10: center - 5, p50: center, p90: center + 5 } }],
+    resolution: { v: 1, rec: "resolved", id, t: 2, outcome, evidence: "", sources: [], resolvedBy: "swarm" },
+  });
+  // Outcome consistently ~9 below center → far past the lower p10 (−5), inside upper.
+  const entries = Array.from({ length: 30 }, (_, i) => mk(`d${i}`, 100 + i, 100 + i - 9));
+  const cal = fitIntervalCalibration(entries, DEFAULT_QUANTILE_DILATION);
+  assert.equal(cal.source, "learned");
+  assert.ok(cal.dLo > cal.dUp, `lower tail should widen more (dLo ${cal.dLo} > dUp ${cal.dUp})`);
+});
+
+// ---- B2: mc recalibration / B1: beta calibration ----
+
+const { fitMcRecalibration, applyMcRecalibration, fitBetaCalibration, applyBetaCalibration } = require("../../dist/forecast.js");
+
+test("applyMcRecalibration applies a shared logistic per option and renormalizes to the simplex", () => {
+  const r = { a: 1.5, b: 0, n: 40 }; // sharpen (a>1)
+  const out = applyMcRecalibration({ A: 0.5, B: 0.3, C: 0.2 }, r);
+  near(out.A + out.B + out.C, 1, 1e-9, "renormalized");
+  assert.ok(out.A > 0.5, "a>1 sharpens the leader");
+  // null recalibration is identity.
+  const id = applyMcRecalibration({ A: 0.6, B: 0.4 }, null);
+  near(id.A, 0.6, 1e-9);
+});
+
+test("fitMcRecalibration learns a correction from a systematically over/under-confident mc record", () => {
+  // Panels give the winner 0.5 but it wins 75% of the time → underconfident →
+  // recalibration should push the leader up (a>1 or b favoring it).
+  const entries = Array.from({ length: 40 }, (_, i) => ({
+    v: 1, id: `mr${i}`, runId: "r", t: 1,
+    question: { kind: "mc", text: "q", resolutionCriteria: "", resolutionDate: "2030-01-01", options: ["A", "B", "C"] },
+    aggregate: { optionProbs: { A: 0.5, B: 0.3, C: 0.2 }, n: 3, spread: 0 },
+    panel: [{ taskId: "T0", method: "outside-view", optionProbs: { A: 0.5, B: 0.3, C: 0.2 } }],
+    resolution: { v: 1, rec: "resolved", id: `mr${i}`, t: 2, outcome: i < 30 ? "A" : i < 35 ? "B" : "C", evidence: "", sources: [], resolvedBy: "swarm" },
+  }));
+  const recal = fitMcRecalibration(entries);
+  assert.ok(recal, "learns above the threshold");
+  const before = 0.5;
+  const after = applyMcRecalibration({ A: 0.5, B: 0.3, C: 0.2 }, recal).A;
+  assert.ok(after > before, `underconfident leader should be pushed up (${before} → ${after})`);
+  // Below threshold → null.
+  assert.equal(fitMcRecalibration(entries.slice(0, 10)), null);
+});
+
+test("beta calibration fits and reduces to identity sensibly; applyBetaCalibration is monotone", () => {
+  // A well-calibrated record → near-identity map (a≈b≈1, c≈0), so it barely moves p.
+  const entries = Array.from({ length: 50 }, (_, i) => resolvedEntry(`bc${i}`, (i % 10) / 10 + 0.05, ((i % 10) / 10 + 0.05) > Math.random() ? 1 : 0));
+  const cal = fitBetaCalibration(entries);
+  assert.ok(cal, "fits above the threshold");
+  // Monotone: higher p maps to higher p'.
+  assert.ok(applyBetaCalibration(0.8, cal) > applyBetaCalibration(0.3, cal));
+  // Identity when null.
+  near(applyBetaCalibration(0.42, null), 0.42, 1e-9);
+});
+
+// ---- G2: outside-view prior→final delta scoring ----
+
+const { priorDeltaStats } = require("../../dist/forecast.js");
+
+test("priorDeltaStats flags when big deviations from the committed prior LOSE to holding it (G2)", () => {
+  // Panels commit prior 0.5, then swing hard to 0.9 — but the outcome is NO.
+  // Big moves are wrong → bigMovesPayOff should be false and large-move Brier > prior Brier.
+  const bigWrong = (id) => ({
+    v: 1, id, runId: "r", t: 1,
+    question: { kind: "binary", text: "q", resolutionCriteria: "", resolutionDate: "2030-01-01" },
+    aggregate: { probability: 0.9, k: 2.5, n: 2, spread: 0 },
+    panel: [{ taskId: "T0", method: "outside-view", prior: 0.5, probability: 0.9 }],
+    resolution: { v: 1, rec: "resolved", id, t: 2, outcome: 0, evidence: "", sources: [], resolvedBy: "swarm" },
+  });
+  // Small-move, well-calibrated entries (prior≈final, correct).
+  const smallOk = (id, p, o) => ({
+    v: 1, id, runId: "r", t: 1,
+    question: { kind: "binary", text: "q", resolutionCriteria: "", resolutionDate: "2030-01-01" },
+    aggregate: { probability: p, k: 2.5, n: 2, spread: 0 },
+    panel: [{ taskId: "T0", method: "outside-view", prior: p, probability: p }],
+    resolution: { v: 1, rec: "resolved", id, t: 2, outcome: o, evidence: "", sources: [], resolvedBy: "swarm" },
+  });
+  const entries = [
+    ...Array.from({ length: 8 }, (_, i) => bigWrong(`bw${i}`)),
+    ...Array.from({ length: 8 }, (_, i) => smallOk(`so${i}`, i % 2 ? 0.8 : 0.2, i % 2 ? 1 : 0)),
+  ];
+  const pd = priorDeltaStats(entries);
+  assert.equal(pd.n, 16);
+  assert.ok(pd.meanAbsDelta > 0);
+  assert.equal(pd.bigMovesPayOff, false, "big wrong moves should NOT pay off");
+  assert.ok(pd.largeMoveBrier > pd.largeMovePriorBrier, "holding the prior would have beaten the big moves");
+  // No priors → empty/neutral.
+  const noPriors = priorDeltaStats([resolvedEntry("x", 0.7, 1)]);
+  assert.equal(noPriors.n, 0);
+  assert.equal(noPriors.bigMovesPayOff, true);
 });

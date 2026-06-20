@@ -6,12 +6,12 @@ import { CalibrationChart } from "@/components/CalibrationChart";
 import { TopBar } from "@/components/TopBar";
 import { EmptyState, Spinner } from "@/components/atoms";
 import { api } from "@/lib/api";
+import { daysToIso, fmtNum } from "@/lib/format";
+import { useNow } from "@/lib/hooks";
 import type { CalibrationStats, LedgerEntry } from "@/lib/types";
 
 const pct = (p: number) => `${Math.round(p * 100)}%`;
-const fmtNum = (v: number) => (Math.abs(v) >= 1000 ? Math.round(v).toLocaleString() : String(Number(v.toPrecision(4))));
 const fmtDate = (t: number) => new Date(t).toISOString().slice(0, 10);
-const daysToIso = (days: number) => new Date(Math.round(days) * 86_400_000).toISOString().slice(0, 10);
 
 function isDue(e: LedgerEntry, now: number): boolean {
   return !e.resolution && Date.parse(`${e.question.resolutionDate}T23:59:59Z`) <= now;
@@ -119,6 +119,76 @@ function exportCsv(entries: LedgerEntry[]): void {
   downloadText("forecast-ledger.csv", "text/csv", rows.join("\n"));
 }
 
+type ManualOutcome = "yes" | "no" | "void" | "never" | number | string;
+
+/**
+ * Operator manual-resolution controls — kind-aware so a due numeric/date/mc
+ * forecast the auto-resolver can't settle can still be recorded with its real
+ * value (not just voided). Mirrors the `swarm resolve set` CLI surface. Holds its
+ * own input state per row so typing doesn't re-render the whole list.
+ */
+function ManualResolveControls({
+  e,
+  onResolve,
+  disabled,
+}: {
+  e: LedgerEntry;
+  onResolve: (id: string, outcome: ManualOutcome) => void;
+  disabled?: boolean;
+}) {
+  const [val, setVal] = useState("");
+  const kind = e.question.kind;
+  return (
+    <span className="flex flex-wrap gap-1 justify-end items-center">
+      {kind === "binary" && (
+        <>
+          <button className="chip" title="Mark resolved YES (operator)" disabled={disabled} onClick={() => onResolve(e.id, "yes")}>YES</button>
+          <button className="chip" title="Mark resolved NO (operator)" disabled={disabled} onClick={() => onResolve(e.id, "no")}>NO</button>
+        </>
+      )}
+      {kind === "numeric" && (
+        <>
+          <input
+            className="input text-2xs w-24 px-2 py-1"
+            inputMode="decimal"
+            placeholder={e.question.unit ? `value (${e.question.unit})` : "value"}
+            aria-label="Realized value"
+            value={val}
+            onChange={(ev) => setVal(ev.target.value)}
+          />
+          <button className="chip" title="Resolve with the realized value" disabled={disabled || val.trim() === "" || !Number.isFinite(Number(val))} onClick={() => onResolve(e.id, Number(val))}>set</button>
+        </>
+      )}
+      {kind === "date" && (
+        <>
+          <input className="input text-2xs w-32 px-2 py-1" type="date" aria-label="Realized date" value={val} onChange={(ev) => setVal(ev.target.value)} />
+          <button className="chip" title="Resolve with the realized date" disabled={disabled || !/^\d{4}-\d{2}-\d{2}$/.test(val)} onClick={() => onResolve(e.id, val)}>set</button>
+          <button className="chip" title="It never happened by the horizon" disabled={disabled} onClick={() => onResolve(e.id, "never")}>never</button>
+        </>
+      )}
+      {kind === "mc" && (e.question.options ?? []).length > 0 && (
+        <select
+          className="input text-2xs max-w-[150px] px-2 py-1"
+          aria-label="Realized option"
+          value={val}
+          disabled={disabled}
+          onChange={(ev) => {
+            const v = ev.target.value;
+            setVal(v);
+            if (v) onResolve(e.id, v);
+          }}
+        >
+          <option value="">resolve…</option>
+          {(e.question.options ?? []).map((o) => (
+            <option key={o} value={o}>{o}</option>
+          ))}
+        </select>
+      )}
+      <button className="chip" title="Mark void — the question stopped being meaningful" disabled={disabled} onClick={() => onResolve(e.id, "void")}>void</button>
+    </span>
+  );
+}
+
 export default function ForecastsPage() {
   const [entries, setEntries] = useState<LedgerEntry[] | null>(null);
   const [calibration, setCalibration] = useState<CalibrationStats | null>(null);
@@ -127,7 +197,9 @@ export default function ForecastsPage() {
   const [resolving, setResolving] = useState<Set<string> | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [modelFilter, setModelFilter] = useState<string | null>(null);
-  const now = Date.now();
+  // Tick coarsely (deadlines are day-granularity) so a forecast crossing its
+  // resolution date while the page is open moves into the 'due' bucket on its own.
+  const now = useNow(60_000);
 
   // Honor /forecasts?model=<id> (from the saved-models card / composer picker).
   useEffect(() => {
@@ -177,7 +249,7 @@ export default function ForecastsPage() {
     }
   };
 
-  const manual = async (id: string, outcome: "yes" | "no" | "void") => {
+  const manual = async (id: string, outcome: ManualOutcome) => {
     try {
       await api.resolveManual(id, outcome);
       await load();
@@ -428,15 +500,7 @@ export default function ForecastsPage() {
                           <button className="btn btn-sm" disabled={!!resolving} onClick={() => resolveNow([e.id])}>
                             {busy ? <Spinner size={11} /> : null} Resolve now
                           </button>
-                          <span className="flex gap-1">
-                            {e.question.kind === "binary" && (
-                              <>
-                                <button className="chip" title="Mark resolved YES (operator)" onClick={() => manual(e.id, "yes")}>YES</button>
-                                <button className="chip" title="Mark resolved NO (operator)" onClick={() => manual(e.id, "no")}>NO</button>
-                              </>
-                            )}
-                            <button className="chip" title="Mark void — the question stopped being meaningful" onClick={() => manual(e.id, "void")}>void</button>
-                          </span>
+                          <ManualResolveControls e={e} onResolve={manual} disabled={!!resolving} />
                         </div>
                       ) : (
                         <span className="chip">open</span>

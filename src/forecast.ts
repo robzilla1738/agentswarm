@@ -4,6 +4,7 @@ import { home } from "./config";
 import { normInv } from "./datatools";
 import { canonicalizeUrl } from "./searchcore";
 import {
+  AggregateComponents,
   AggregateForecast,
   CombinerNode,
   CombinerSpec,
@@ -577,13 +578,82 @@ function scopeToDomain(entries: LedgerEntry[], domain: DomainId | undefined, min
   return resolved >= minN ? inDomain : entries;
 }
 
+/** Shrinkage pseudo-count for per-domain partial pooling: at this many in-domain USABLE fits the local term gets half the weight. */
+export const POOL_KAPPA = 20;
+
+/**
+ * A scalar learner's result: the fitted value, whether it actually LEARNED (vs
+ * backed off to the fallback), and the count of entries IT could use. `learned`
+ * + `n` are what partial pooling needs — pooling a backed-off fallback would
+ * pull the global pool toward the cold prior, and weighting by a kind-agnostic
+ * resolution count would credit evidence this estimator never saw.
+ */
+interface ScalarFit {
+  value: number;
+  learned: boolean;
+  n: number;
+}
+
+/**
+ * Per-domain partial pooling for a SCALAR learner (James-Stein style): fit the
+ * parameter globally and in-domain, then blend the in-domain value toward the
+ * global one by the local fit's OWN usable sample — w = nLocal/(nLocal+κ). A hard
+ * in-domain↔global switch (the old scopeToDomain) regresses exactly when a domain
+ * first crosses its threshold and the thin local fit abruptly takes over; pooling
+ * shrinks that local fit toward the global pool until it has earned independence.
+ *
+ * Two guards keep this from regressing the GLOBAL value toward the static
+ * fallback (the bug the QCal learner already avoids): if the local fit did not
+ * learn (its own usable slice was below threshold) we return the global fit
+ * verbatim — a data-poor domain rests on the global POOL, never the cold prior —
+ * and the weight uses the local fit's usable count, not a kind-agnostic
+ * resolution tally that would over-credit wrong-kind history.
+ */
+function pooledScalarFit(
+  fit: (entries: LedgerEntry[]) => ScalarFit,
+  entries: LedgerEntry[],
+  domain: DomainId | undefined,
+  kappa = POOL_KAPPA
+): number {
+  const global = fit(entries);
+  if (!domain) return global.value;
+  const local = fit(entries.filter((e) => e.domain === domain));
+  if (!local.learned) return global.value; // rest on the global pool, not the fallback
+  const w = local.n / (local.n + kappa);
+  return w * local.value + (1 - w) * global.value;
+}
+
+/**
+ * Grid-search argmin returning the SMALLEST weight that achieves the minimum
+ * loss (strict-improvement-keep-first). This is deliberately conservative on a
+ * flat optimum: for a market that the record shows is uninformative or wrong,
+ * the low-weight region is flat (the −1/panelN residual clamps wEff to 0), and
+ * the smallest such weight is the only one guaranteed to stay harmless when
+ * applied LIVE to a future market whose liquidity may differ. (We considered
+ * breaking ties toward the prior weight to counter under-anchoring on good
+ * markets — the audit's C4 — but that hands a future high-liquidity *wrong*
+ * market residual weight, trading a guaranteed safety for a few ten-thousandths
+ * of Brier. Conservative wins.)
+ */
+function gridArgmin(loss: (x: number) => number, lo: number, hi: number, step: number): number {
+  let best = lo;
+  let bestLoss = Infinity;
+  for (let w = lo; w <= hi + 1e-9; w += step) {
+    const l = loss(Number(w.toFixed(6)));
+    if (l < bestLoss - 1e-12) {
+      bestLoss = l;
+      best = Number(w.toFixed(6));
+    }
+  }
+  return best;
+}
+
 /**
  * Fit the market blend weight on the resolved track record: the w that would
  * have minimized mean log loss re-blending each stored panel aggregate with
  * its stored market price. Falls back below MIN_MARKET_WEIGHT_N resolutions.
  */
-export function chooseMarketWeight(entries = loadLedger(), fallback = DEFAULT_MARKET_WEIGHT, domain?: DomainId): number {
-  entries = scopeToDomain(entries, domain, MIN_MARKET_WEIGHT_N);
+function chooseMarketWeightRaw(entries: LedgerEntry[], fallback: number): ScalarFit {
   const usable = entries.filter(
     (e) =>
       e.question.kind === "binary" &&
@@ -592,11 +662,8 @@ export function chooseMarketWeight(entries = loadLedger(), fallback = DEFAULT_MA
       Number.isFinite(e.aggregate.components?.extremized) &&
       Number.isFinite(e.aggregate.components?.market?.probability)
   );
-  if (usable.length < MIN_MARKET_WEIGHT_N) return fallback;
-  let bestW = fallback;
-  let bestLoss = Infinity;
-  for (let i = 0; i <= 10; i++) {
-    const w = i / 10;
+  if (usable.length < MIN_MARKET_WEIGHT_N) return { value: fallback, learned: false, n: usable.length };
+  const lossAt = (w: number): number => {
     let sum = 0;
     for (const e of usable) {
       const c = e.aggregate.components!;
@@ -610,13 +677,13 @@ export function chooseMarketWeight(entries = loadLedger(), fallback = DEFAULT_MA
       const p = blendWithMarket(c.extremized!, c.market!.probability, wEff);
       sum += -logScore(p, e.resolution!.outcome as 0 | 1);
     }
-    const mean = sum / usable.length;
-    if (mean < bestLoss - 1e-12) {
-      bestLoss = mean;
-      bestW = w;
-    }
-  }
-  return bestW;
+    return sum / usable.length;
+  };
+  return { value: gridArgmin(lossAt, 0, 1, 0.1), learned: true, n: usable.length };
+}
+
+export function chooseMarketWeight(entries = loadLedger(), fallback = DEFAULT_MARKET_WEIGHT, domain?: DomainId): number {
+  return pooledScalarFit((es) => chooseMarketWeightRaw(es, fallback), entries, domain);
 }
 
 // ---------------------------------------------------------------- sports line anchoring
@@ -774,8 +841,7 @@ export const MIN_SPORTS_MARKET_WEIGHT_N = 20;
  * chooseMarketWeight but in pinball space, re-applying the same −1/panelSize
  * residual the live path uses. Falls back to the high default below 20.
  */
-export function chooseSportsMarketWeight(entries = loadLedger(), fallback = DEFAULT_SPORTS_MARKET_WEIGHT, domain?: DomainId): number {
-  entries = scopeToDomain(entries, domain, MIN_SPORTS_MARKET_WEIGHT_N);
+function chooseSportsMarketWeightRaw(entries: LedgerEntry[], fallback: number): ScalarFit {
   const usable = entries.filter(
     (e) =>
       (e.question.kind === "numeric" || e.question.kind === "date") &&
@@ -784,11 +850,8 @@ export function chooseSportsMarketWeight(entries = loadLedger(), fallback = DEFA
       e.aggregate.components?.blendedQ &&
       e.aggregate.components?.marketLine
   );
-  if (usable.length < MIN_SPORTS_MARKET_WEIGHT_N) return fallback;
-  let bestW = fallback;
-  let bestLoss = Infinity;
-  for (let i = 0; i <= 10; i++) {
-    const w = i / 10;
+  if (usable.length < MIN_SPORTS_MARKET_WEIGHT_N) return { value: fallback, learned: false, n: usable.length };
+  const lossAt = (w: number): number => {
     let sum = 0;
     for (const e of usable) {
       const c = e.aggregate.components!;
@@ -797,13 +860,13 @@ export function chooseSportsMarketWeight(entries = loadLedger(), fallback = DEFA
       const wEff = Math.max(0, w - 1 / panelN);
       sum += pinballLoss(blendQuantilesWithMarket(c.blendedQ!, mq, wEff), e.resolution!.outcome as number);
     }
-    const mean = sum / usable.length;
-    if (mean < bestLoss - 1e-12) {
-      bestLoss = mean;
-      bestW = w;
-    }
-  }
-  return bestW;
+    return sum / usable.length;
+  };
+  return { value: gridArgmin(lossAt, 0, 1, 0.1), learned: true, n: usable.length };
+}
+
+export function chooseSportsMarketWeight(entries = loadLedger(), fallback = DEFAULT_SPORTS_MARKET_WEIGHT, domain?: DomainId): number {
+  return pooledScalarFit((es) => chooseSportsMarketWeightRaw(es, fallback), entries, domain);
 }
 
 // ---------------------------------------------------------------- method weighting
@@ -863,12 +926,46 @@ export interface Recalibration {
 export const MIN_RECALIBRATION_N = 40;
 
 /**
- * Fit (a, b) on the resolved record by grid search minimizing mean log loss,
- * regularized toward identity (γ = 2/n) so small samples barely move it.
- * The fit uses each entry's PRE-recalibration value (components.blended or
- * extremized) — fitting on already-recalibrated numbers would be circular.
- * The b intercept is the genuinely new dial vs adaptive-k: it corrects a
- * systematic YES-lean (LLM acquiescence bias) that no symmetric exponent can.
+ * The shared logistic-recalibration grid search: the (a, b) minimizing mean log
+ * loss over the (p, outcome) pairs, regularized toward identity (γ = 2/n) so
+ * small samples barely move it. Both the binary (fitRecalibration) and mc
+ * (fitMcRecalibration) fits are this exact loop over differently-collected pairs;
+ * keeping it in one place stops the two from drifting apart. The `n` reported on
+ * the result is supplied by the caller (binary: resolved forecasts; mc: resolved
+ * questions, since pairs within a question are correlated). a down to 0.1: LLM
+ * panels can be SEVERELY overconfident, and a slope floor of 0.5 made that
+ * uncorrectable; the identity-regularizer keeps small samples from wandering
+ * down there without evidence. Callers gate on their own minimum BEFORE calling.
+ */
+function fitLogisticRecal(pts: { p: number; outcome: 0 | 1 }[], n: number): Recalibration {
+  const gamma = 2 / pts.length;
+  let best: Recalibration = { a: 1, b: 0, n };
+  let bestLoss = Infinity;
+  for (let ai = 0; ai <= 38; ai++) {
+    const a = 0.1 + ai * 0.05;
+    for (let bi = -20; bi <= 20; bi++) {
+      const b = bi / 10;
+      let sum = 0;
+      for (const pt of pts) {
+        const odds = Math.exp(a * Math.log(pt.p / (1 - pt.p)) + b);
+        sum += -logScore(clampProb(odds / (1 + odds)), pt.outcome);
+      }
+      const loss = sum / pts.length + gamma * ((a - 1) * (a - 1) + b * b);
+      if (loss < bestLoss - 1e-12) {
+        bestLoss = loss;
+        best = { a: Number(a.toFixed(2)), b: Number(b.toFixed(2)), n };
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * Fit (a, b) on the resolved record minimizing mean log loss (shared
+ * fitLogisticRecal). The fit uses each entry's PRE-recalibration value
+ * (components.blended or extremized) — fitting on already-recalibrated numbers
+ * would be circular. The b intercept is the genuinely new dial vs adaptive-k: it
+ * corrects a systematic YES-lean (LLM acquiescence bias) no symmetric exponent can.
  */
 export function fitRecalibration(entries = loadLedger(), domain?: DomainId): Recalibration | null {
   entries = scopeToDomain(entries, domain, MIN_RECALIBRATION_N);
@@ -883,30 +980,7 @@ export function fitRecalibration(entries = loadLedger(), domain?: DomainId): Rec
     pts.push({ p: clampProb(p), outcome: o });
   }
   if (pts.length < MIN_RECALIBRATION_N) return null;
-  const gamma = 2 / pts.length;
-  let best: Recalibration = { a: 1, b: 0, n: pts.length };
-  let bestLoss = Infinity;
-  // a down to 0.1: LLM panels can be SEVERELY overconfident, and a slope
-  // floor of 0.5 made that uncorrectable. The identity-regularizer keeps
-  // small samples from actually wandering down there without evidence.
-  for (let ai = 0; ai <= 38; ai++) {
-    const a = 0.1 + ai * 0.05;
-    for (let bi = -20; bi <= 20; bi++) {
-      const b = bi / 10;
-      let sum = 0;
-      for (const pt of pts) {
-        const lo = Math.log(pt.p / (1 - pt.p));
-        const odds = Math.exp(a * lo + b);
-        sum += -logScore(clampProb(odds / (1 + odds)), pt.outcome);
-      }
-      const loss = sum / pts.length + gamma * ((a - 1) * (a - 1) + b * b);
-      if (loss < bestLoss - 1e-12) {
-        bestLoss = loss;
-        best = { a: Number(a.toFixed(2)), b: Number(b.toFixed(2)), n: pts.length };
-      }
-    }
-  }
-  return best;
+  return fitLogisticRecal(pts, pts.length);
 }
 
 export function applyRecalibration(p: number, r: Recalibration | null): number {
@@ -914,6 +988,130 @@ export function applyRecalibration(p: number, r: Recalibration | null): number {
   const cp = clampProb(p);
   const odds = Math.exp(r.a * Math.log(cp / (1 - cp)) + r.b);
   return clampProb(odds / (1 + odds));
+}
+
+// ---------------------------------------------------------------- mc recalibration (B2)
+
+/** Resolved mc QUESTIONS needed before option-probability recalibration leaves identity. */
+export const MIN_MC_RECALIBRATION_N = 30;
+
+/**
+ * Fit ONE shared logistic (a,b) over every (optionProb, did-it-happen) pair from
+ * the resolved mc record — the multiple-choice analogue of fitRecalibration,
+ * which mc previously had none of. A single shared map (not per-option) is the
+ * right model at these data volumes: it corrects the systematic over/under-
+ * confidence of the mc sharpening without K separate fits that would each see a
+ * handful of points. Gated on the count of resolved mc QUESTIONS (not pairs,
+ * which are correlated within a question). Returns null below the threshold.
+ */
+export function fitMcRecalibration(entries = loadLedger(), domain?: DomainId): Recalibration | null {
+  entries = scopeToDomain(entries, domain, MIN_MC_RECALIBRATION_N);
+  const pts: { p: number; outcome: 0 | 1 }[] = [];
+  let questions = 0;
+  for (const e of entries) {
+    if (e.question.kind !== "mc" || !e.resolution) continue;
+    const realized = e.resolution.outcome;
+    const options = e.question.options;
+    // Fit on the PRE-recalibration probs (fall back to the published ones for
+    // entries written before the snapshot existed) — fitting on already-
+    // recalibrated numbers would be circular, mirroring fitRecalibration.
+    const probs = e.aggregate.components?.preRecalOptionProbs ?? e.aggregate.optionProbs;
+    if (typeof realized !== "string" || realized === "void" || !options || !probs || !options.includes(realized)) continue;
+    questions++;
+    for (const opt of options) {
+      const p = probs[opt];
+      if (typeof p !== "number" || !Number.isFinite(p)) continue;
+      pts.push({ p: clampProb(p), outcome: opt === realized ? 1 : 0 });
+    }
+  }
+  if (questions < MIN_MC_RECALIBRATION_N || pts.length < MIN_MC_RECALIBRATION_N) return null;
+  // Same logistic grid as the binary fit, but the reported n is the resolved
+  // QUESTION count (pairs within a question are correlated, so they'd overstate it).
+  return fitLogisticRecal(pts, questions);
+}
+
+/** Apply a shared logistic recalibration to each option probability in log-odds, then renormalize to the simplex. */
+export function applyMcRecalibration(optionProbs: Record<string, number>, r: Recalibration | null): Record<string, number> {
+  if (!r) return optionProbs;
+  const out: Record<string, number> = {};
+  let sum = 0;
+  for (const [opt, p] of Object.entries(optionProbs)) {
+    const v = applyRecalibration(p, r);
+    out[opt] = v;
+    sum += v;
+  }
+  if (sum > 0) for (const opt of Object.keys(out)) out[opt] /= sum;
+  return out;
+}
+
+// ---------------------------------------------------------------- beta calibration (B1)
+
+/** Three-parameter beta calibration (Kull 2017): p′ = σ(c + a·ln p − b·ln(1−p)). */
+export interface BetaCalibration {
+  a: number;
+  b: number;
+  c: number;
+  n: number;
+}
+
+/**
+ * Beta calibration (Kull, Silva Filho & Flach 2017) — a richer alternative to the
+ * 2-parameter logistic (Platt) recalibration. Where Platt can only shift and
+ * scale the reliability curve affinely in log-odds, beta calibration fits
+ * separate slopes on ln p and ln(1−p), so it can bend an S-shaped or
+ * boundary-skewed curve. NOT isotonic regression (which overfits below ~1000
+ * points and serializes poorly). This is offered as a BACKTEST-GATED alternative:
+ * the binary backtest scores it head-to-head with Platt so promotion to the live
+ * path is earned, not assumed (Platt remains the live default until the gate
+ * shows beta wins, which needs more data than a cold ledger has). Returns null
+ * below the recalibration threshold.
+ */
+export function fitBetaCalibration(entries = loadLedger(), domain?: DomainId): BetaCalibration | null {
+  entries = scopeToDomain(entries, domain, MIN_RECALIBRATION_N);
+  const pts: { lp: number; l1p: number; outcome: 0 | 1 }[] = [];
+  for (const e of entries) {
+    if (e.question.kind !== "binary" || !e.resolution) continue;
+    const o = e.resolution.outcome;
+    if (o !== 0 && o !== 1) continue;
+    const c = e.aggregate.components;
+    const p = c?.blended ?? c?.extremized ?? e.aggregate.probability;
+    if (typeof p !== "number" || !Number.isFinite(p)) continue;
+    const cp = clampProb(p);
+    pts.push({ lp: Math.log(cp), l1p: Math.log(1 - cp), outcome: o });
+  }
+  if (pts.length < MIN_RECALIBRATION_N) return null;
+  const gamma = 2 / pts.length;
+  let best: BetaCalibration = { a: 1, b: 1, c: 0, n: pts.length };
+  let bestLoss = Infinity;
+  // a,b ≥ 0 (monotone non-decreasing map); grid over a sane range, c the intercept.
+  for (let ai = 0; ai <= 30; ai++) {
+    const a = ai * 0.1; // 0..3
+    for (let bj = 0; bj <= 30; bj++) {
+      const b = bj * 0.1; // 0..3
+      for (let ck = -20; ck <= 20; ck++) {
+        const cc = ck / 10; // -2..2
+        let sum = 0;
+        for (const pt of pts) {
+          const z = cc + a * pt.lp - b * pt.l1p;
+          const pp = clampProb(1 / (1 + Math.exp(-z)));
+          sum += -logScore(pp, pt.outcome);
+        }
+        const loss = sum / pts.length + gamma * ((a - 1) * (a - 1) + (b - 1) * (b - 1) + cc * cc);
+        if (loss < bestLoss - 1e-12) {
+          bestLoss = loss;
+          best = { a: Number(a.toFixed(2)), b: Number(b.toFixed(2)), c: Number(cc.toFixed(2)), n: pts.length };
+        }
+      }
+    }
+  }
+  return best;
+}
+
+export function applyBetaCalibration(p: number, cal: BetaCalibration | null): number {
+  if (!cal) return clampProb(p);
+  const cp = clampProb(p);
+  const z = cal.c + cal.a * Math.log(cp) - cal.b * Math.log(1 - cp);
+  return clampProb(1 / (1 + Math.exp(-z)));
 }
 
 // ---------------------------------------------------------------- interval dilation
@@ -930,12 +1128,27 @@ export function applyRecalibration(p: number, r: Recalibration | null): number {
  * separate binary-style mass and is never dilated.
  */
 export function applyQuantileDilation(q: Quantiles, d: number, logSpace = false): Quantiles {
+  // The symmetric case is exactly the asymmetric one with dLo=dUp — keep one
+  // stretch kernel (applyAsymmetricDilation) so the log/linear pivot logic can
+  // never drift between the two.
+  return applyAsymmetricDilation(q, d, d, logSpace);
+}
+
+/**
+ * Asymmetric interval dilation: widen the LOWER quantiles (below p50) by dLo and
+ * the UPPER quantiles (above p50) by dUp. A single symmetric factor can't fix
+ * miscoverage that is lopsided — LLM panels are often more overconfident on the
+ * downside (a crash) than the upside, or vice-versa per quantity. dLo=dUp
+ * recovers the symmetric applyQuantileDilation exactly. p50 is the pivot.
+ */
+export function applyAsymmetricDilation(q: Quantiles, dLo: number, dUp: number, logSpace = false): Quantiles {
   const out = { ...q };
-  if (!(d > 0) || d === 1) return out;
   const p50 = q.p50;
-  for (const { key } of QUANTILE_TAUS) {
+  for (const { key, tau } of QUANTILE_TAUS) {
     const v = q[key];
-    if (typeof v !== "number") continue;
+    if (typeof v !== "number" || tau === 0.5) continue;
+    const d = tau < 0.5 ? dLo : dUp;
+    if (!(d > 0) || d === 1) continue;
     out[key] = logSpace && p50 > 0 && v > 0 ? p50 * Math.exp(d * Math.log(v / p50)) : p50 + d * (v - p50);
   }
   return out;
@@ -961,12 +1174,7 @@ export interface QuantileCalibration {
  * toward d=1 (γ=2/n) so small samples barely move it; falls back to the default
  * below MIN_QCAL_N.
  */
-export function fitQuantileCalibration(
-  entries = loadLedger(),
-  fallback = DEFAULT_QUANTILE_DILATION,
-  domain?: DomainId
-): QuantileCalibration {
-  entries = scopeToDomain(entries, domain, MIN_QCAL_N);
+function fitQuantileCalibrationRaw(entries: LedgerEntry[], fallback: number): QuantileCalibration {
   const pts: { q: Quantiles; logSpace: boolean; outcome: number }[] = [];
   for (const e of entries) {
     if ((e.question.kind !== "numeric" && e.question.kind !== "date") || !e.resolution) continue;
@@ -993,6 +1201,106 @@ export function fitQuantileCalibration(
   return { d: Number(bestD.toFixed(2)), n: pts.length, source: "learned" };
 }
 
+export function fitQuantileCalibration(
+  entries = loadLedger(),
+  fallback = DEFAULT_QUANTILE_DILATION,
+  domain?: DomainId
+): QuantileCalibration {
+  const global = fitQuantileCalibrationRaw(entries, fallback);
+  if (!domain) return global;
+  // Partial pooling on the dilation scalar: a thin in-domain fit shrinks toward
+  // the global one by its own sample size (and stays global until it learns).
+  const local = fitQuantileCalibrationRaw(entries.filter((e) => e.domain === domain), fallback);
+  if (local.source === "default") return global;
+  const w = local.n / (local.n + POOL_KAPPA);
+  const base = global.source === "learned" ? global.d : fallback;
+  return { d: Number((w * local.d + (1 - w) * base).toFixed(2)), n: local.n, source: "learned" };
+}
+
+export interface IntervalCalibration {
+  /** Dilation for quantiles BELOW p50 (the lower tail). */
+  dLo: number;
+  /** Dilation for quantiles ABOVE p50 (the upper tail). */
+  dUp: number;
+  n: number;
+  source: "default" | "learned";
+}
+
+/** Fit one half's dilation by the pinball loss over just that half's taus (p50 pivot fixed). */
+function fitHalfDilation(pts: { q: Quantiles; logSpace: boolean; outcome: number }[], side: "lo" | "up", fallback: number): number {
+  const keys = QUANTILE_TAUS.filter((t) => (side === "lo" ? t.tau < 0.5 : t.tau > 0.5)).map((t) => t.key);
+  const gamma = 2 / pts.length;
+  let bestD = 1;
+  let bestLoss = Infinity;
+  for (let i = 0; i <= 50; i++) {
+    const d = 0.5 + i * 0.05; // 0.5 .. 3.0
+    let sum = 0;
+    for (const pt of pts) {
+      const dilated = applyAsymmetricDilation(pt.q, side === "lo" ? d : 1, side === "up" ? d : 1, pt.logSpace);
+      // Mean pinball over only this half's stated quantiles — per-KEY so the data
+      // term lives on the same scale as the symmetric pinballLoss and the shared
+      // γ regularizer shrinks both calibrators equivalently.
+      let psum = 0;
+      let pn = 0;
+      for (const key of keys) {
+        const v = dilated[key];
+        const tau = QUANTILE_TAUS.find((t) => t.key === key)!.tau;
+        if (typeof v !== "number") continue;
+        psum += pt.outcome >= v ? tau * (pt.outcome - v) : (1 - tau) * (v - pt.outcome);
+        pn++;
+      }
+      sum += pn ? psum / pn : 0;
+    }
+    const loss = sum / pts.length + gamma * (d - 1) * (d - 1);
+    if (loss < bestLoss - 1e-12) {
+      bestLoss = loss;
+      bestD = d;
+    }
+  }
+  return Number(bestD.toFixed(2)) || fallback;
+}
+
+function fitIntervalCalibrationRaw(entries: LedgerEntry[], fallback: number): IntervalCalibration {
+  const pts: { q: Quantiles; logSpace: boolean; outcome: number }[] = [];
+  for (const e of entries) {
+    if ((e.question.kind !== "numeric" && e.question.kind !== "date") || !e.resolution) continue;
+    const o = e.resolution.outcome;
+    if (typeof o !== "number") continue;
+    const q = e.aggregate.predilationQuantiles ?? e.aggregate.quantiles;
+    if (!q || typeof q.p50 !== "number") continue;
+    pts.push({ q, logSpace: Boolean(e.aggregate.logSpace), outcome: o });
+  }
+  if (pts.length < MIN_QCAL_N) return { dLo: fallback, dUp: fallback, n: pts.length, source: "default" };
+  return { dLo: fitHalfDilation(pts, "lo", fallback), dUp: fitHalfDilation(pts, "up", fallback), n: pts.length, source: "learned" };
+}
+
+/**
+ * Interval calibration with ASYMMETRIC (per-tail) dilation — the B3 upgrade over
+ * the single symmetric factor. Fits the lower- and upper-tail dilations
+ * separately by their own pinball loss, so lopsided miscoverage (an interval too
+ * narrow only on the downside) is corrected on the side that needs it. Same
+ * partial-pooling discipline as fitQuantileCalibration.
+ */
+export function fitIntervalCalibration(
+  entries = loadLedger(),
+  fallback = DEFAULT_QUANTILE_DILATION,
+  domain?: DomainId
+): IntervalCalibration {
+  const global = fitIntervalCalibrationRaw(entries, fallback);
+  if (!domain) return global;
+  const local = fitIntervalCalibrationRaw(entries.filter((e) => e.domain === domain), fallback);
+  if (local.source === "default") return global;
+  const w = local.n / (local.n + POOL_KAPPA);
+  const baseLo = global.source === "learned" ? global.dLo : fallback;
+  const baseUp = global.source === "learned" ? global.dUp : fallback;
+  return {
+    dLo: Number((w * local.dLo + (1 - w) * baseLo).toFixed(2)),
+    dUp: Number((w * local.dUp + (1 - w) * baseUp).toFixed(2)),
+    n: local.n,
+    source: "learned",
+  };
+}
+
 /**
  * Snapshot the out-of-fold fit for a domain (or globally) into a reusable,
  * freezable artifact. This is the engine's "fitted model": every parameter the
@@ -1001,7 +1309,8 @@ export function fitQuantileCalibration(
  */
 export function snapshotFittedParams(domain?: DomainId, entries = loadLedger()): FittedParams {
   const recal = fitRecalibration(entries, domain);
-  const qcal = fitQuantileCalibration(entries, DEFAULT_QUANTILE_DILATION, domain);
+  const mcRecal = fitMcRecalibration(entries, domain);
+  const ical = fitIntervalCalibration(entries, DEFAULT_QUANTILE_DILATION, domain);
   const inDomain = domain ? entries.filter((e) => e.domain === domain) : entries;
   const fitN = inDomain.reduce((n, e) => n + (e.resolution ? 1 : 0), 0);
   return {
@@ -1009,11 +1318,17 @@ export function snapshotFittedParams(domain?: DomainId, entries = loadLedger()):
     // Carry each fit's true sample count so a frozen run logs an honest n even
     // when the learner backed off to the global pool.
     recalibration: recal ? { a: recal.a, b: recal.b, n: recal.n } : null,
+    mcRecalibration: mcRecal ? { a: mcRecal.a, b: mcRecal.b, n: mcRecal.n } : null,
     extremizeK: chooseExtremizeK(entries, DEFAULT_EXTREMIZE_K, domain),
+    extremizeKMc: chooseExtremizeKMc(entries, DEFAULT_EXTREMIZE_K, domain),
     marketWeight: chooseMarketWeight(entries, DEFAULT_MARKET_WEIGHT, domain),
     sportsMarketWeight: chooseSportsMarketWeight(entries, DEFAULT_SPORTS_MARKET_WEIGHT, domain),
-    quantileDilation: qcal.d,
-    quantileDilationN: qcal.n,
+    // Symmetric quantileDilation kept (mean of the two tails) for back-compat;
+    // the asymmetric per-tail factors are the live path.
+    quantileDilation: Number(((ical.dLo + ical.dUp) / 2).toFixed(2)),
+    quantileDilationLo: ical.dLo,
+    quantileDilationUp: ical.dUp,
+    quantileDilationN: ical.n,
     methodWeights: methodWeights(entries, domain),
     fitN,
     fitAt: Date.now(),
@@ -1075,7 +1390,10 @@ function sanitizeCombiner(node: unknown, validIds: Set<string>, binaryIds: Set<s
   if (op === "driver") return validIds.has(String(n.id)) ? { op, id: String(n.id) } : null;
   if (op === "threshold") {
     const child = sanitizeCombiner(n.child, validIds, binaryIds);
-    return child && Number.isFinite(Number(n.above)) ? { op, child, above: Number(n.above) } : null;
+    if (!child || !Number.isFinite(Number(n.above))) return null;
+    // dir "lt" (fire below) is opt-in; omit the field for the default "gt" so
+    // existing above-threshold combiners serialize byte-identically.
+    return n.dir === "lt" ? { op, child, above: Number(n.above), dir: "lt" } : { op, child, above: Number(n.above) };
   }
   if (op === "conditional_table") {
     if (!binaryIds.has(String(n.conditionDriver))) return null; // branch must be a binary driver
@@ -1162,6 +1480,18 @@ export function blendOptionProbs(a: Record<string, number>, b: Record<string, nu
   return out;
 }
 
+/**
+ * The pre-simulation BINARY headline: the published probability the scenario
+ * simulation blends on TOP of, and the value the sim-weight fit scores against.
+ * Read superseded-first (the H2 sequential update on a re-forecast), then the
+ * recalibration chain. Centralized so the live blend (executor) and the fit
+ * (chooseSimulationWeight) read the SAME chain — duplicating this expression once
+ * silently dropped `superseded` from the serve path while the fit kept it.
+ */
+export function preSimBinaryHeadline(c: AggregateComponents | undefined, fallback: number): number {
+  return c?.superseded ?? c?.recalibrated ?? c?.blended ?? c?.extremized ?? fallback;
+}
+
 /** Simulation starts with ZERO headline influence — pure cross-check until the ledger earns it trust. */
 export const DEFAULT_SIM_WEIGHT = 0;
 /** A newer, less-tested signal than the market anchor (20) — demand more resolved evidence before any blend. */
@@ -1192,12 +1522,14 @@ export function chooseSimulationWeight(entries = loadLedger(), kind: ForecastKin
     return bestW;
   };
   if (kind === "binary") {
-    // No !simBlendWeight guard needed here (unlike numeric/mc): the binary
+    // No pre-sim snapshot guard needed here (unlike numeric/mc): the binary
     // pre-sim headline is preserved in the components chain (extremized →
-    // blended → recalibrated), which the simulation blend never mutates — it
-    // only overwrites agg.probability. So `pre` below is always the honest
-    // pre-sim value even on entries that were later blended; the fit is not
-    // circular, and including those entries gives the fit more data.
+    // blended → recalibrated → superseded), which the simulation blend never
+    // mutates — it only overwrites agg.probability. So `pre` below is always the
+    // honest pre-sim value even on entries that were later blended; the fit is
+    // not circular, and including those entries gives the fit more data. The
+    // `superseded` link captures the H2 sequential update so a re-forecast's true
+    // published headline (not its pre-supersede value) is what the fit scores.
     const usable = entries.filter(
       (e) =>
         e.question.kind === "binary" &&
@@ -1209,30 +1541,36 @@ export function chooseSimulationWeight(entries = loadLedger(), kind: ForecastKin
     return grid((w) =>
       usable.reduce((s, e) => {
         const c = e.aggregate.components!;
-        const pre = c.recalibrated ?? c.blended ?? c.extremized ?? e.aggregate.probability ?? 0.5;
+        const pre = preSimBinaryHeadline(c, e.aggregate.probability ?? 0.5);
         return s - logScore(blendWithMarket(pre, c.simulated!, w), e.resolution!.outcome as 0 | 1);
       }, 0) / usable.length
     );
   }
   if (kind === "numeric" || kind === "date") {
+    // Include entries that WERE sim-blended as long as their pre-sim headline was
+    // snapshotted (components.preSimQuantiles) — re-blending the stored (post-sim)
+    // headline would be circular, but the snapshot is the honest pre-sim value, so
+    // the fit can learn from exactly the questions where the simulation was used
+    // (matching the binary path). Older entries that were blended before the
+    // snapshot existed are still excluded.
     const usable = entries.filter(
       (e) =>
         (e.question.kind === "numeric" || e.question.kind === "date") &&
         e.resolution &&
         typeof e.resolution.outcome === "number" &&
         e.aggregate.components?.simulatedQ &&
-        e.aggregate.quantiles &&
-        !e.aggregate.components?.simBlendWeight // only entries whose stored headline is pre-sim
+        (e.aggregate.components?.preSimQuantiles || e.aggregate.quantiles) &&
+        (e.aggregate.components?.preSimQuantiles || !e.aggregate.components?.simBlendWeight)
     );
     if (usable.length < MIN_SIM_WEIGHT_N) return fallback;
     return grid((w) =>
-      usable.reduce(
-        (s, e) => s + pinballLoss(blendQuantiles(e.aggregate.quantiles!, e.aggregate.components!.simulatedQ!, w), e.resolution!.outcome as number),
-        0
-      ) / usable.length
+      usable.reduce((s, e) => {
+        const c = e.aggregate.components!;
+        return s + pinballLoss(blendQuantiles(c.preSimQuantiles ?? e.aggregate.quantiles!, c.simulatedQ!, w), e.resolution!.outcome as number);
+      }, 0) / usable.length
     );
   }
-  // mc
+  // mc — same pre-sim snapshot logic as numeric/date.
   const usable = entries.filter(
     (e) =>
       e.question.kind === "mc" &&
@@ -1240,15 +1578,15 @@ export function chooseSimulationWeight(entries = loadLedger(), kind: ForecastKin
       typeof e.resolution.outcome === "string" &&
       e.resolution.outcome !== "void" &&
       e.aggregate.components?.simulatedOptionProbs &&
-      e.aggregate.optionProbs &&
-      !e.aggregate.components?.simBlendWeight
+      (e.aggregate.components?.preSimOptionProbs || e.aggregate.optionProbs) &&
+      (e.aggregate.components?.preSimOptionProbs || !e.aggregate.components?.simBlendWeight)
   );
   if (usable.length < MIN_SIM_WEIGHT_N) return fallback;
   return grid((w) =>
-    usable.reduce(
-      (s, e) => s - mcLogScore(blendOptionProbs(e.aggregate.optionProbs!, e.aggregate.components!.simulatedOptionProbs!, w), e.resolution!.outcome as string),
-      0
-    ) / usable.length
+    usable.reduce((s, e) => {
+      const c = e.aggregate.components!;
+      return s - mcLogScore(blendOptionProbs(c.preSimOptionProbs ?? e.aggregate.optionProbs!, c.simulatedOptionProbs!, w), e.resolution!.outcome as string);
+    }, 0) / usable.length
   );
 }
 
@@ -1786,6 +2124,10 @@ export function resolveLedgerEntry(
         qkind: kind,
         outcome: settled,
         ledgerId: entry.id,
+        // Carry the open-question group + supersession link so queryRefClass can
+        // de-dup: a re-forecast of the same event must count ONCE (G3).
+        ...(entry.setId ? { setId: entry.setId } : {}),
+        ...(entry.supersedes ? { supersedes: entry.supersedes } : {}),
       });
     } catch {
       /* reference-class accumulation is best-effort */
@@ -1822,15 +2164,17 @@ export interface CalibrationStats {
 }
 
 /** Binary entries resolved to a hard 0/1 (voids and numerics don't calibrate a probability). */
-function scoreable(entries: LedgerEntry[]): { p: number; outcome: 0 | 1; panel: LedgerPanelist[] }[] {
-  const out: { p: number; outcome: 0 | 1; panel: LedgerPanelist[] }[] = [];
+function scoreable(entries: LedgerEntry[]): { p: number; outcome: 0 | 1; panel: LedgerPanelist[]; overlap: number }[] {
+  const out: { p: number; outcome: 0 | 1; panel: LedgerPanelist[]; overlap: number }[] = [];
   for (const e of entries) {
     if (e.question.kind !== "binary" || !e.resolution) continue;
     const o = e.resolution.outcome;
     if (o !== 0 && o !== 1) continue;
     const p = e.aggregate.probability;
     if (typeof p !== "number" || !Number.isFinite(p)) continue;
-    out.push({ p, outcome: o, panel: e.panel });
+    // Carry the evidence overlap so a learner can replay the SERVED estimator
+    // (scaleK(k, overlap)) instead of the raw one — train/serve must match.
+    out.push({ p, outcome: o, panel: e.panel, overlap: e.evidenceOverlap ?? e.aggregate.evidenceOverlap ?? 0 });
   }
   return out;
 }
@@ -1909,6 +2253,62 @@ export function calibrationStats(entries: LedgerEntry[]): CalibrationStats {
     mcBins: mcBins.filter((b) => b.n > 0),
     byMethod,
     byDomain,
+  };
+}
+
+/**
+ * Outside-view discipline diagnostic (G2): each panelist commits a base-rate
+ * `prior` BEFORE weighing the news. This scores whether the panel's deviations
+ * from that committed prior actually PAY OFF — splitting resolved binary
+ * forecasts into small- vs large-move halves (by |final − aggregated prior|) and
+ * comparing the published Brier to the prior's own Brier on the large-move half.
+ * If big moves score WORSE than just holding the prior, the panel is talking
+ * itself off the base rate. This is the SCORING stage only — the engine does not
+ * blindly blend self-reported priors (they're unverified and gameable); a learned
+ * shrinkage is gated on this signal turning negative over real history.
+ */
+export interface PriorDeltaStats {
+  n: number;
+  meanAbsDelta: number;
+  smallMoveBrier: number;
+  largeMoveBrier: number;
+  /** On the large-move half: the Brier of just holding the aggregated prior. */
+  largeMovePriorBrier: number;
+  /** True when large moves beat simply holding the prior (deviations earn their keep). */
+  bigMovesPayOff: boolean;
+}
+
+export function priorDeltaStats(entries = loadLedger()): PriorDeltaStats {
+  const pts: { delta: number; brier: number; priorBrier: number }[] = [];
+  for (const e of entries) {
+    if (e.question.kind !== "binary" || !e.resolution) continue;
+    const o = e.resolution.outcome;
+    if (o !== 0 && o !== 1) continue;
+    const final = e.aggregate.probability;
+    if (typeof final !== "number" || !Number.isFinite(final)) continue;
+    const priors = e.panel.map((p) => p.prior).filter((p): p is number => typeof p === "number" && Number.isFinite(p));
+    if (!priors.length) continue;
+    // Aggregate the priors in log-odds (the panel's geometric-mean-of-odds core,
+    // without the served extremization/weights — this is a diagnostic reference
+    // point, not the published number, so the un-sharpened mean is the right baseline).
+    const lo = priors.reduce((s, p) => s + Math.log(clampProb(p) / (1 - clampProb(p))), 0) / priors.length;
+    const priorAgg = clampProb(Math.exp(lo) / (1 + Math.exp(lo)));
+    pts.push({ delta: Math.abs(final - priorAgg), brier: brierScore(final, o), priorBrier: brierScore(priorAgg, o) });
+  }
+  if (!pts.length) return { n: 0, meanAbsDelta: 0, smallMoveBrier: 0, largeMoveBrier: 0, largeMovePriorBrier: 0, bigMovesPayOff: true };
+  const deltas = pts.map((p) => p.delta).sort((a, b) => a - b);
+  const med = median(deltas);
+  const small = pts.filter((p) => p.delta <= med);
+  const large = pts.filter((p) => p.delta > med);
+  const lgBrier = large.length ? large.reduce((s, p) => s + p.brier, 0) / large.length : 0;
+  const lgPriorBrier = large.length ? large.reduce((s, p) => s + p.priorBrier, 0) / large.length : 0;
+  return {
+    n: pts.length,
+    meanAbsDelta: pts.reduce((s, p) => s + p.delta, 0) / pts.length,
+    smallMoveBrier: small.length ? small.reduce((s, p) => s + p.brier, 0) / small.length : 0,
+    largeMoveBrier: lgBrier,
+    largeMovePriorBrier: lgPriorBrier,
+    bigMovesPayOff: large.length === 0 || lgBrier <= lgPriorBrier,
   };
 }
 
@@ -2058,72 +2458,141 @@ const K_MAX = 6;
  */
 export const MIN_ADAPTIVE_N = 30;
 
-export function chooseExtremizeK(entries = loadLedger(), fallback = DEFAULT_EXTREMIZE_K, domain?: DomainId): number {
-  entries = scopeToDomain(entries, domain, MIN_ADAPTIVE_N);
-  const usable = scoreable(entries).filter((s) => s.panel.filter((m) => Number.isFinite(m.probability)).length >= 2);
-  if (usable.length < MIN_ADAPTIVE_N) return fallback;
-  const meanBrier = (k: number): number => {
-    let sum = 0;
-    for (const s of usable) {
-      const probs = s.panel.map((m) => m.probability).filter((p): p is number => typeof p === "number" && Number.isFinite(p));
-      try {
-        sum += brierScore(aggregateBinary(probs, k).probability!, s.outcome);
-      } catch (e) {
-        // Unreachable with usable's ≥2-prob filter; keep the loop honest anyway.
-        void errMsg(e);
-      }
-    }
-    return sum / usable.length;
-  };
-  // Coarse scan (step 0.5) brackets the global region — Brier vs k is smooth
-  // but only locally unimodal, and golden-section alone could chase a local dip.
-  let coarseBest = K_MIN;
+/**
+ * Minimize a locally-unimodal 1-D loss on [lo,hi]: a coarse scan (step) brackets
+ * the global region — the loss is smooth but only locally unimodal, so golden
+ * section alone could chase a local dip — then golden-section refines, and the
+ * refined point is compared against the bracket endpoints so a boundary optimum
+ * stays reachable. Shared by the binary and mc extremization fits.
+ */
+function minimize1D(f: (x: number) => number, lo: number, hi: number, step = 0.5): number {
+  let coarseBest = lo;
   let coarseLoss = Infinity;
-  for (let k = K_MIN; k <= K_MAX + 1e-9; k += 0.5) {
-    const loss = meanBrier(k);
+  for (let x = lo; x <= hi + 1e-9; x += step) {
+    const loss = f(x);
     if (loss < coarseLoss - 1e-12) {
       coarseLoss = loss;
-      coarseBest = k;
+      coarseBest = x;
     }
   }
-  // Golden-section refinement within the bracketing cell.
   const phi = (Math.sqrt(5) - 1) / 2;
-  let a = Math.max(K_MIN, coarseBest - 0.5);
-  let b = Math.min(K_MAX, coarseBest + 0.5);
+  let a = Math.max(lo, coarseBest - step);
+  let b = Math.min(hi, coarseBest + step);
   let c = b - phi * (b - a);
   let d = a + phi * (b - a);
-  let fc = meanBrier(c);
-  let fd = meanBrier(d);
+  let fc = f(c);
+  let fd = f(d);
   while (b - a > 1e-3) {
     if (fc < fd) {
       b = d;
       d = c;
       fd = fc;
       c = b - phi * (b - a);
-      fc = meanBrier(c);
+      fc = f(c);
     } else {
       a = c;
       c = d;
       fc = fd;
       d = a + phi * (b - a);
-      fd = meanBrier(d);
+      fd = f(d);
     }
   }
-  // Golden-section converges to an INTERIOR point of the bracket; if the true
-  // optimum sits at a boundary (k=K_MIN ≈ no extremization for a chronically
-  // overconfident panel, or k=K_MAX), that midpoint is strictly worse and
-  // unreachable. Compare the refined point against the coarse winner and the
-  // bracket endpoints and take the genuine argmin so a boundary k is reachable.
-  let bestK = coarseBest;
-  let bestKLoss = Infinity;
-  for (const k of [coarseBest, (a + b) / 2, a, b]) {
-    const loss = meanBrier(k);
-    if (loss < bestKLoss - 1e-12) {
-      bestKLoss = loss;
-      bestK = k;
+  let best = coarseBest;
+  let bestLoss = Infinity;
+  for (const x of [coarseBest, (a + b) / 2, a, b]) {
+    const loss = f(x);
+    if (loss < bestLoss - 1e-12) {
+      bestLoss = loss;
+      best = x;
     }
   }
-  return Number(bestK.toFixed(3));
+  return Number(best.toFixed(3));
+}
+
+/**
+ * Pick the binary extremization exponent that would have minimized Brier over
+ * the resolved history. CRUCIAL: the objective replays the SERVED estimator —
+ * `aggregateBinary(probs, scaleK(k, overlap), methodWeights)` — not the raw one.
+ * Fitting raw k while serving scaleK(k,overlap)·weighted is a train/serve skew
+ * that mis-orders the per-entry exponents. Per-domain partial pooling shrinks a
+ * thin in-domain fit toward the global one. Falls back below MIN_ADAPTIVE_N.
+ */
+export function chooseExtremizeK(entries = loadLedger(), fallback = DEFAULT_EXTREMIZE_K, domain?: DomainId): number {
+  return pooledScalarFit((es) => chooseExtremizeKRaw(es, fallback), entries, domain);
+}
+
+function chooseExtremizeKRaw(entries: LedgerEntry[], fallback: number): ScalarFit {
+  // Method weights are computed over the same entries the objective scores. This
+  // is mild in-sample optimism (an entry's own outcome nudges its panelist's
+  // weight up), which biases the fitted k slightly LOW — the conservative
+  // (less-overconfident) direction. The honest gate is the forward-chaining
+  // backtest (the served base uses methodWeights(train) on strictly-earlier entries);
+  // the live path applies methodWeights(ledger) where the new question isn't yet
+  // in the ledger, so the serve side has no leakage.
+  const mw = methodWeights(entries);
+  const prepared = scoreable(entries)
+    .map((s) => {
+      const kept = s.panel.filter((m) => typeof m.probability === "number" && Number.isFinite(m.probability));
+      return { probs: kept.map((m) => m.probability as number), weights: kept.map((m) => mw[m.method] ?? 1), overlap: s.overlap, outcome: s.outcome };
+    })
+    .filter((s) => s.probs.length >= 2);
+  if (prepared.length < MIN_ADAPTIVE_N) return { value: fallback, learned: false, n: prepared.length };
+  const meanBrier = (k: number): number => {
+    let sum = 0;
+    for (const s of prepared) sum += brierScore(aggregateBinary(s.probs, scaleK(k, s.overlap), s.weights).probability!, s.outcome);
+    return sum / prepared.length;
+  };
+  return { value: minimize1D(meanBrier, K_MIN, K_MAX), learned: true, n: prepared.length };
+}
+
+/** mc resolved entries with a hard option outcome and ≥2 panel ballots — the mc analogue of scoreable. */
+function scoreableMc(
+  entries: LedgerEntry[]
+): { panels: Record<string, number>[]; options: string[]; realized: string; overlap: number; methods: string[] }[] {
+  const out: { panels: Record<string, number>[]; options: string[]; realized: string; overlap: number; methods: string[] }[] = [];
+  for (const e of entries) {
+    if (e.question.kind !== "mc" || !e.resolution) continue;
+    const realized = e.resolution.outcome;
+    const options = e.question.options;
+    // ≥2 options required — aggregateMc throws below that, and a 1-option mc is degenerate.
+    if (typeof realized !== "string" || realized === "void" || !options || options.length < 2 || !options.includes(realized)) continue;
+    const kept = e.panel.filter((m) => m.optionProbs && typeof m.optionProbs === "object");
+    if (kept.length < 2) continue;
+    out.push({
+      panels: kept.map((m) => m.optionProbs!),
+      options,
+      realized,
+      overlap: e.evidenceOverlap ?? e.aggregate.evidenceOverlap ?? 0,
+      methods: kept.map((m) => m.method),
+    });
+  }
+  return out;
+}
+
+/**
+ * The mc extremization exponent — fit on multiclass log-loss, replaying the
+ * served `aggregateMc(panels, options, scaleK(k, overlap), weights)`. The
+ * per-option-GMO-then-renormalize geometry has a different optimal exponent than
+ * the binary path, so reusing the binary k (the old behavior) mis-sharpens every
+ * multiple-choice question. Same shared minimizer + partial pooling.
+ */
+export function chooseExtremizeKMc(entries = loadLedger(), fallback = DEFAULT_EXTREMIZE_K, domain?: DomainId): number {
+  return pooledScalarFit((es) => chooseExtremizeKMcRaw(es, fallback), entries, domain);
+}
+
+function chooseExtremizeKMcRaw(entries: LedgerEntry[], fallback: number): ScalarFit {
+  const mw = methodWeights(entries);
+  const usable = scoreableMc(entries).map((s) => ({ ...s, weights: s.methods.map((m) => mw[m] ?? 1) }));
+  if (usable.length < MIN_ADAPTIVE_N) return { value: fallback, learned: false, n: usable.length };
+  const meanLoss = (k: number): number => {
+    let sum = 0;
+    for (const s of usable) {
+      const agg = aggregateMc(s.panels, s.options, scaleK(k, s.overlap), s.weights);
+      sum += -mcLogScore(agg.optionProbs!, s.realized);
+    }
+    return sum / usable.length;
+  };
+  return { value: minimize1D(meanLoss, K_MIN, K_MAX), learned: true, n: usable.length };
 }
 
 // ---------------------------------------------------------------- backtest
@@ -2176,20 +2645,29 @@ export function bootstrapCi(values: number[], b = 1000, seed = 1738): { lo: numb
 
 interface BacktestEntry {
   probs: number[];
+  /** Panel methods aligned to probs, so a replayed strategy can apply the learned method weights. */
+  methods: string[];
   overlap: number;
   outcome: 0 | 1;
   published: number;
   market?: { probability: number; volume?: number };
+  /** Forecast creation/serve instant — the moment the parameters would have been read live. */
+  createT: number;
+  /** Resolution instant — when this entry's outcome became known. */
+  resolveT: number;
   entry: LedgerEntry;
 }
 
 /**
  * Replay the resolved binary ledger under each aggregation strategy and score
- * them side by side — the regression gate for every mechanism the engine
- * learns. Learned parameters (adaptive k, market weight, recalibration) are
- * fitted OUT-OF-FOLD (10-fold by time order): each entry is scored with
- * parameters fitted on the other folds, so a strategy can't grade its own
- * homework. Pure deterministic replay — no agents, no tokens.
+ * them side by side — the regression gate for every mechanism the engine learns.
+ * Learned parameters (adaptive k, market weight, recalibration) are fitted
+ * OUT-OF-FOLD by a TIME-RESPECTING expanding window: each entry is scored with
+ * parameters fitted ONLY on strictly-earlier entries. An index-interleaved
+ * (j%FOLDS) split leaks future outcomes into the training fold and flatters
+ * exactly the learners (recalibration most of all) whose job is to generalize
+ * forward — so it would green-light a strategy that won't hold live. Pure
+ * deterministic replay — no agents, no tokens.
  */
 export function backtest(entries = loadLedger()): BacktestReport {
   const skipped = { nonBinary: 0, noPanel: 0 };
@@ -2202,7 +2680,8 @@ export function backtest(entries = loadLedger()): BacktestReport {
     }
     const o = e.resolution.outcome;
     if (o !== 0 && o !== 1) continue;
-    const probs = e.panel.map((m) => m.probability).filter((p): p is number => typeof p === "number" && Number.isFinite(p));
+    const kept = e.panel.filter((m) => typeof m.probability === "number" && Number.isFinite(m.probability));
+    const probs = kept.map((m) => m.probability as number);
     const published = e.aggregate.probability;
     if (!probs.length || typeof published !== "number") {
       skipped.noPanel++;
@@ -2210,19 +2689,54 @@ export function backtest(entries = loadLedger()): BacktestReport {
     }
     usable.push({
       probs,
+      methods: kept.map((m) => m.method),
       overlap: e.evidenceOverlap ?? e.aggregate.evidenceOverlap ?? 0,
       outcome: o,
       published,
       market: e.aggregate.components?.market,
+      createT: e.t,
+      resolveT: e.resolution.t,
       entry: e,
     });
   }
   const report: BacktestReport = { rows: [], skipped };
   if (!usable.length) return report;
 
-  const FOLDS = Math.min(10, usable.length);
-  const trainFor = (idx: number): LedgerEntry[] =>
-    usable.filter((_, j) => j % FOLDS !== idx % FOLDS).map((u) => u.entry);
+  // Time-respecting (forward-chaining) OOF keyed on RESOLUTION time, not creation
+  // order: when entry i was served (createT), only outcomes RESOLVED before then
+  // were knowable. Training on "earlier-created" leaks future outcomes — a
+  // long-horizon question created first can resolve last. So train on entries
+  // whose resolution preceded i's serve instant; the recalibration intercept
+  // (which learns a systematic YES-lean) is the most leakage-flattered otherwise.
+  const trainFor = (idx: number): LedgerEntry[] => usable.filter((u) => u.resolveT < usable[idx].createT).map((u) => u.entry);
+  // Hoist every out-of-fold fit ONCE per entry. Each is a pure function of the
+  // strictly-earlier training slice, so a strategy can index the precomputed fit
+  // instead of refitting from scratch on every call — the binary backtest used to
+  // re-run chooseExtremizeK/chooseMarketWeight/fitRecalibration/fitBetaCalibration
+  // inside each strategy's per-entry closure (and twice over, once for Brier and
+  // once for log loss), turning an O(n) replay into O(n²·gridsize). Each fit is
+  // threaded with the entry's OWN domain so the gate measures the per-domain
+  // partial-pooled estimator aggregateOne actually ships (not the global pool).
+  const trains = usable.map((_, i) => trainFor(i));
+  const doms = usable.map((u) => u.entry.domain);
+  const ks = trains.map((t, i) => chooseExtremizeK(t, DEFAULT_EXTREMIZE_K, doms[i]));
+  const mws = trains.map((t, i) => methodWeights(t, doms[i]));
+  const mwts = trains.map((t, i) => chooseMarketWeight(t, DEFAULT_MARKET_WEIGHT, doms[i]));
+  const recals = trains.map((t, i) => fitRecalibration(t, doms[i]));
+  const betas = trains.map((t, i) => fitBetaCalibration(t, doms[i]));
+
+  // The SERVED binary estimate: extremized-by-scaleK, weighted by the learned
+  // method weights — exactly what aggregateOne ships, so the gate measures reality.
+  const servedBaseAt = (u: BacktestEntry, i: number): number => {
+    const weights = u.methods.map((m) => mws[i][m] ?? 1);
+    return aggregateBinary(u.probs, scaleK(ks[i], u.overlap), weights).probability!;
+  };
+  const marketedAt = (u: BacktestEntry, i: number): number => {
+    const base = servedBaseAt(u, i);
+    if (!u.market) return base;
+    const w = mwts[i] * liquidityFactor(u.market.volume);
+    return blendWithMarket(base, u.market.probability, w);
+  };
 
   const strategies: { config: string; p: (u: BacktestEntry, i: number) => number }[] = [
     { config: "published headline (as recorded)", p: (u) => u.published },
@@ -2232,40 +2746,33 @@ export function backtest(entries = loadLedger()): BacktestReport {
       p: (u) => aggregateBinary(u.probs, scaleK(DEFAULT_EXTREMIZE_K, u.overlap)).probability!,
     },
     {
-      config: "panel adaptive-k (out-of-fold)",
-      p: (u, i) => {
-        const k = chooseExtremizeK(trainFor(i), DEFAULT_EXTREMIZE_K);
-        return aggregateBinary(u.probs, scaleK(k, u.overlap)).probability!;
-      },
+      config: "panel adaptive-k + method weights (out-of-fold)",
+      p: (u, i) => servedBaseAt(u, i),
     },
     {
       config: "+ market anchor (learned w, out-of-fold)",
-      p: (u, i) => {
-        const k = chooseExtremizeK(trainFor(i), DEFAULT_EXTREMIZE_K);
-        const base = aggregateBinary(u.probs, scaleK(k, u.overlap)).probability!;
-        if (!u.market) return base;
-        const w = chooseMarketWeight(trainFor(i), DEFAULT_MARKET_WEIGHT) * liquidityFactor(u.market.volume);
-        return blendWithMarket(base, u.market.probability, w);
-      },
+      p: (u, i) => marketedAt(u, i),
     },
     {
       config: "+ recalibration (out-of-fold)",
-      p: (u, i) => {
-        const train = trainFor(i);
-        const k = chooseExtremizeK(train, DEFAULT_EXTREMIZE_K);
-        let p = aggregateBinary(u.probs, scaleK(k, u.overlap)).probability!;
-        if (u.market) {
-          const w = chooseMarketWeight(train, DEFAULT_MARKET_WEIGHT) * liquidityFactor(u.market.volume);
-          p = blendWithMarket(p, u.market.probability, w);
-        }
-        return applyRecalibration(p, fitRecalibration(train));
-      },
+      p: (u, i) => applyRecalibration(marketedAt(u, i), recals[i]),
+    },
+    {
+      // B1: beta calibration as a BACKTEST-GATED alternative to Platt. Same chain,
+      // beta recalibration instead of logistic — promote to live only if this row
+      // beats "+ recalibration" once the ledger is deep enough to tell.
+      config: "+ beta calibration (out-of-fold, alt)",
+      p: (u, i) => applyBetaCalibration(marketedAt(u, i), betas[i]),
     },
   ];
 
   for (const s of strategies) {
-    const briers = usable.map((u, i) => brierScore(s.p(u, i), u.outcome));
-    const logs = usable.map((u, i) => -logScore(s.p(u, i), u.outcome));
+    // One prediction pass per strategy — Brier and log loss are pure functions of
+    // the same prediction, so evaluating s.p once (not twice) is exact and halves
+    // the work the published headline / static rows already share.
+    const preds = usable.map((u, i) => s.p(u, i));
+    const briers = preds.map((p, i) => brierScore(p, usable[i].outcome));
+    const logs = preds.map((p, i) => -logScore(p, usable[i].outcome));
     const ci = bootstrapCi(briers);
     report.rows.push({
       config: s.config,
@@ -2287,6 +2794,99 @@ export function backtest(entries = loadLedger()): BacktestReport {
       marketBrier:
         tourney.reduce((s, u) => s + brierScore(u.entry.origin!.marketProbAtCreate!, u.outcome), 0) / tourney.length,
     };
+  }
+  return report;
+}
+
+// ---------------------------------------------------------------- mc backtest
+
+export interface BacktestMcRow {
+  config: string;
+  n: number;
+  /** Mean multiclass Brier (0 perfect … 2 worst). */
+  brierMean: number;
+  /** Mean multiclass log loss (lower is better). */
+  logLossMean: number;
+}
+
+export interface BacktestMcReport {
+  rows: BacktestMcRow[];
+  skipped: number;
+}
+
+/**
+ * Replay the resolved multiple-choice ledger to check the mc extremization
+ * exponent earns its seat — scored on multiclass Brier + log loss, time-
+ * respecting OOF. Distinct from the binary backtest because mc has its own k
+ * (the per-option-GMO-then-renormalize geometry differs).
+ */
+export function backtestMc(entries = loadLedger()): BacktestMcReport {
+  const usable: { panels: Record<string, number>[]; methods: string[]; options: string[]; realized: string; overlap: number; published?: Record<string, number>; createT: number; resolveT: number; entry: LedgerEntry }[] = [];
+  let skipped = 0;
+  for (const e of entries) {
+    if (e.question.kind !== "mc" || !e.resolution) {
+      if (e.question.kind === "mc") skipped++;
+      continue;
+    }
+    const realized = e.resolution.outcome;
+    const options = e.question.options;
+    if (typeof realized !== "string" || realized === "void" || !options || options.length < 2 || !options.includes(realized)) {
+      skipped++;
+      continue;
+    }
+    const kept = e.panel.filter((m) => m.optionProbs && typeof m.optionProbs === "object");
+    if (kept.length < 2) {
+      skipped++;
+      continue;
+    }
+    usable.push({
+      panels: kept.map((m) => m.optionProbs!),
+      methods: kept.map((m) => m.method),
+      options,
+      realized,
+      overlap: e.evidenceOverlap ?? e.aggregate.evidenceOverlap ?? 0,
+      published: e.aggregate.optionProbs,
+      createT: e.t,
+      resolveT: e.resolution.t,
+      entry: e,
+    });
+  }
+  const report: BacktestMcReport = { rows: [], skipped };
+  if (!usable.length) return report;
+  // Time-respecting OOF by resolution time (see backtest()). Hoist every fit once
+  // per entry (threaded with the entry's own domain) instead of refitting the
+  // exponent and recalibration — and recomputing trainFor — inside each strategy's
+  // per-entry closure, which re-ran chooseExtremizeKMc twice over for the recal row.
+  const trainFor = (idx: number): LedgerEntry[] => usable.filter((u) => u.resolveT < usable[idx].createT).map((u) => u.entry);
+  const trains = usable.map((_, i) => trainFor(i));
+  const doms = usable.map((u) => u.entry.domain);
+  const kmcs = trains.map((t, i) => chooseExtremizeKMc(t, DEFAULT_EXTREMIZE_K, doms[i]));
+  const mws = trains.map((t, i) => methodWeights(t, doms[i]));
+  const mcRecals = trains.map((t, i) => fitMcRecalibration(t, doms[i]));
+  const servedWith = (u: (typeof usable)[number], k: number, mw: Record<string, number>): Record<string, number> => {
+    const weights = u.methods.map((m) => mw[m] ?? 1);
+    return aggregateMc(u.panels, u.options, scaleK(k, u.overlap), weights).optionProbs!;
+  };
+  const strategies: { config: string; probs: (u: (typeof usable)[number], i: number) => Record<string, number> }[] = [
+    { config: "published headline (as recorded)", probs: (u) => u.published ?? servedWith(u, DEFAULT_EXTREMIZE_K, {}) },
+    { config: `static k=${DEFAULT_EXTREMIZE_K} (overlap-scaled)`, probs: (u) => servedWith(u, DEFAULT_EXTREMIZE_K, {}) },
+    { config: "adaptive kMc + method weights (out-of-fold)", probs: (u, i) => servedWith(u, kmcs[i], mws[i]) },
+    {
+      // Gate mc recalibration the same way binary recalibration is gated: does it
+      // beat the un-recalibrated served headline out-of-fold?
+      config: "+ mc recalibration (out-of-fold)",
+      probs: (u, i) => applyMcRecalibration(servedWith(u, kmcs[i], mws[i]), mcRecals[i]),
+    },
+  ];
+  for (const s of strategies) {
+    let brier = 0;
+    let log = 0;
+    for (let i = 0; i < usable.length; i++) {
+      const p = s.probs(usable[i], i);
+      brier += mcBrierScore(p, usable[i].realized);
+      log += -mcLogScore(p, usable[i].realized);
+    }
+    report.rows.push({ config: s.config, n: usable.length, brierMean: brier / usable.length, logLossMean: log / usable.length });
   }
   return report;
 }
@@ -2318,12 +2918,14 @@ export interface BacktestNumericReport {
  * Replay the resolved numeric/date ledger under each quantile-aggregation
  * strategy and score them side by side — the regression gate for the LOP
  * combiner and the interval-dilation calibrator. Learned dilation is fitted
- * OUT-OF-FOLD (10-fold by time order). Pure deterministic replay; no agents.
- * Standalone from `backtest()` so the binary path is untouched.
+ * OUT-OF-FOLD by a TIME-RESPECTING expanding window (each entry's dilation is fit
+ * only on entries RESOLVED before it was served) — an index-interleaved split
+ * would leak future outcomes and flatter the calibrator. Pure deterministic
+ * replay; no agents. Standalone from `backtest()` so the binary path is untouched.
  */
 export function backtestNumeric(entries = loadLedger()): BacktestNumericReport {
   const skipped = { nonNumeric: 0, noPanel: 0, unresolved: 0 };
-  const usable: { panel: Quantiles[]; outcome: number; entry: LedgerEntry }[] = [];
+  const usable: { panel: Quantiles[]; outcome: number; createT: number; resolveT: number; entry: LedgerEntry }[] = [];
   for (const e of entries) {
     if (e.question.kind !== "numeric" && e.question.kind !== "date") {
       skipped.nonNumeric++;
@@ -2340,16 +2942,17 @@ export function backtestNumeric(entries = loadLedger()): BacktestNumericReport {
       skipped.noPanel++;
       continue;
     }
-    usable.push({ panel, outcome: e.resolution.outcome, entry: e });
+    usable.push({ panel, outcome: e.resolution.outcome, createT: e.t, resolveT: e.resolution.t, entry: e });
   }
   const report: BacktestNumericReport = { rows: [], skipped };
   if (!usable.length) return report;
 
-  const FOLDS = Math.min(10, usable.length);
-  const trainFor = (idx: number): LedgerEntry[] => usable.filter((_, j) => j % FOLDS !== idx % FOLDS).map((u) => u.entry);
-  // Fit the learned dilation once per fold (reused across entries in that fold).
-  const foldCal = Array.from({ length: FOLDS }, (_, idx) => fitQuantileCalibration(trainFor(idx), DEFAULT_QUANTILE_DILATION));
-  const learnedEqualsDefault = foldCal.every((c) => c.source === "default");
+  // Time-respecting OOF (see backtest()): each entry's dilation is fit only on
+  // entries resolved before it was served.
+  const trainFor = (idx: number): LedgerEntry[] => usable.filter((u) => u.resolveT < usable[idx].createT).map((u) => u.entry);
+  const entryCal = usable.map((_, i) => fitQuantileCalibration(trainFor(i), DEFAULT_QUANTILE_DILATION));
+  const entryICal = usable.map((_, i) => fitIntervalCalibration(trainFor(i), DEFAULT_QUANTILE_DILATION));
+  const learnedEqualsDefault = entryCal.every((c) => c.source === "default");
 
   const def = DEFAULT_QUANTILE_DILATION;
   const strategies: { config: string; q: (u: (typeof usable)[number], i: number) => Quantiles; learned?: boolean }[] = [
@@ -2367,7 +2970,15 @@ export function backtestNumeric(entries = loadLedger()): BacktestNumericReport {
       learned: true,
       q: (u, i) => {
         const a = aggregateQuantiles(u.panel, DEFAULT_EXTREMIZE_K, { combine: "lop" });
-        return applyQuantileDilation(a.quantiles!, foldCal[i % FOLDS].d, Boolean(a.logSpace));
+        return applyQuantileDilation(a.quantiles!, entryCal[i].d, Boolean(a.logSpace));
+      },
+    },
+    {
+      config: "LOP + asymmetric dilation (out-of-fold)",
+      learned: true,
+      q: (u, i) => {
+        const a = aggregateQuantiles(u.panel, DEFAULT_EXTREMIZE_K, { combine: "lop" });
+        return applyAsymmetricDilation(a.quantiles!, entryICal[i].dLo, entryICal[i].dUp, Boolean(a.logSpace));
       },
     },
   ];

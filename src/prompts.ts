@@ -505,7 +505,7 @@ export function simStructurePrompt(q: ForecastQuestion, drivers: SimDriver[], ev
     q.kind === "mc"
       ? `\nFor this MULTIPLE-CHOICE question the combiner picks ONE option per world. Prefer {"op":"argmax","children":[<score for option 0>, <score for option 1>, ...]} — one score sub-tree per option, IN THE ORDER ${JSON.stringify(q.options ?? [])}; the highest-scoring option wins that world. (You may also build a conditional_table/threshold tree that evaluates to the 0-based option index.)`
       : q.kind === "binary"
-        ? `\nFor this BINARY question the combiner must evaluate to YES(1)/NO(0): use and / or / threshold nodes.`
+        ? `\nFor this BINARY question the combiner must evaluate to YES(1)/NO(0): use and / or / threshold nodes. When YES means a value falls BELOW a level (a "close below / under / less than X" question), use a threshold node with "dir":"lt" (or a driver the catalog already states as P(value < X)).`
         : `\nFor this NUMERIC/DATE question the combiner must evaluate to the OUTCOME VALUE: use sum / weighted_sum / conditional_table over the driver values.`;
   return `You are designing the STRUCTURE of a Monte Carlo scenario simulation. You supply the shape only — NOT any probabilities or values. The engine already computed each driver's grounded distribution (shown below) and will run tens of thousands of correlated draws itself.
 
@@ -527,7 +527,7 @@ Reply with ONLY a JSON object (no prose, no fence):
 
 COMBINER DSL (a JSON tree; every leaf is {"op":"driver","id":"<handle>"}):
 - {"op":"and","children":[...]} / {"op":"or","children":[...]}  — all / any of the (binary) children fire
-- {"op":"threshold","child":<node>,"above":<number>}            — 1 if the child's value exceeds the threshold, else 0
+- {"op":"threshold","child":<node>,"above":<number>,"dir":"gt"|"lt"} — 1 if the child's value is past the threshold on the chosen side ("gt"=above [default], "lt"=below), else 0
 - {"op":"sum","children":[...]} / {"op":"weighted_sum","children":[...],"weights":[...]}
 - {"op":"max","children":[...]} / {"op":"min","children":[...]} / {"op":"argmax","children":[...]}
 - {"op":"conditional_table","conditionDriver":"<BINARY handle>","ifTrue":<node>,"ifFalse":<node>}  (conditionDriver MUST be a binary driver)

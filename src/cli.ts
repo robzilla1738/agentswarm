@@ -37,11 +37,13 @@ import {
   ISO_DATE,
   appendLedger,
   backtest,
+  backtestMc,
   backtestNumeric,
   calibrationStats,
   daysToIso,
   isoToDays,
   loadLedger,
+  priorDeltaStats,
   resolveLedgerEntry,
   simulationLedgerSummary,
   sportsCalibrationStats,
@@ -50,6 +52,9 @@ import {
 import { SportsLineSnapshot } from "./types";
 import { TOURNAMENT_SOURCES, TournamentSource, listClosingQuestions, sportsbookLines } from "./datatools";
 import { resolveDue, watchOpenForecasts } from "./resolve";
+import { seedRefClasses, loadRefClasses, queryRefClass, loadSeries, RefClassRecord } from "./refstore";
+import { seedCorpus, seedSummary } from "./domains/seeds";
+import { backtestProjectors } from "./datatools";
 import { ForecastQuestion, RunMeta, RunOptions } from "./types";
 import { ansi, errMsg, fmtMoney, fmtTokens } from "./util";
 
@@ -143,6 +148,9 @@ export async function main(): Promise<void> {
         break;
       case "backtest":
         cmdBacktest();
+        break;
+      case "refclass":
+        cmdRefclass(_.slice(1));
         break;
       case "report":
         cmdReport(_[1], flags);
@@ -916,6 +924,16 @@ function cmdCalibration(): void {
     console.log(ansi.bold("\nby panel method") + ansi.gray("  (mean Brier per panelist method)"));
     for (const [m, s] of methods) console.log(`  ${m.padEnd(18)} ${s.brierMean.toFixed(3)}  ${ansi.gray(`n=${s.n}`)}`);
   }
+  // Outside-view discipline (G2): do the panel's deviations from its committed
+  // base-rate prior actually pay off, or is it talking itself off the base rate?
+  const pd = priorDeltaStats(entries);
+  if (pd.n >= 10) {
+    const verdict = pd.bigMovesPayOff
+      ? ansi.green("big moves earn their keep")
+      : ansi.yellow("big moves LOSE to just holding the prior — demand stronger base-rate work");
+    console.log(ansi.bold("\noutside-view discipline") + ansi.gray(`  (${pd.n} resolved · mean |final−prior| ${pd.meanAbsDelta.toFixed(2)})`));
+    console.log(`  small moves Brier ${pd.smallMoveBrier.toFixed(3)}   big moves ${pd.largeMoveBrier.toFixed(3)}   (prior on big-move half ${pd.largeMovePriorBrier.toFixed(3)})  ${verdict}`);
+  }
 }
 
 /** "Did we match/beat the market" — the verdict the sports work is judged on. */
@@ -1055,6 +1073,20 @@ function cmdBacktest(): void {
     );
   }
 
+  // Multiple-choice: the mc extremization exponent (kMc) has its own optimum —
+  // graded on multiclass Brier (0–2) and log loss, time-respecting out-of-fold.
+  const mc = backtestMc(ledger);
+  if (mc.rows.length) {
+    const mn = mc.rows[0].n;
+    console.log("\n" + ansi.bold("backtest (multiple-choice)") + ansi.gray(`  (${mn} resolved mc forecasts replayed; multiclass Brier 0–2)`));
+    console.log(ansi.gray("  strategy                                          brier    log loss"));
+    const bestB = Math.min(...mc.rows.map((r) => r.brierMean));
+    for (const r of mc.rows) {
+      const mark = r.brierMean === bestB ? ansi.green(" ◀ best") : "";
+      console.log(`  ${r.config.padEnd(48)} ${r.brierMean.toFixed(4)}  ${r.logLossMean.toFixed(4)}${mark}`);
+    }
+  }
+
   // Scenario-simulation coverage: did binary forecasts that ran the simulation
   // score differently from those that didn't? Descriptive only — questions vary
   // in difficulty, so this is not a causal sim-on/sim-off comparison.
@@ -1068,6 +1100,63 @@ function cmdBacktest(): void {
     );
     console.log(`  sim-on  mean Brier: ${fmt(sim.onBrier)}   sim-off mean Brier: ${fmt(sim.offBrier)}`);
   }
+
+  // Projector gate: walk-forward the trend projectors on the accumulated refstore
+  // series, proving the RW-drift default earns its place vs OLS / damped trend.
+  try {
+    const series = [...loadSeries().values()].map((s) => s.points);
+    const proj = backtestProjectors(series);
+    if (proj.some((r) => r.n > 0)) {
+      console.log("\n" + ansi.bold("trend projectors") + ansi.gray("  (walk-forward one-step-ahead on stored series; scale-free MASE, <1 beats persistence, lower better; coverage ≈0.80)"));
+      const bestMase = Math.min(...proj.filter((r) => r.n > 0).map((r) => r.mase));
+      for (const r of proj) {
+        if (!r.n) continue;
+        const mark = r.mase === bestMase ? ansi.green(" ◀ best") : "";
+        console.log(`  ${r.method.padEnd(10)} n=${String(r.n).padEnd(5)} MASE ${r.mase.toFixed(4)}  coverage ${r.coverage.toFixed(2)}${mark}`);
+      }
+    }
+  } catch {
+    /* projector gate is best-effort */
+  }
+}
+
+/**
+ * `swarm refclass seed` — import the bundled starter base-rate corpus so the
+ * outside-view drivers are live from day one. Idempotent: replaces prior seeded
+ * rows, keeps the engine's own accumulated resolutions. `swarm refclass list`
+ * shows the current counted classes.
+ */
+function cmdRefclass(rest: string[]): void {
+  const sub = rest[0] || "list";
+  if (sub === "seed") {
+    const { added, kept } = seedRefClasses(seedCorpus(Date.now()));
+    console.log(ansi.bold("refclass seed") + ansi.gray(`  (${added} counted rows imported; ${kept} self-generated rows kept)`));
+    for (const line of seedSummary()) console.log("  " + line);
+    console.log(ansi.gray("\n  these are starter base rates — the engine's own resolutions refine and eventually dominate them."));
+    return;
+  }
+  if (sub === "list") {
+    const rows = loadRefClasses();
+    if (!rows.length) {
+      console.log(ansi.gray("no reference classes yet — run `swarm refclass seed` for the starter corpus, or resolve forecasts to accrue your own"));
+      return;
+    }
+    const byClass = new Map<string, RefClassRecord[]>();
+    for (const r of rows) {
+      const key = `${r.domain}/${r.refClass}`;
+      (byClass.get(key) ?? byClass.set(key, []).get(key)!).push(r);
+    }
+    console.log(ansi.bold("reference classes") + ansi.gray(`  (${rows.length} rows, ${byClass.size} classes)`));
+    for (const [key] of [...byClass].sort()) {
+      const [domain, refClass] = key.split("/");
+      const q = queryRefClass(domain, refClass);
+      const seeded = (byClass.get(key) ?? []).some((r) => r.seeded) ? ansi.gray(" [seed]") : "";
+      const rate = typeof q.baseRate === "number" ? `${Math.round(q.baseRate * 100)}% (raw ${Math.round((q.rawBaseRate ?? 0) * 100)}%, n=${q.binaryN})` : `${q.values.length} numeric values`;
+      console.log(`  ${key.padEnd(44)} ${rate}${seeded}`);
+    }
+    return;
+  }
+  console.log("usage: swarm refclass [seed|list]");
 }
 
 // ---------------------------------------------------------------- config / models
@@ -1110,7 +1199,7 @@ async function cmdConfig(rest: string[], flags: Args["flags"]): Promise<void> {
     const value = rest.slice(2).join(" ");
     if (!key || value === "") throw new Error("usage: swarm config set <key> <value>");
     if (!SETTABLE_KEYS.includes(key)) {
-      throw new Error(`unknown/settable keys: ${SETTABLE_KEYS.join(", ")}`);
+      throw new Error(`unknown config key: ${key}. Settable keys: ${SETTABLE_KEYS.join(", ")}`);
     }
     const coerced = coerceConfigValue(key, value);
     if (key === "apiKey") {
@@ -1254,16 +1343,17 @@ ${b("USAGE")}
   swarm calibration                   the system's track record: reliability table + per-method Brier,
                                       plus sports vs the market (beat-the-line / beat-the-moneyline)
   swarm sports close                  capture closing betting lines for open games near tip-off (CLV)
+  swarm refclass [seed|list]          seed the starter base-rate corpus (outside view live on day one) / list classes
   swarm backtest                      replay the resolved ledger under each aggregation strategy
-                                      (adaptive k, market anchor, recalibration — fitted out-of-fold)
-                                      and report Brier deltas + the swarm-vs-market skill line
+                                      (adaptive k + weights, market anchor, recalibration — time-respecting OOF),
+                                      plus mc + numeric tables and the trend-projector gate
   swarm report <id> [--open]          print (or open) a run's final report
   swarm note <id> "<text>"            steer a live run (the conductor reads it)
   swarm cancel <id>                   stop a run gracefully (still synthesizes)
-  swarm config [list|get|set ...]     manage config (~/.agentswarm/config.json)
+  swarm config [list|get|set|unset|path]  manage config (~/.agentswarm/config.json)
   swarm sandbox [test|<runtime>]      show / smoke-test the shell runtime (host, docker, e2b, modal, vercel)
   swarm models                        list models from the active provider
-  swarm demo                          run a self-contained demo mission
+  swarm demo [--mission "..."]        run a self-contained demo mission (override the canned prompt)
 
 ${b("RUN OPTIONS")}
   --workers N        max parallel agents (default ${loadConfig().maxWorkers})

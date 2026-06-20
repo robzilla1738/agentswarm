@@ -629,9 +629,10 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
     },
     run: async (args, ctx) => {
       const r = await optionsImplied(String(args.symbol), Number(args.strike), String(args.by), ctx.signal);
+      const ivNote = r.interpolated ? `interpolated to ${r.horizonDate} from expiries ${r.expiry}` : `expiry ${r.expiry} (horizon outside listed range — σ held flat)`;
       return [
-        `${r.symbol} spot ${r.spot} · strike ${r.strike} · expiry ${r.expiry} (nearest listed to your date) · implied vol ${(r.iv * 100).toFixed(1)}%`,
-        `Risk-neutral P(${r.symbol} > ${r.strike} at expiry) = ${(r.probAbove * 100).toFixed(1)}%  ·  P(below) = ${((1 - r.probAbove) * 100).toFixed(1)}%`,
+        `${r.symbol} spot ${r.spot} · strike ${r.strike} · horizon ${r.horizonDate} (${r.tYears.toFixed(2)}y) · implied vol ${(r.iv * 100).toFixed(1)}% (${ivNote})`,
+        `Risk-neutral P(${r.symbol} > ${r.strike} by ${r.horizonDate}) = ${(r.probAbove * 100).toFixed(1)}%  ·  P(below) = ${((1 - r.probAbove) * 100).toFixed(1)}%`,
         `Contracts used: ${r.contractsUsed}. Caveat: risk-neutral probabilities ≠ real-world for far-dated or high-risk-premium events — treat as a strong anchor, then adjust.`,
       ].join("\n");
     },
