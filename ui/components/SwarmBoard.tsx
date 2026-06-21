@@ -119,7 +119,11 @@ function ConductorTopNode({ status, latest, taskCount }: { status: RunStatus; la
         <span className="mono text-2xs text-ink-faint">
           {status === "synthesizing"
             ? "synthesizing the final report"
-            : `orchestrating ${taskCount} task${taskCount !== 1 ? "s" : ""}`}
+            : status === "planning" || (taskCount === 0 && thinking)
+              ? "planning the first wave…"
+              : taskCount === 0
+                ? "no tasks spawned"
+                : `orchestrating ${taskCount} task${taskCount !== 1 ? "s" : ""}`}
         </span>
       </div>
       <p className="text-xs leading-snug mt-1 line-clamp-2 text-ink-dim">

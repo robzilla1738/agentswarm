@@ -4,8 +4,10 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { ArtifactsPanel } from "@/components/ArtifactsPanel";
+import { ForecastBreakdown } from "@/components/ForecastBreakdown";
 import { ForecastHeadline } from "@/components/ForecastHeadline";
 import { ReportPanel } from "@/components/ReportPanel";
+import { SimulationPanel } from "@/components/SimulationPanel";
 import { CancelButton, NoteComposer } from "@/components/RunControls";
 import { SideRail } from "@/components/SideRail";
 import { SwarmBoard } from "@/components/SwarmBoard";
@@ -26,6 +28,7 @@ function RunView() {
   const [tab, setTab] = useState<"swarm" | "report" | "artifacts">("swarm");
   const [autoSwitched, setAutoSwitched] = useState(false);
   const [connectingSlow, setConnectingSlow] = useState(false);
+  const [copiedId, setCopiedId] = useState(false);
 
   // If the first events never arrive, say so instead of spinning forever
   // (bad run id, or the hub isn't running).
@@ -153,16 +156,37 @@ function RunView() {
           </Banner>
         )}
 
-        {data.question && (
-          <ForecastHeadline
-            question={data.question}
-            aggregate={data.aggregate}
-            tasks={data.tasks}
-            now={now}
-            expectedPanel={meta.options.panelSize}
-            dateInferred={!meta.options.resolutionDate}
-          />
-        )}
+        {data.question &&
+          (data.subForecasts.length > 1 ? (
+            <ForecastBreakdown
+              brief={data.forecastBrief}
+              domain={data.forecastDomain}
+              subForecasts={data.subForecasts}
+              onOpenReport={() => setTab("report")}
+              hasReport={!!data.finalSummary}
+            />
+          ) : (
+            <>
+              <ForecastHeadline
+                question={data.question}
+                aggregate={data.aggregate}
+                tasks={data.tasks}
+                now={now}
+                expectedPanel={meta.options.panelSize}
+                dateInferred={!meta.options.resolutionDate}
+                domain={data.forecastDomain}
+              />
+              {data.subForecasts[0]?.simulation && (
+                <section className="panel p-5 mb-5" style={{ animation: "var(--animate-rise)" }}>
+                  <SimulationPanel
+                    sim={data.subForecasts[0].simulation}
+                    kind={data.question.kind}
+                    unit={data.question.unit}
+                  />
+                </section>
+              )}
+            </>
+          ))}
 
         {/* Header */}
         <div className="panel p-5 mb-5">
@@ -176,9 +200,17 @@ function RunView() {
                   className="mono text-2xs text-ink-faint hover:text-ink-dim transition-colors"
                   aria-label="Copy run id"
                   title="Copy run id"
-                  onClick={() => navigator.clipboard?.writeText(id).catch(() => {})}
+                  onClick={() => {
+                    navigator.clipboard
+                      ?.writeText(id)
+                      .then(() => {
+                        setCopiedId(true);
+                        setTimeout(() => setCopiedId(false), 1200);
+                      })
+                      .catch(() => {});
+                  }}
                 >
-                  {id} ⧉
+                  {id} {copiedId ? <span className="text-ink">✓</span> : "⧉"}
                 </button>
               </div>
               {data.statusReason && terminal && (
@@ -309,7 +341,7 @@ function Banner({ glyph, title, children }: { glyph: string; title: string; chil
         animation: "var(--animate-rise)",
       }}
     >
-      <span className="glyph shrink-0 text-ink w-[30px] h-[30px] text-[13px]">{glyph}</span>
+      <span className="glyph shrink-0 text-ink w-[30px] h-[30px] text-sm">{glyph}</span>
       <div className="flex-1 min-w-0">
         <div className="font-semibold text-ink">{title}</div>
         <div className="text-sm mt-0.5 leading-relaxed text-ink-dim">{children}</div>

@@ -83,7 +83,7 @@ export function Logo({ small }: { small?: boolean }) {
   return (
     <Link href="/" className="flex items-center gap-2.5">
       <LogoMark size={small ? 24 : 28} />
-      <span className="font-display" style={{ fontSize: small ? 14 : 15 }}>
+      <span className={`font-display ${small ? "text-base" : "text-lg"}`}>
         agentswarm
       </span>
     </Link>
@@ -141,9 +141,11 @@ export function Sparkline({ points, width = 120, height = 26 }: { points: number
   if (points.length < 2) return null;
   const max = Math.max(...points);
   const min = Math.min(...points);
+  const flat = max === min;
   const span = max - min || 1;
   const step = width / (points.length - 1);
-  const y = (p: number) => height - 2 - ((p - min) / span) * (height - 4);
+  // A flat (zero-variance) series rides the vertical middle, not the invisible bottom edge.
+  const y = (p: number) => (flat ? height / 2 : height - 2 - ((p - min) / span) * (height - 4));
   const d = points.map((p, i) => `${i === 0 ? "M" : "L"}${(i * step).toFixed(1)},${y(p).toFixed(1)}`).join(" ");
   const area = `${d} L${width},${height} L0,${height} Z`;
   return (
@@ -192,7 +194,7 @@ export function CopyButton({ text, label = "Copy" }: { text: string | (() => str
 export function EmptyState({ glyph, title, sub }: { glyph: string; title: string; sub?: string }) {
   return (
     <div className="flex flex-col items-center justify-center py-14 px-6 text-center">
-      <div className="glyph mb-4" style={{ width: 44, height: 44, fontSize: 17 }}>
+      <div className="glyph mb-4" style={{ width: 44, height: 44, fontSize: 16 }}>
         {glyph}
       </div>
       <div className="font-semibold text-sm text-ink-dim">{title}</div>

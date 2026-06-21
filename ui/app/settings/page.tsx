@@ -111,6 +111,15 @@ export default function SettingsPage() {
     api.models().then((r) => setModels(r.models)).catch(() => {});
   }, [config?.apiKeySet, config?.provider]);
 
+  // A shown test result describes a SAVED state — clear it the moment the
+  // operator edits the inputs it was about, so a stale ✓/✕ never misleads.
+  // Depend on the active provider's own values (not the whole maps) so a config
+  // reload for an unrelated section doesn't wipe a still-valid provider test.
+  useEffect(() => { setTestResult(null); }, [form.provider, provKeys[form.provider], provUrls[form.provider]]);
+  useEffect(() => { setSearchResult(null); }, [form.searchBackend, tinyfishApiKey]);
+  useEffect(() => { setSbxResult(null); }, [form.sandboxRuntime, form.sandboxImage, sbxSecrets]);
+  useEffect(() => { setCrawlResult(null); }, [form.crawlBackend, form.deepcrawlBaseUrl, crawlSecrets]);
+
   const active: ProviderView | undefined = useMemo(
     () => config?.providers.find((p) => p.id === form.provider) ?? config?.providers.find((p) => p.id === config.provider),
     [config, form.provider]
@@ -264,7 +273,7 @@ export default function SettingsPage() {
                     : `— ${testResult.message || "could not verify"}`}
               </span>
             ) : (
-              <span className="text-2xs text-ink-faint">tests the saved provider — save first</span>
+              <span className="text-2xs text-ink-faint">tests the saved provider — Save settings (below) first</span>
             )}
           </div>
         </Card>
@@ -351,7 +360,7 @@ export default function SettingsPage() {
                 {searchResult.engines.map((e) => `${e.ok ? "✓" : "✕"} ${e.engine} (${e.detail})`).join("  ·  ")}
               </span>
             ) : (
-              <span className="text-2xs text-ink-faint">runs one real query per engine — save first</span>
+              <span className="text-2xs text-ink-faint">runs one real query per engine — Save settings (below) first</span>
             )}
           </div>
         </Card>
@@ -459,7 +468,7 @@ export default function SettingsPage() {
                   : `✕ ${crawlResult.backend ?? "none"}: ${crawlResult.detail}`}
               </span>
             ) : (
-              <span className="text-2xs text-ink-faint">scrapes one page with the saved keys — save first</span>
+              <span className="text-2xs text-ink-faint">scrapes one page with the saved keys — Save settings (below) first</span>
             )}
           </div>
         </Card>
@@ -700,7 +709,7 @@ export default function SettingsPage() {
                 {sbxResult.ok ? `✓ ${sbxResult.kind} works` : `✕ ${sbxResult.kind}: ${sbxResult.detail}`}
               </span>
             ) : (
-              <span className="text-2xs text-ink-faint">boots the saved runtime, runs a command, tears down — save first</span>
+              <span className="text-2xs text-ink-faint">boots the saved runtime, runs a command, tears down — Save settings (below) first</span>
             )}
           </div>
         </Card>

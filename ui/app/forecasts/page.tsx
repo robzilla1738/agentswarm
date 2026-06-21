@@ -6,7 +6,7 @@ import { CalibrationChart } from "@/components/CalibrationChart";
 import { TopBar } from "@/components/TopBar";
 import { EmptyState, Spinner } from "@/components/atoms";
 import { api } from "@/lib/api";
-import { daysToIso, fmtNum } from "@/lib/format";
+import { daysToIso, fmtNum, forecastChain, splitLabel } from "@/lib/format";
 import { useNow } from "@/lib/hooks";
 import type { CalibrationStats, LedgerEntry } from "@/lib/types";
 
@@ -29,7 +29,8 @@ function headline(e: LedgerEntry): string {
     return top ? pct(top[1]) : "—";
   }
   if (e.aggregate.quantiles) {
-    if (e.question.kind === "date") return daysToIso(e.aggregate.quantiles.p50);
+    // "~" marks a median (p50) estimate — consistent with the live run views.
+    if (e.question.kind === "date") return `~${daysToIso(e.aggregate.quantiles.p50)}`;
     return `~${fmtNum(e.aggregate.quantiles.p50)}${e.question.unit ? ` ${e.question.unit}` : ""}`;
   }
   return "—";
@@ -51,19 +52,6 @@ function outcomeLabel(e: LedgerEntry): string {
   return `${fmtNum(o as number)}${e.question.unit ? ` ${e.question.unit}` : ""}`;
 }
 
-/** "panel 62% → ⚓ market 58% → 56%" — the engine's full derivation chain. */
-function chainLabel(e: LedgerEntry): string | null {
-  const c = e.aggregate.components;
-  if (!c || typeof c.extremized !== "number") return null;
-  const steps: string[] = [];
-  if (typeof c.panelGmo === "number") steps.push(`GMO ${pct(c.panelGmo)}`);
-  steps.push(`extremized ${pct(c.extremized)}`);
-  if (c.market && typeof c.blended === "number") {
-    steps.push(`market [${c.market.platform} ${pct(c.market.probability)}, w=${c.market.weight.toFixed(2)}] → ${pct(c.blended)}`);
-  }
-  if (typeof c.recalibrated === "number") steps.push(`recalibrated ${pct(c.recalibrated)}`);
-  return steps.length > 1 ? steps.join(" → ") : null;
-}
 
 /** Tournament entries scored against the source market's price at import. */
 function vsMarket(entries: LedgerEntry[]): { n: number; swarm: number; market: number } | null {
@@ -138,53 +126,54 @@ function ManualResolveControls({
 }) {
   const [val, setVal] = useState("");
   const kind = e.question.kind;
+  const options = e.question.options ?? [];
   return (
     <span className="flex flex-wrap gap-1 justify-end items-center">
       {kind === "binary" && (
         <>
-          <button className="chip" title="Mark resolved YES (operator)" disabled={disabled} onClick={() => onResolve(e.id, "yes")}>YES</button>
-          <button className="chip" title="Mark resolved NO (operator)" disabled={disabled} onClick={() => onResolve(e.id, "no")}>NO</button>
+          <button className="btn btn-sm" title="Mark resolved YES (operator)" disabled={disabled} onClick={() => onResolve(e.id, "yes")}>YES</button>
+          <button className="btn btn-sm" title="Mark resolved NO (operator)" disabled={disabled} onClick={() => onResolve(e.id, "no")}>NO</button>
         </>
       )}
       {kind === "numeric" && (
         <>
           <input
-            className="input text-2xs w-24 px-2 py-1"
+            className="input text-xs w-24 px-2 py-1"
             inputMode="decimal"
             placeholder={e.question.unit ? `value (${e.question.unit})` : "value"}
             aria-label="Realized value"
             value={val}
             onChange={(ev) => setVal(ev.target.value)}
           />
-          <button className="chip" title="Resolve with the realized value" disabled={disabled || val.trim() === "" || !Number.isFinite(Number(val))} onClick={() => onResolve(e.id, Number(val))}>set</button>
+          <button className="btn btn-sm" title="Resolve with the realized value" disabled={disabled || val.trim() === "" || !Number.isFinite(Number(val))} onClick={() => onResolve(e.id, Number(val))}>set</button>
         </>
       )}
       {kind === "date" && (
         <>
-          <input className="input text-2xs w-32 px-2 py-1" type="date" aria-label="Realized date" value={val} onChange={(ev) => setVal(ev.target.value)} />
-          <button className="chip" title="Resolve with the realized date" disabled={disabled || !/^\d{4}-\d{2}-\d{2}$/.test(val)} onClick={() => onResolve(e.id, val)}>set</button>
-          <button className="chip" title="It never happened by the horizon" disabled={disabled} onClick={() => onResolve(e.id, "never")}>never</button>
+          <input className="input text-xs w-32 px-2 py-1" type="date" aria-label="Realized date" value={val} onChange={(ev) => setVal(ev.target.value)} />
+          <button className="btn btn-sm" title="Resolve with the realized date" disabled={disabled || !/^\d{4}-\d{2}-\d{2}$/.test(val)} onClick={() => onResolve(e.id, val)}>set</button>
+          <button className="btn btn-sm" title="It never happened by the horizon" disabled={disabled} onClick={() => onResolve(e.id, "never")}>never</button>
         </>
       )}
-      {kind === "mc" && (e.question.options ?? []).length > 0 && (
-        <select
-          className="input text-2xs max-w-[150px] px-2 py-1"
-          aria-label="Realized option"
-          value={val}
-          disabled={disabled}
-          onChange={(ev) => {
-            const v = ev.target.value;
-            setVal(v);
-            if (v) onResolve(e.id, v);
-          }}
-        >
-          <option value="">resolve…</option>
-          {(e.question.options ?? []).map((o) => (
-            <option key={o} value={o}>{o}</option>
-          ))}
-        </select>
+      {kind === "mc" && options.length > 0 && (
+        <>
+          {/* Stage the option, then resolve on an explicit click — an irreversible record shouldn't fire on dropdown change. */}
+          <select
+            className="input text-xs max-w-[150px] px-2 py-1"
+            aria-label="Realized option"
+            value={val}
+            disabled={disabled}
+            onChange={(ev) => setVal(ev.target.value)}
+          >
+            <option value="">resolve…</option>
+            {options.map((o) => (
+              <option key={o} value={o}>{o}</option>
+            ))}
+          </select>
+          <button className="btn btn-sm" title="Resolve with the selected option" disabled={disabled || !val} onClick={() => onResolve(e.id, val)}>set</button>
+        </>
       )}
-      <button className="chip" title="Mark void — the question stopped being meaningful" disabled={disabled} onClick={() => onResolve(e.id, "void")}>void</button>
+      <button className="btn btn-sm" title="Mark void — the question stopped being meaningful" disabled={disabled} onClick={() => onResolve(e.id, "void")}>void</button>
     </span>
   );
 }
@@ -269,7 +258,7 @@ export default function ForecastsPage() {
       <main className="max-w-5xl mx-auto px-5 sm:px-8 py-8">
         <div className="flex items-end justify-between gap-4 mb-6 flex-wrap">
           <div>
-            <h1 className="font-display text-[22px] mb-1">Forecasts</h1>
+            <h1 className="font-display text-xl mb-1">Forecasts</h1>
             <p className="text-xs text-ink-faint">
               Every prediction the swarm has made, resolved against reality. Brier 0.25 = &quot;always say 50%&quot;; lower is better.
             </p>
@@ -299,13 +288,20 @@ export default function ForecastsPage() {
               value={calibration && calibration.n ? calibration.brierMean.toFixed(3) : "—"}
               hint={calibration && calibration.n ? `${calibration.n} scored` : "resolve forecasts to score"}
             />
-            {market && (
-              <Stat
-                label="vs market"
-                value={`${market.swarm < market.market ? "+" : "−"}${Math.abs(market.market - market.swarm).toFixed(3)}`}
-                hint={`swarm ${market.swarm.toFixed(3)} vs market ${market.market.toFixed(3)} Brier (n=${market.n})${market.swarm < market.market ? " — beating the market" : ""}`}
-              />
-            )}
+            {market &&
+              (() => {
+                // d > 0 ⇒ swarm's Brier is lower than the market's at import ⇒ swarm is better.
+                const d = market.market - market.swarm;
+                const sign = d > 0 ? "+" : d < 0 ? "−" : "±";
+                const verdict = d > 0 ? "beating the market" : d < 0 ? "behind the market" : "level with the market";
+                return (
+                  <Stat
+                    label="vs market"
+                    value={`${sign}${Math.abs(d).toFixed(3)}`}
+                    hint={`swarm ${market.swarm.toFixed(3)} vs market ${market.market.toFixed(3)} Brier (n=${market.n}) — ${verdict} (lower is better)`}
+                  />
+                );
+              })()}
           </div>
         )}
 
@@ -333,7 +329,7 @@ export default function ForecastsPage() {
                   </tbody>
                 </table>
                 <p className="text-2xs text-ink-faint mt-2 leading-relaxed">
-                  Which forecasting lens has the best track record — the engine&apos;s aggregation weighting stays mechanical,
+                  Which forecasting method has the best track record — the engine&apos;s aggregation weighting stays mechanical,
                   but the conductor reads this when composing panels.
                 </p>
               </div>
@@ -414,7 +410,7 @@ export default function ForecastsPage() {
             {shown.map((e) => {
               const dueNow = isDue(e, now);
               const busy = resolving?.has(e.id);
-              const chain = chainLabel(e);
+              const chain = forecastChain(e.aggregate.components, e.aggregate.k);
               const sub = headlineSub(e);
               const stale = superseded.has(e.id);
               return (
@@ -438,11 +434,15 @@ export default function ForecastsPage() {
                       <div className="mono text-2xs text-ink-faint mt-1 flex flex-wrap gap-x-2 gap-y-0.5">
                         <span>{fmtDate(e.t)}</span>
                         <span>· panel {e.aggregate.n}</span>
-                        {typeof e.aggregate.probability === "number" && <span>· spread {Math.round(e.aggregate.spread * 100)}pts</span>}
+                        {typeof e.aggregate.probability === "number" && (
+                          <span title="How far apart the panel's forecasts were — a high split means low panel agreement.">
+                            · {splitLabel(e.aggregate.spread, e.question.kind)}
+                          </span>
+                        )}
                         <span>· resolves {e.question.resolutionDate}</span>
                         {e.origin && (
                           <a href={e.origin.url} target="_blank" rel="noreferrer" className="hover:underline" title="Imported from this market by swarm tournament">
-                            · 🏆 {e.origin.platform}
+                            · ◆ {e.origin.platform}
                             {typeof e.origin.marketProbAtCreate === "number" ? ` @ ${pct(e.origin.marketProbAtCreate)}` : ""}
                           </a>
                         )}
@@ -471,7 +471,11 @@ export default function ForecastsPage() {
                       {e.question.kind === "date" && e.aggregate.quantiles && (
                         <div className="mono text-2xs text-ink-faint mt-1">
                           p10 {daysToIso(e.aggregate.quantiles.p10)} · p90 {daysToIso(e.aggregate.quantiles.p90)}
-                          {typeof e.aggregate.pNever === "number" && <> · P(never by horizon) {pct(e.aggregate.pNever)}</>}
+                          {typeof e.aggregate.pNever === "number" && (
+                            <span title="Combined probability the event simply doesn't happen by the resolution date.">
+                              {" "}· P(never by {e.question.resolutionDate}) {pct(e.aggregate.pNever)}
+                            </span>
+                          )}
                         </div>
                       )}
                       {e.resolution && (
@@ -486,13 +490,19 @@ export default function ForecastsPage() {
                         <>
                           <div className="mono text-sm font-semibold text-ink">{outcomeLabel(e)}</div>
                           {e.resolution.brier !== undefined && (
-                            <div className="mono text-2xs text-ink-faint mt-0.5">Brier {e.resolution.brier.toFixed(3)}</div>
+                            <div className="mono text-2xs text-ink-faint mt-0.5" title="Brier score — squared error of the probability vs the 0/1 outcome; 0 is perfect, 0.25 = always saying 50%. Lower is better.">
+                              Brier {e.resolution.brier.toFixed(3)}
+                            </div>
                           )}
                           {e.resolution.pinball !== undefined && (
-                            <div className="mono text-2xs text-ink-faint mt-0.5">pinball {e.resolution.pinball.toFixed(2)}</div>
+                            <div className="mono text-2xs text-ink-faint mt-0.5" title="Pinball loss — the average quantile (p10/p50/p90) miss against the realised value. Lower is better.">
+                              pinball {e.resolution.pinball.toFixed(2)}
+                            </div>
                           )}
                           {e.resolution.intervalScore !== undefined && (
-                            <div className="mono text-2xs text-ink-faint mt-0.5">interval {e.resolution.intervalScore.toFixed(2)}</div>
+                            <div className="mono text-2xs text-ink-faint mt-0.5" title="Interval score — penalises a p10–p90 band that is too wide or that misses the realised value. Lower is better.">
+                              interval score {e.resolution.intervalScore.toFixed(2)}
+                            </div>
                           )}
                         </>
                       ) : dueNow ? (
@@ -520,7 +530,7 @@ export default function ForecastsPage() {
 function Stat({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
     <div className="panel p-4">
-      <div className="text-2xs text-ink-faint mb-1">{label}</div>
+      <div className="label mb-1">{label}</div>
       <div className="mono text-xl font-semibold text-ink">{value}</div>
       {hint && <div className="text-2xs text-ink-faint mt-0.5">{hint}</div>}
     </div>

@@ -39,7 +39,7 @@ export default function Dashboard() {
         >
           <div className="flex flex-col items-center gap-3 mb-8" style={{ animation: "var(--animate-rise)" }}>
             <LogoMark size={64} />
-            <h1 className="font-display text-[26px]">
+            <h1 className="font-display text-2xl">
               agentswarm
             </h1>
           </div>

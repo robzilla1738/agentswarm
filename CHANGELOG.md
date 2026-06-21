@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.20.0
+
+A UI release: the live web UI now visualizes the entire forecast structure the engine already computes — not just the synthesized report afterward — plus an adversarial UI-quality sweep across the dashboard, run view, settings, and ledger. No engine or forecasting-math changes; the numbers are identical, the difference is what you can see while a run computes.
+
+### The forecast UI now shows what the engine computes
+- **Sub-forecast decomposition is visible live.** When an open-ended question fans out into several sub-forecasts, the run view renders the framing brief, the matched domain, and every sub-forecast with its own headline, distribution, panel spread, and pending state. Previously only the first sub-forecast was shown, as if it were the whole answer — the rest were already streaming, the UI just collapsed them.
+- **The grounded scenario simulation has a UI.** A new "Scenario analysis" panel renders the driver tornado (share of outcome variance η²), the ranked scenarios with their conditional outcomes, the coherence verdict against the panel (a high divergence gets the system's one alarm treatment), and whether the simulation blended into the headline or stayed a cross-check — for single and decomposed questions alike. It was computed and streamed all along; the reducer was discarding it.
+- **The full derivation chain renders identically** on the live headline and the ledger — `GMO → extremized (k) → ⚓ market (w, volume) → recalibrated → updated → sim (w)` — alongside the per-tail interval dilation (`×lo/up`) with its pre-dilation raw band, the inverted-framing coherence-probe panelist drawn as a hollow ring, panelist medians on the range strip, and the matched sportsbook line on each sports facet (winner / total / margin).
+- **Domain packs read with their friendly labels** ("Macro / economy", "Sports", "General") everywhere, instead of raw ids on the run views and labels only in the composer.
+
+### UI quality + correctness sweep
+- **Live steering and Stop surface failures** instead of silently swallowing them; the typed note survives a failed send so it can be retried.
+- **Settings test results stay honest** — a shown ✓/✕ clears the moment you edit the inputs it described.
+- **Forecast manual-resolve requires an explicit click** (it was firing an irreversible resolution on a dropdown change), and resolution actions read as buttons distinct from the read-only status tag.
+- **Render fixes**: non-finite chart points no longer emit broken polylines, flat sparklines stay visible, and the scoring metrics (Brier, pinball, interval score, P(never), panel split) all carry inline explanations.
+- **Design-system consistency**: color emoji replaced with monochrome glyphs, off-scale type snapped to documented tokens (the headline number and wordmark now own a `2xl` token), reused micro-headings, and a theme toggle that announces its target without a hydration flash.
+
 ## 0.19.0
 
 An accuracy-hardening pass: a multi-expert audit of the forecasting math drove fixes across four layers — deterministic correctness bugs that mis-stated numbers, train/serve skews in the learning flywheel, calibration expressiveness, and cold-start. No breaking changes; every new method reduces to prior behavior in its no-op limit, and sports/binary behavior is unchanged where it should be.

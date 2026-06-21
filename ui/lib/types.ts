@@ -34,13 +34,82 @@ export interface Quantiles {
   p95?: number;
 }
 
+/** A de-vigged sportsbook line snapshot (the anchor + CLV baseline for a sports facet). */
+export interface SportsLineSnapshot {
+  pHome?: number;
+  pDraw?: number;
+  pAway?: number;
+  /** Favorite's point spread (positive magnitude). */
+  spread?: number;
+  /** Over/under total points. */
+  total?: number;
+  t: number;
+}
+
+/** Carried on sub-forecasts the engine decomposed from one real game (winner / total / margin). */
+export interface SportsMeta {
+  sportTitle: string;
+  home: string;
+  away: string;
+  commence: string;
+  facet: "winner" | "total" | "margin";
+  favorite: "home" | "away";
+  sigma?: number;
+  /** The line at forecast time — the anchor and the market-relative scoring baseline. */
+  lineAtCreate?: SportsLineSnapshot;
+  /** The line near tip-off — captured later for CLV. */
+  lineAtClose?: SportsLineSnapshot;
+}
+
 export interface ForecastQuestion {
+  /** Stable sub-forecast id within a run ("sf1"), set when an open question fans out. */
+  id?: string;
   text: string;
   kind: ForecastKind;
   resolutionCriteria: string;
   resolutionDate: string;
   unit?: string;
   options?: string[];
+  /** The domain pack that planned this question (finance, macro, sports, …). */
+  domain?: string;
+  /** Set on sub-forecasts decomposed from one real game — the matched betting line + matchup. */
+  sports?: SportsMeta;
+}
+
+/** One driver ranked by how much outcome variance it explains (tornado input). */
+export interface SensitivityIndex {
+  driverId: string;
+  driverLabel: string;
+  /** First-order correlation ratio η² in [0,1] — share of outcome variance from this driver. */
+  varianceContribution: number;
+  linearCorrelation: number;
+}
+
+/** One scenario cluster from the Monte Carlo: a pattern of which drivers fired, and its conditional outcome. */
+export interface ScenarioRow {
+  key: string;
+  /** Fraction of simulated worlds in this cluster [0,1]. */
+  frequency: number;
+  outcome: AggregateForecast;
+  description: string;
+}
+
+/**
+ * The grounded scenario simulation for one sub-forecast (forecast.simulated):
+ * a bottom-up Monte Carlo cross-check the UI renders as scenarios + a driver
+ * tornado + a coherence verdict against the top-down panel.
+ */
+export interface SimulationView {
+  /** Blend weight into the headline (0 = cross-check only, never moved the number). */
+  weight: number;
+  /** Ids of proposed drivers that were filtered out as ungrounded (provenance). */
+  dropped?: string[];
+  /** Bottom-up simulated aggregate (before blending onto the panel headline). */
+  simulated?: AggregateForecast;
+  scenarios: ScenarioRow[];
+  sensitivity: SensitivityIndex[];
+  coherence: { divergence: number; verdict: "ok" | "moderate" | "high" };
+  drivers: { id: string; label: string; provenance?: { kind: string; ref: string; label: string } }[];
 }
 
 export interface ForecastOrigin {
@@ -82,6 +151,14 @@ export interface AggregateComponents {
   market?: MarketAnchor;
   blended?: number;
   recalibrated?: number;
+  /** After the H2 sequential update on a re-forecast (--supersedes) — the published binary headline. */
+  superseded?: number;
+  /** Scenario-simulation bottom-up headline (binary), blended in only once it earns weight. */
+  simulated?: number;
+  /** The simulation blend weight actually applied to the headline (0 until the ledger earns it trust). */
+  simBlendWeight?: number;
+  /** The sportsbook line a numeric sports facet (total/margin) was anchored to, and how hard. */
+  marketLine?: { line: number; sigma: number; lineKind: "total" | "margin"; weight: number };
 }
 
 export interface AggregateForecast {
@@ -92,8 +169,8 @@ export interface AggregateForecast {
   quantiles?: Quantiles;
   /** Combined quantiles before interval dilation (numeric/date). */
   predilationQuantiles?: Quantiles;
-  /** Interval dilation applied to the quantiles and where the factor came from. */
-  dilation?: { d: number; source: "default" | "learned"; n: number };
+  /** Interval dilation applied to the quantiles and where the factor came from (dLo/dUp = per-tail). */
+  dilation?: { d: number; source: "default" | "learned"; n: number; dLo?: number; dUp?: number };
   optionProbs?: Record<string, number>;
   pNever?: number;
   logSpace?: boolean;
@@ -113,6 +190,16 @@ export interface ForecastPanelist {
   optionProbs?: Record<string, number>;
   pNever?: number;
   weight?: number;
+}
+
+/** One sub-forecast of a decomposed question: its question, aggregate, panel, and optional simulation. */
+export interface SubForecast {
+  questionId: string;
+  question: ForecastQuestion;
+  aggregate: AggregateForecast | null;
+  panel: ForecastPanelist[];
+  ledgerId?: string;
+  simulation?: SimulationView;
 }
 
 /** One ledger entry from /api/forecasts (created record + optional resolution). */

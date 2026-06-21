@@ -112,7 +112,7 @@ export function ExtBadge({ name }: { name: string }) {
     <span
       className="mono shrink-0 uppercase grid place-items-center text-ink-dim"
       style={{
-        fontSize: 9.5,
+        fontSize: 10,
         letterSpacing: "0.08em",
         width: 34,
         height: 20,

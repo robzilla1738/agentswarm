@@ -15,6 +15,7 @@ import type {
   RunMeta,
   RunStatus,
   RunSummary,
+  SubForecast,
   Task,
   Usage,
 } from "./types";
@@ -40,6 +41,10 @@ export interface LiveRun {
   question: ForecastQuestion | null;
   aggregate: AggregateForecast | null;
   forecastPanel: ForecastPanelist[];
+  /** Decomposition: framing brief, detected domain, and every sub-forecast in plan order. */
+  forecastBrief: string;
+  forecastDomain: string | null;
+  subForecasts: SubForecast[];
   finalSummary?: string;
   finalReportPath?: string;
   lastSeq: number;
@@ -71,6 +76,18 @@ function project(s: ClientState): LiveRun {
     question: s.question,
     aggregate: s.aggregate,
     forecastPanel: s.forecastPanel.slice(),
+    forecastBrief: s.forecastBrief,
+    forecastDomain: s.forecastDomain,
+    // Plan order, with a pending placeholder for sub-forecasts not yet aggregated.
+    subForecasts: s.questions.map(
+      (q): SubForecast =>
+        (q.id ? s.subForecasts.get(q.id) : undefined) ?? {
+          questionId: q.id ?? "",
+          question: q,
+          aggregate: null,
+          panel: [],
+        }
+    ),
     finalSummary: s.finalSummary,
     finalReportPath: s.finalReportPath,
     lastSeq: s.lastSeq,

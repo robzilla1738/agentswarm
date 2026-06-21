@@ -191,7 +191,11 @@ function LineChart({ spec }: { spec: Extract<ChartSpec, { type: "line" }> }) {
             strokeWidth={2}
             opacity={STROKES[i].op}
             strokeDasharray={STROKES[i].dash}
-            points={s.values.map((v, j) => `${x(j).toFixed(1)},${y(v).toFixed(1)}`).join(" ")}
+            points={s.values
+              .map((v, j) => [x(j), y(v)] as const)
+              .filter(([, yy]) => Number.isFinite(yy))
+              .map(([xx, yy]) => `${xx.toFixed(1)},${yy.toFixed(1)}`)
+              .join(" ")}
           />
         ))}
       </svg>
@@ -309,7 +313,7 @@ export function ChartBlock({ raw }: { raw: string }) {
   // Couldn't parse or render — keep it quiet and contained, never a raw dump.
   return (
     <figure className="my-5">
-      <figcaption className="mono text-2xs uppercase tracking-wider text-ink-faint mb-1">chart</figcaption>
+      <figcaption className="mono text-2xs uppercase tracking-wider text-ink-faint mb-1">chart (could not render)</figcaption>
       <pre
         className="text-2xs text-ink-faint overflow-x-auto rounded p-2 m-0"
         style={{ background: "rgb(var(--hi) / 0.03)" }}

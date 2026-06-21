@@ -59,13 +59,20 @@ export function RunCard({ run, now, onDeleted }: { run: RunSummary; now: number;
             onClick={remove}
             aria-label="Delete run"
             title={confirming ? "Click again to delete" : "Delete run"}
-            className="btn btn-sm px-2 py-[3px] text-2xs"
+            className="btn btn-sm px-2 py-[3px] text-2xs relative overflow-hidden"
             style={{
               color: confirming ? "var(--color-ink)" : "var(--color-ink-faint)",
               borderColor: confirming ? "rgb(var(--hi) / 0.5)" : "var(--color-border-soft)",
             }}
           >
             {confirming ? "delete?" : "✕"}
+            {confirming && (
+              // Draining bar shows the confirm window closing instead of an invisible timer.
+              <span
+                className="absolute left-0 bottom-0 h-[2px] w-full bg-[var(--color-ink)]"
+                style={{ transformOrigin: "left", animation: "drain 2.6s linear forwards" }}
+              />
+            )}
           </button>
         ) : null}
       </div>

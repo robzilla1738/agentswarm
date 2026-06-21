@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { api, PublicConfig, DomainDetection, ForecastModelView } from "@/lib/api";
-import { fmtTokens } from "@/lib/format";
+import { domainLabel, fmtTokens } from "@/lib/format";
 import { Spinner } from "./atoms";
 
 /** Which forecast knobs to surface per domain (mirrors each pack's declared knobs). */
@@ -259,7 +259,7 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
       </div>
 
       <textarea
-        className="input resize-none text-[15px] leading-relaxed"
+        className="input resize-none leading-relaxed"
         rows={3}
         autoFocus
         placeholder={
@@ -328,7 +328,7 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
             <div className="space-y-3">
               <div className="flex items-center gap-2">
                 <span className="text-2xs text-ink-faint">Forecast tuning</span>
-                <span className="chip text-ink">{effectiveDomain}</span>
+                <span className="chip text-ink">{domainLabel(effectiveDomain)}</span>
                 {Object.keys(fcTouched).some((k) => fcTouched[k]) && (
                   <button className="btn btn-ghost btn-sm" onClick={() => { setFcTouched({}); markTouched(); }}>
                     reset to domain defaults
@@ -373,7 +373,7 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
                   </Field>
                 )}
                 {relevantKnobs.includes("coherenceProbe") && (
-                  <Field label="Coherence probe" hint="inverted-framing check">
+                  <Field label="Coherence probe" hint="re-asks inverted to cancel yes-bias">
                     <select className="input" value={fc.coherenceProbe ? "yes" : "no"} onChange={(e) => { markFc("coherenceProbe"); setFc((f) => ({ ...f, coherenceProbe: e.target.value === "yes" })); }}>
                       <option value="yes">yes</option>
                       <option value="no">no</option>
@@ -520,7 +520,10 @@ function FolderBrowser({ cwd, onPick, onClose }: { cwd: string; onPick: (p: stri
       .catch((e: any) => setErr(e?.message || "can't read directory"));
 
   useEffect(() => {
-    if (open && !listing) browse(cwd.trim() || undefined);
+    // Each time the browser opens, refetch from the typed path so a manually
+    // entered path is honored (this intentionally resets in-browser navigation
+    // back to that path rather than showing a stale listing).
+    if (open) browse(cwd.trim() || undefined);
   }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
@@ -589,7 +592,7 @@ function DomainPicker({ detected, override, onChange }: { detected: DomainDetect
   const detLabel = detected && detected.domain !== "generic" ? `${detected.label}${override ? "" : " · auto"}` : "General";
   return (
     <label className="flex items-center gap-1.5" title="Detected forecasting domain — override if it's wrong">
-      <span className="text-2xs text-ink-faint" aria-hidden="true">🎯</span>
+      <span className="text-2xs text-ink-faint" aria-hidden="true">⌖</span>
       <select
         className="input !py-1 !text-xs !w-auto"
         aria-label="Forecast domain"

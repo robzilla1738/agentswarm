@@ -6,7 +6,7 @@ import { type ActivityGroup, groupActivity } from "@/lib/feed";
 import { fmtClockShort } from "@/lib/format";
 import { PixelAvatar, personaName } from "@/lib/persona";
 import type { ActivityItem, BlackboardNote, ConductorSay, OperatorNote } from "@/lib/types";
-import { Clamp, EmptyState, Md, ToolIcon } from "./atoms";
+import { Clamp, EmptyState, Md, Spinner, ToolIcon } from "./atoms";
 
 type Tab = "activity" | "conductor" | "blackboard" | "plan";
 
@@ -34,7 +34,7 @@ export function SideRail({
   ];
 
   return (
-    <div className="panel flex flex-col h-[480px] lg:h-[calc(100vh-96px)] lg:sticky lg:top-20">
+    <div className="panel flex flex-col h-[60vh] min-h-[360px] lg:h-[calc(100vh-96px)] lg:sticky lg:top-20">
       <div className="flex items-center gap-5 px-4 border-b border-border-soft shrink-0">
         {tabs.map((t) => (
           <button key={t.id} className="tab" data-active={tab === t.id} onClick={() => setTab(t.id)}>
@@ -57,7 +57,7 @@ export function SideRail({
 /** The conductor's living mission-plan.md, refetched whenever it changes. */
 function PlanView({ runId, planUpdatedAt }: { runId: string; planUpdatedAt: number }) {
   const [plan, setPlan] = useState<string | null>(null);
-  const [loaded, setLoaded] = useState(false);
+  const [state, setState] = useState<"loading" | "ok" | "error">("loading");
 
   useEffect(() => {
     let alive = true;
@@ -66,18 +66,28 @@ function PlanView({ runId, planUpdatedAt }: { runId: string; planUpdatedAt: numb
       .then((text) => {
         if (alive) {
           setPlan(text);
-          setLoaded(true);
+          setState("ok");
         }
       })
       .catch(() => {
-        if (alive) setLoaded(true);
+        // A failed fetch is distinct from "no plan exists" — don't conflate them.
+        if (alive) setState("error");
       });
     return () => {
       alive = false;
     };
   }, [runId, planUpdatedAt]);
 
-  if (!loaded) return <EmptyState glyph="◈" title="Loading plan…" sub="" />;
+  if (state === "loading") {
+    return (
+      <div className="h-full flex items-center justify-center gap-2 text-ink-faint">
+        <Spinner /> <span className="text-xs">loading plan…</span>
+      </div>
+    );
+  }
+  if (state === "error") {
+    return <EmptyState glyph="⚠" title="Couldn't load the plan" sub="The hub didn't answer — make sure swarm serve is running." />;
+  }
   if (!plan) {
     return (
       <EmptyState
@@ -259,7 +269,7 @@ function titleCase(key: string): string {
 /** One chip styling for note kinds and their filter buttons, so they can't drift apart. */
 function kindChipStyle(solid: boolean, padding = "1px 6px"): CSSProperties {
   return {
-    fontSize: 9,
+    fontSize: 10,
     letterSpacing: "0.1em",
     padding,
     borderRadius: 4,

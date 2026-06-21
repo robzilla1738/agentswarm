@@ -57,6 +57,7 @@ export function CalibrationChart({ stats }: { stats: CalibrationStats }) {
       </text>
       {/* Brier annotation */}
       <text x={W - pad} y={pad - 10} textAnchor="end" fontSize="10" fill="var(--color-ink-dim)" className="mono">
+        <title>{`Mean Brier score across ${stats.n} resolved forecasts — 0 is perfect, 0.25 = always saying 50%. Lower is better.`}</title>
         {`Brier ${stats.brierMean.toFixed(3)} · n=${stats.n}`}
       </text>
     </svg>

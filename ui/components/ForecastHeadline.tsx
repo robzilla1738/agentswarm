@@ -1,9 +1,13 @@
 "use client";
 
 import type { AggregateForecast, ForecastQuestion, Task } from "@/lib/types";
+import { domainLabel, forecastChain, splitLabel } from "@/lib/format";
 
 const pctOf = (p: number) => `${Math.round(p * 100)}%`;
 const daysToIso = (days: number) => new Date(Math.round(days) * 86_400_000).toISOString().slice(0, 10);
+/** A quantile value as a date or number (mirrors RangeStrip's fmt). */
+const fmtQ = (v: number, asDate?: boolean) =>
+  asDate ? daysToIso(v) : Math.abs(v) >= 1000 ? Math.round(v).toLocaleString() : String(Number(v.toPrecision(4)));
 
 /** Per-option probability bars for mc questions. */
 function OptionBars({ probs }: { probs: Record<string, number> }) {
@@ -26,18 +30,6 @@ function OptionBars({ probs }: { probs: Record<string, number> }) {
       ))}
     </div>
   );
-}
-
-/** "panel 62% → market 58% → recalibrated 56%" — the engine's derivation. */
-function chainLine(agg: AggregateForecast): string | null {
-  const c = agg.components;
-  if (!c || typeof c.extremized !== "number") return null;
-  const steps = [`panel ${pctOf(c.extremized)} (k=${agg.k})`];
-  if (c.market && typeof c.blended === "number") {
-    steps.push(`⚓ ${c.market.platform} ${pctOf(c.market.probability)} (w=${c.market.weight.toFixed(2)}) → ${pctOf(c.blended)}`);
-  }
-  if (typeof c.recalibrated === "number") steps.push(`recalibrated ${pctOf(c.recalibrated)}`);
-  return steps.length > 1 ? steps.join("  →  ") : null;
 }
 
 /** Semicircular probability gauge, house monochrome. */
@@ -97,8 +89,8 @@ function RangeStrip({
     asDate ? daysToIso(v) : Math.abs(v) >= 1000 ? Math.round(v).toLocaleString() : String(Number(v.toPrecision(4)));
   return (
     <div className="flex-1 min-w-0">
-      <div className="mono text-2xl font-semibold text-ink mb-1">
-        {fmt(agg.p50)}
+      <div className="mono text-2xl font-semibold text-ink mb-1" title="Median (p50) estimate of the distribution">
+        ~{fmt(agg.p50)}
         {unit ? <span className="text-sm text-ink-dim ml-1">{unit}</span> : null}
       </div>
       <div className="relative h-2 rounded-full bg-[rgb(var(--hi)/0.08)] mt-3">
@@ -106,7 +98,16 @@ function RangeStrip({
           className="absolute top-0 h-full rounded-full bg-[rgb(var(--hi)/0.25)]"
           style={{ left: pos(agg.p10), width: `calc(${pos(agg.p90)} - ${pos(agg.p10)})` }}
         />
-        <div className="absolute -top-1 w-1 h-4 rounded-full bg-[var(--color-ink)]" style={{ left: pos(agg.p50) }} />
+        {/* Faint panelist medians — they set the axis bounds, so show why the band can sit narrow. */}
+        {panel.map((q, i) => (
+          <span
+            key={i}
+            className="absolute top-1/2 -translate-y-1/2 w-px h-2.5 bg-[rgb(var(--hi)/0.3)]"
+            style={{ left: pos(q.p50) }}
+            title={`panelist median ${fmt(q.p50)}`}
+          />
+        ))}
+        <div className="absolute -top-1 w-1 h-4 rounded-full bg-[var(--color-ink)]" style={{ left: pos(agg.p50) }} title={`ensemble median ${fmt(agg.p50)}`} />
       </div>
       <div className="flex justify-between mono text-2xs text-ink-faint mt-1.5">
         <span title="10th percentile — 10% chance the value lands below this">
@@ -132,6 +133,7 @@ export function ForecastHeadline({
   now,
   expectedPanel,
   dateInferred,
+  domain,
 }: {
   question: ForecastQuestion;
   aggregate: AggregateForecast | null;
@@ -139,6 +141,7 @@ export function ForecastHeadline({
   now: number;
   expectedPanel?: number;
   dateInferred?: boolean;
+  domain?: string | null;
 }) {
   const submitted = tasks.filter((t) => t.forecast);
   const probs = submitted
@@ -170,6 +173,11 @@ export function ForecastHeadline({
         <span className="chip text-ink" style={{ borderColor: "rgb(var(--hi) / 0.4)" }}>
           Forecast
         </span>
+        {domain && domain !== "generic" && (
+          <span className="chip" title="The domain pack the engine matched — it tunes the model and data sources.">
+            {domainLabel(domain)}
+          </span>
+        )}
         <span className="mono text-2xs text-ink-faint">{countdown}</span>
         {dateInferred && (
           <span
@@ -181,7 +189,7 @@ export function ForecastHeadline({
         )}
         {aggregate && aggregate.spread > 0.25 && (
           <span className="mono text-2xs text-ink" title="The panel disagreed substantially — read the panel breakdown in the report">
-            ⚠ panel split {binary ? `${Math.round(aggregate.spread * 100)} pts` : `${Math.round(aggregate.spread * 100)}%`}
+            ⚠ {splitLabel(aggregate.spread, question.kind)}
           </span>
         )}
         {aggregate && (aggregate.evidenceOverlap ?? 0) > 0.5 && (
@@ -218,32 +226,37 @@ export function ForecastHeadline({
                 P(never by {question.resolutionDate}) = {pctOf(aggregate.pNever)}
               </div>
             )}
-            {aggregate.dilation && aggregate.dilation.d !== 1 && (
-              <div
-                className="mono text-2xs text-ink-faint mt-2"
-                title={
-                  aggregate.dilation.source === "learned"
-                    ? `Interval widened ×${aggregate.dilation.d} to correct over-confidence, learned from ${aggregate.dilation.n} resolved forecasts.`
-                    : `Interval widened ×${aggregate.dilation.d} by default — LLM intervals run too narrow; the factor is learned once enough forecasts resolve.`
-                }
-              >
-                · interval ×{aggregate.dilation.d}
-                {aggregate.dilation.source === "default" ? " (default)" : ""}
-              </div>
-            )}
+            {aggregate.dilation && (aggregate.dilation.d !== 1 || (aggregate.dilation.dLo ?? 1) !== 1 || (aggregate.dilation.dUp ?? 1) !== 1) && (() => {
+              const dil = aggregate.dilation!;
+              const asDate = question.kind === "date";
+              const asym = typeof dil.dLo === "number" && typeof dil.dUp === "number" && dil.dLo !== dil.dUp;
+              const raw = aggregate.predilationQuantiles;
+              const base =
+                dil.source === "learned"
+                  ? `Interval widened to correct over-confidence, learned from ${dil.n} resolved forecasts.`
+                  : `Interval widened by default — LLM intervals run too narrow; the factor is learned once enough forecasts resolve.`;
+              const asymNote = asym ? ` Lower tail ×${dil.dLo}, upper tail ×${dil.dUp}.` : "";
+              const rawNote = raw ? ` Raw p10–p90: ${fmtQ(raw.p10, asDate)}–${fmtQ(raw.p90, asDate)}.` : "";
+              return (
+                <div className="mono text-2xs text-ink-faint mt-2" title={base + asymNote + rawNote}>
+                  · interval {asym ? `×${dil.dLo}/${dil.dUp}` : `×${dil.d}`}
+                  {dil.source === "default" ? " (default)" : ""}
+                </div>
+              );
+            })()}
           </div>
         ) : (
           <div className="mono text-2xl font-semibold text-ink-dim shrink-0">…</div>
         )}
 
         <div className="flex-1 min-w-[240px]">
-          <p className="text-[15px] font-semibold leading-snug text-ink">{question.text}</p>
+          <p className="text-lg font-semibold leading-snug text-ink">{question.text}</p>
           <p className="text-xs leading-relaxed text-ink-faint mt-1.5" title="Resolution criteria">
             {question.resolutionCriteria}
           </p>
-          {aggregate && chainLine(aggregate) && (
+          {aggregate && forecastChain(aggregate.components, aggregate.k) && (
             <p className="mono text-2xs text-ink-faint mt-1.5" title="The engine's mechanical derivation, layer by layer">
-              {chainLine(aggregate)}
+              {forecastChain(aggregate.components, aggregate.k)}
             </p>
           )}
 
@@ -251,17 +264,22 @@ export function ForecastHeadline({
           {binary && (
             <div className="mt-4">
               <div className="relative h-1.5 rounded-full bg-[rgb(var(--hi)/0.08)]">
-                {submitted.map(
-                  (t) =>
-                    typeof t.forecast!.probability === "number" && (
-                      <span
-                        key={t.id}
-                        className="absolute -top-[3px] w-3 h-3 rounded-full border border-[var(--color-border-soft)] bg-[var(--color-ink)]"
-                        style={{ left: `calc(${(t.forecast!.probability * 100).toFixed(1)}% - 6px)` }}
-                        title={`${t.id} [${t.forecast!.method}] → ${pctOf(t.forecast!.probability)}${typeof t.forecast!.prior === "number" ? ` (base-rate prior ${pctOf(t.forecast!.prior)})` : ""}`}
-                      />
-                    )
-                )}
+                {submitted.map((t) => {
+                  if (typeof t.forecast!.probability !== "number") return null;
+                  // The coherence-probe panelist (inverted framing) reads as a hollow ring,
+                  // so its de-biasing contribution is visible without breaking the monochrome.
+                  const probe = t.forecast!.method === "inverted-framing";
+                  return (
+                    <span
+                      key={t.id}
+                      className={`absolute -top-[3px] w-3 h-3 rounded-full border ${
+                        probe ? "border-[var(--color-ink)]" : "border-[var(--color-border-soft)] bg-[var(--color-ink)]"
+                      }`}
+                      style={{ left: `calc(${(t.forecast!.probability * 100).toFixed(1)}% - 6px)` }}
+                      title={`${t.id} [${probe ? "de-biasing probe · inverted framing" : t.forecast!.method}] → ${pctOf(t.forecast!.probability)}${typeof t.forecast!.prior === "number" ? ` (base-rate prior ${pctOf(t.forecast!.prior)})` : ""}`}
+                    />
+                  );
+                })}
                 {typeof headlineP === "number" && (
                   <span
                     className="absolute -top-[5px] w-1 h-4 rounded-full bg-[var(--color-ink)]"

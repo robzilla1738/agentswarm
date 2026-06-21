@@ -7,18 +7,24 @@ import { Logo } from "./atoms";
 
 /** Cycles dark/light; persists to localStorage, defaults to the OS scheme. */
 function ThemeToggle() {
+  const [mounted, setMounted] = useState(false);
   const [, force] = useState(0);
+  useEffect(() => setMounted(true), []);
   const current = (): "light" | "dark" => {
     if (typeof document === "undefined") return "dark";
     const set = document.documentElement.dataset.theme;
     if (set === "light" || set === "dark") return set;
     return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
   };
+  // Until mounted, render the SSR-stable default ("dark") so hydration matches;
+  // the real mode (which may read matchMedia) is only resolved after mount.
+  const mode = mounted ? current() : "dark";
+  const target = mode === "light" ? "dark" : "light";
   return (
     <button
       className="btn btn-ghost btn-sm"
-      title="Toggle light / dark"
-      aria-label="Toggle color theme"
+      title={`Switch to ${target} mode`}
+      aria-label={`Switch to ${target} mode`}
       onClick={() => {
         const next = current() === "light" ? "dark" : "light";
         document.documentElement.dataset.theme = next;
@@ -30,7 +36,8 @@ function ThemeToggle() {
         force((n) => n + 1);
       }}
     >
-      ◐
+      {/* Glyph reflects the current theme: filled-right = dark, filled-left = light. */}
+      {mode === "light" ? "◐" : "◑"}
     </button>
   );
 }

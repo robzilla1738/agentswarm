@@ -10,6 +10,10 @@ import type {
   OperatorNote,
   RunMeta,
   RunStatus,
+  ScenarioRow,
+  SensitivityIndex,
+  SimulationView,
+  SubForecast,
   Task,
   Usage,
 } from "./types";
@@ -41,6 +45,11 @@ export interface ClientState {
   question: ForecastQuestion | null;
   aggregate: AggregateForecast | null;
   forecastPanel: ForecastPanelist[];
+  /** Decomposition: the framing brief, detected domain, and every sub-forecast keyed by id. */
+  forecastBrief: string;
+  forecastDomain: string | null;
+  questions: ForecastQuestion[];
+  subForecasts: Map<string, SubForecast>;
   finalSummary?: string;
   finalReportPath?: string;
   lastSeq: number;
@@ -75,6 +84,10 @@ export function emptyState(): ClientState {
     question: null,
     aggregate: null,
     forecastPanel: [],
+    forecastBrief: "",
+    forecastDomain: null,
+    questions: [],
+    subForecasts: new Map(),
     lastSeq: 0,
     lastT: 0,
   };
@@ -103,6 +116,20 @@ const TAIL = 4000;
 
 function clipTail(s: string, max: number): string {
   return s.length <= max ? s : s.slice(s.length - max);
+}
+
+/**
+ * Keep the singular `aggregate`/`forecastPanel` (what the headline gauge reads)
+ * pointed at the primary — first — sub-forecast, regardless of the order its
+ * per-question events arrive in.
+ */
+function syncPrimaryForecast(s: ClientState): void {
+  const primaryId = s.questions[0]?.id ?? s.subForecasts.keys().next().value;
+  const primary = primaryId ? s.subForecasts.get(primaryId) : undefined;
+  if (primary) {
+    s.aggregate = primary.aggregate;
+    s.forecastPanel = primary.panel;
+  }
 }
 
 export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
@@ -331,8 +358,15 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
     case "plan.updated":
       s.planUpdatedAt = ev.t;
       break;
+    case "forecast.plan":
+      if (Array.isArray(ev.questions)) s.questions = ev.questions as ForecastQuestion[];
+      if (typeof ev.brief === "string") s.forecastBrief = ev.brief;
+      if (typeof ev.domain === "string") s.forecastDomain = ev.domain;
+      break;
     case "forecast.question":
-      s.question = ev.question as ForecastQuestion;
+      // Primary headline = the first sub-forecast; later sub-forecasts don't
+      // overwrite it (they surface in the decomposition breakdown instead).
+      if (!s.question) s.question = ev.question as ForecastQuestion;
       break;
     case "forecast.submitted": {
       const t = s.tasks.get(ev.taskId as string);
@@ -342,10 +376,55 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
       }
       break;
     }
-    case "forecast.aggregated":
-      s.aggregate = ev.aggregate as AggregateForecast;
-      if (Array.isArray(ev.panel)) s.forecastPanel = ev.panel as ForecastPanelist[];
+    case "forecast.aggregated": {
+      const qid = typeof ev.questionId === "string" ? ev.questionId : s.questions[0]?.id ?? "sf1";
+      const prev = s.subForecasts.get(qid);
+      const question =
+        (ev.question as ForecastQuestion | undefined) ??
+        prev?.question ??
+        s.questions.find((q) => q.id === qid) ??
+        s.question ??
+        ({ id: qid, text: "", kind: "binary", resolutionCriteria: "", resolutionDate: "" } as ForecastQuestion);
+      s.subForecasts.set(qid, {
+        questionId: qid,
+        question,
+        aggregate: ev.aggregate as AggregateForecast,
+        panel: Array.isArray(ev.panel) ? (ev.panel as ForecastPanelist[]) : prev?.panel ?? [],
+        ledgerId: typeof ev.ledgerId === "string" ? ev.ledgerId : prev?.ledgerId,
+        simulation: prev?.simulation,
+      });
+      syncPrimaryForecast(s);
       break;
+    }
+    case "forecast.simulated": {
+      const qid = typeof ev.questionId === "string" ? ev.questionId : s.questions[0]?.id ?? "sf1";
+      const prev = s.subForecasts.get(qid);
+      const sim: SimulationView = {
+        weight: typeof ev.weight === "number" ? ev.weight : 0,
+        dropped: Array.isArray(ev.dropped) ? (ev.dropped as string[]) : [],
+        simulated: ev.simulated as AggregateForecast | undefined,
+        scenarios: Array.isArray(ev.scenarios) ? (ev.scenarios as ScenarioRow[]) : [],
+        sensitivity: Array.isArray(ev.sensitivity) ? (ev.sensitivity as SensitivityIndex[]) : [],
+        coherence: (ev.coherence as SimulationView["coherence"]) ?? { divergence: 0, verdict: "ok" },
+        drivers: Array.isArray(ev.drivers) ? (ev.drivers as SimulationView["drivers"]) : [],
+      };
+      const question =
+        prev?.question ??
+        s.questions.find((q) => q.id === qid) ??
+        s.question ??
+        ({ id: qid, text: "", kind: "binary", resolutionCriteria: "", resolutionDate: "" } as ForecastQuestion);
+      s.subForecasts.set(qid, {
+        questionId: qid,
+        question,
+        // The simulated headline blend lands on `aggregate`; keep it if present.
+        aggregate: (ev.aggregate as AggregateForecast | undefined) ?? prev?.aggregate ?? null,
+        panel: prev?.panel ?? [],
+        ledgerId: prev?.ledgerId,
+        simulation: sim,
+      });
+      syncPrimaryForecast(s);
+      break;
+    }
     case "run.final":
       s.finalSummary = ev.summary as string;
       s.finalReportPath = ev.reportPath as string | undefined;
