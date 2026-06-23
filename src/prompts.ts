@@ -1,6 +1,6 @@
 import * as os from "os";
 import { daysToIso } from "./forecast";
-import { AggregateForecast, ForecastQuestion, RepoProfile, RunMeta, SimDriver, SimulationResult, Task } from "./types";
+import { AcceptanceItem, AggregateForecast, BuildPlan, ForecastQuestion, RepoMap, RepoProfile, RunMeta, SimDriver, SimulationResult, Task } from "./types";
 import { clip, fmtTokens } from "./util";
 
 // ============================================================ conductor
@@ -166,6 +166,8 @@ const ROLE_HINTS: Record<string, string> = {
     "Writing craft: structure before prose; concrete over abstract; cut filler. Match the audience and purpose given in the objective. Deliver in the format the objective calls for — for polished documents prefer a styled, self-contained .html file (inline CSS, readable typography, real tables) over raw markdown; ship data tables as .csv alongside the prose.",
   reviewer:
     "Review craft: be adversarial; try to break it; check edge cases and the unhappy path; verify claims against the actual files, not the description.",
+  "test-author":
+    "Test-first craft: turn each acceptance criterion into concrete, executable tests BEFORE the feature exists — assert real input→output/error behavior, never tautologies. ADD to the existing suite; match its framework and conventions. Run the tests with run_check and confirm the NEW ones FAIL for the right reason (feature missing, not a setup/import error). Do NOT implement the feature. Report every test file in files_touched and which criterion each test covers.",
   "data-wrangler":
     "Data craft: validate schema and row counts at every step; spot-check samples; never silently drop rows — report anomalies.",
   forecaster:
@@ -212,6 +214,10 @@ export function workerSystem(opts: {
   terminalName?: "report" | "submit_forecast";
   /** Code mode: the detected repo profile — its real build/test commands are injected as BUILD CONTEXT. */
   repoProfile?: RepoProfile;
+  /** Code mode: the deterministic repo symbol-map so the worker edits with the codebase's structure. */
+  repoMap?: RepoMap;
+  /** Code mode: the files this task exclusively owns (from the pinned build plan) — it must not write outside them. */
+  ownedFiles?: string[];
 }): string {
   const { meta, task } = opts;
   const roleHint = [ROLE_HINTS[opts.role.toLowerCase()] ?? "", opts.extraCraft ?? ""].filter(Boolean).join("\n\n");
@@ -244,7 +250,7 @@ ${opts.blackboard ? `Blackboard digest:\n${opts.blackboard}` : ""}
 ${opts.operatorNotes.length ? `Operator notes:\n${opts.operatorNotes.map((n) => `- ${n}`).join("\n")}` : ""}
 Working directory: ${meta.cwd}
 ${opts.dirListing ? `Top of the working directory:\n${opts.dirListing}` : ""}
-${opts.repoProfile ? buildContextBlock(opts.repoProfile) : ""}
+${opts.repoProfile ? buildContextBlock(opts.repoProfile) : ""}${opts.repoMap ? repoMapBlock(opts.repoMap) : ""}${opts.ownedFiles && opts.ownedFiles.length ? `\nYOUR FILES (own these EXCLUSIVELY — do NOT write any other file; another task owns it and the engine will block the write):\n${opts.ownedFiles.map((f) => `- ${f}`).join("\n")}\n` : ""}
 OPERATING PROTOCOL
 - You are fully autonomous. Never ask questions; decide and act.
 - Plan briefly, then act in small verified steps: after changing anything, prove it worked (run it, read it back, test it).
@@ -746,13 +752,42 @@ BUILD CONTEXT — these are the repo's REAL commands (detected automatically; us
 ${commandsBlock(p)}${p.conventions.length ? `\n- Conventions: ${p.conventions.join("; ")}` : ""}`;
 }
 
+/** The deterministic repo symbol-map, rendered for a worker so it edits with the codebase's existing structure. */
+function repoMapBlock(map: RepoMap): string {
+  if (!map.files.length) return "";
+  const body = map.files.map((f) => `${f.path}\n${f.symbols.map((s) => `  ${s}`).join("\n")}`).join("\n");
+  return `
+REPO MAP — existing top-level declarations (reuse these; do NOT reinvent helpers that already exist, and don't break their signatures)${map.truncated ? " [truncated]" : ""}:
+${body}
+`;
+}
+
 /**
  * Appended to the conductor system prompt in code mode — the software-
  * engineering pipeline doctrine. Appended AFTER conductorSystem so it overrides
  * the generic "parallelize aggressively / go wide with scouts" doctrine, which
  * is wrong for a build. The structure and the commands are engine-owned facts.
  */
-export function codeConductorAddendum(profile: RepoProfile, acceptance?: string): string {
+export function codeConductorAddendum(
+  profile: RepoProfile,
+  acceptance?: string,
+  items?: AcceptanceItem[],
+  buildPlan?: BuildPlan,
+  tdd?: boolean
+): string {
+  const planBlock = buildPlan && buildPlan.waves && buildPlan.waves.length ? buildPlanBlock(buildPlan) : "";
+  const tddBlock =
+    tdd && items && items.length
+      ? profile.greenfield
+        ? `\nTEST-FIRST (TDD) — REQUIRED: Wave 1 scaffolds the project AND establishes the test command, then authors a FAILING spec test for each acceptance criterion (reference its id). Implementation waves make those tests pass. The engine green-gate will NOT pass while zero tests run — "it compiles" is not done.\n`
+        : `\nTEST-FIRST (TDD) — REQUIRED: task T1 (engine-created, the spec-test author) writes FAILING spec tests for every acceptance criterion FIRST. Make EVERY implementation task depend on T1 and code until those tests pass. Do not create your own test-authoring task. The engine green-gate will NOT pass while zero tests run — "it compiles" is not done.\n`
+      : "";
+  const criteriaBlock =
+    items && items.length
+      ? `\nACCEPTANCE CRITERIA — the build is DONE only when every item is satisfied AND verified:\n${items.map((it) => `  [${it.id}] ${it.text}`).join("\n")}\nSeed these into mission-plan.md (update_plan) by ID and tick each only when a passing check or test proves it. Never tick an unverified item.\n`
+      : acceptance
+        ? `\nACCEPTANCE CRITERIA (the build is done when): ${acceptance}\nSeed these into mission-plan.md (update_plan) as a checklist and tick each item as it passes the gate.\n`
+        : "";
   const repo = profile.greenfield
     ? `REPO: greenfield — the working directory is empty. Wave 1 chooses the stack, scaffolds it, and establishes the build + test commands as the first acceptance criterion.`
     : `REPO (detected — these are the real commands; pass them to your workers and have them verify with run_check):
@@ -763,37 +798,114 @@ ${commandsBlock(profile)}${profile.conventions.length ? `\n- Conventions: ${prof
 THIS IS A CODE (BUILD) MISSION. The deliverable is a WORKING TREE that builds and passes its tests — not a report. The generic "PARALLELIZE AGGRESSIVELY / go WIDE with 10+ scouts" research doctrine DOES NOT APPLY here; follow this build doctrine instead.
 
 ${repo}
-${acceptance ? `\nACCEPTANCE CRITERIA (the build is done when): ${acceptance}\nSeed these into mission-plan.md (update_plan) as a checklist and tick each item as it passes the gate.\n` : ""}
+${criteriaBlock}${planBlock}${tddBlock}
 BUILD PIPELINE — structure the run exactly like this:
 1. WAVE 1 = ONE task only — recon + scaffold. Read the relevant code, confirm the tree builds with the command above (and if dependencies aren't installed, install them); if greenfield, choose the stack and establish the test command. Do NOT fan out before you understand the code.
-2. IMPLEMENT WAVES — parallel tasks on STRICTLY DISJOINT files/modules. Partition the work so NO two tasks ever write the same file. Each task: read before editing, match conventions, run run_check after every change, leave its files compiling.
+2. IMPLEMENT WAVES — parallel tasks on STRICTLY DISJOINT files/modules. If a build plan is pinned above, spawn ONE task per module, set that task's files:[...] to the module's files, and dep it on the modules it lists as "after". Otherwise partition the work yourself so NO two tasks ever write the same file. Each task: read before editing, match conventions, run run_check after every change, leave its files compiling.
 3. Every implement wave ENDS with an INTEGRATION task (verify:true, model:"strong") that deps on all of that wave's implementers, runs the FULL build + typecheck + test, and reports done ONLY when green. The verifier runs the commands itself and fails it back on red — and on a passing verify the engine commits the tree, so an interrupted run resumes from a compiling commit.
 4. Before final synthesis the engine runs ONE green-gate. If the integrated tree is red it returns to you with the exact failures — spawn a focused fix task on the failing files (do not re-run the failed approach verbatim).
 5. finish only when the tree is green and the acceptance criteria are met. Use set_phase for the arc (recon → build → integrate → harden) and keep mission-plan.md current with update_plan.
 
 CODE RULES
-- Disjoint-file ownership is the convergence guarantee: two writers on one file corrupt it. Pre-partition files across tasks; the integration task catches any collision as a build failure.
+- Disjoint-file ownership is the convergence guarantee: two writers on one file corrupt it. Pre-partition files across tasks and pass each task its files:[...] — the engine ENFORCES this and blocks a task from writing a file another live task owns.
+- HARD, algorithmically-tricky tasks (the tricky core, a parser, a scheduler): spawn with ensemble:3 — the engine runs N isolated attempts in separate worktrees and keeps the one that passes the gate cleanest. Use sparingly; it costs N×.
 - Big coherent subsystems → spawn with team:true (its own sub-swarm), not one giant task.
 - Model tiers: cheap for mechanical/boilerplate tasks, strong for architecture, integration, and verified deliverables.
 - Deliver the WORKING TREE plus a short PR-style change summary — never a long prose report. The code is the product.`;
 }
 
 /**
+ * Ask a model to produce the engine-owned BuildPlan: a module/file partition
+ * with interface contracts and a dependency order. The engine validates the
+ * partition deterministically (no two modules own the same file, no dependency
+ * cycle) and pins it; a cheap conductor is bad at holding this invariant across
+ * many spawn batches, so removing the decision is the leverage. JSON only.
+ */
+export function planBuildSpecPrompt(mission: string, profile: RepoProfile, items: AcceptanceItem[]): string {
+  const repo = profile.greenfield
+    ? "GREENFIELD — the working directory is empty; choose a stack and lay out the new files."
+    : `EXISTING REPO — ${profile.primaryLanguage ?? "unknown stack"}${profile.framework ? ` (${profile.framework})` : ""}${profile.packageManager ? ` · ${profile.packageManager}` : ""}. Edit existing files where appropriate; list the real paths you expect to touch.`;
+  const crit = items.length ? items.map((it) => `  [${it.id}] ${it.text}`).join("\n") : "  (none specified — infer from the mission)";
+  return `You are the architect for a software build. Decompose it into a MODULE/FILE PARTITION that parallel implementers can build without ever touching each other's files.
+
+MISSION
+${mission}
+
+${repo}
+
+ACCEPTANCE CRITERIA
+${crit}
+
+Rules for the partition:
+- Each module owns a DISJOINT set of files — no file may appear under two modules. This is the hard constraint; if two pieces of work need the same file, they are ONE module.
+- Give each module a short id, the exact files it owns, a one-line purpose, an optional interface/contract other modules import, and deps (module ids it must build after).
+- Mark a module "hard": true if it is the algorithmically tricky / high-risk core (those get a best-of-N ensemble).
+- Keep it tight: 2–8 modules. Prefer fewer, well-bounded modules over many tiny ones.
+
+Reply with ONLY this JSON (no prose, no fences):
+{"scaffoldFirst": <bool: true if a recon+scaffold step must run before any module>,
+ "integrationPerWave": <bool: end each wave with a strong integration task>,
+ "modules": [{"id":"...","files":["..."],"purpose":"...","interface":"...","deps":["..."],"hard":false}]}`;
+}
+
+/** Render the engine-validated, pinned BuildPlan for the conductor doctrine. */
+function buildPlanBlock(plan: BuildPlan): string {
+  if (!plan.waves || !plan.waves.length) return "";
+  const byId = new Map(plan.modules.map((m) => [m.id, m]));
+  const waveLines = plan.waves
+    .map((wave, i) => {
+      const mods = wave
+        .map((id) => {
+          const m = byId.get(id);
+          if (!m) return `    - ${id}`;
+          return `    - ${m.id}${m.hard ? " (HARD — eligible for best-of-N ensemble)" : ""}: ${m.purpose}\n        owns: ${m.files.join(", ") || "(decide)"}${m.interface ? `\n        interface: ${m.interface}` : ""}${m.deps.length ? `\n        after: ${m.deps.join(", ")}` : ""}`;
+        })
+        .join("\n");
+      return `  Wave ${i + 1} (parallel, disjoint files):\n${mods}`;
+    })
+    .join("\n");
+  return `
+PINNED BUILD PLAN (engine-owned — the file partition is validated conflict-free; implement against it. Spawn one task per module, each owning EXACTLY its listed files; deviate only with a logged reason):
+${waveLines}
+`;
+}
+
+/**
+ * Split free-text acceptance criteria into atomic, independently-checkable
+ * items. Cheap-tier call; the engine tracks each item as first-class state so
+ * the spec-test author, the diff-review critic, and the synthesizer reason over
+ * the same checklist. Output is a JSON array of strings — nothing else.
+ */
+export function acceptanceCriteriaSplitPrompt(mission: string, criteria: string): string {
+  return `Split this build's acceptance criteria into a flat list of atomic, independently-verifiable requirements. Each item must be a single concrete, testable condition ("done when X"). Merge duplicates; drop vague aspirational filler. Keep 1–12 items.
+
+MISSION
+${mission}
+
+ACCEPTANCE CRITERIA (free text)
+${criteria}
+
+Reply with ONLY a JSON array of strings (the atomic criteria), e.g. ["the CLI accepts a --json flag", "invalid input exits non-zero with a clear message"]. No prose, no markdown fences.`;
+}
+
+/**
  * Appended to the synthesizer system prompt in code mode. The deliverable is
  * the working tree + a PR-style change summary, NOT a research report.
  */
-export function codeSynthAddendum(profile: RepoProfile, gateEvidence?: string): string {
+export function codeSynthAddendum(profile: RepoProfile, gateEvidence?: string, items?: AcceptanceItem[]): string {
   const c = profile.commands;
+  const criteria = items && items.length ? `\nACCEPTANCE CRITERIA (map each to evidence in §5; mark UNMET honestly if no test/check proves it):\n${items.map((it) => `  [${it.id}] ${it.text}`).join("\n")}\n` : "";
   return `
 CODE DELIVERABLE
 This was a build mission. The deliverable is the WORKING TREE, not a prose report. Keep the report tight and PR-shaped.
-${gateEvidence ? `\nFINAL GREEN-GATE (engine-run — quote this verbatim as the test evidence; do NOT claim green if it is red):\n${gateEvidence}\n` : ""}
+${gateEvidence ? `\nFINAL GREEN-GATE (engine-run — quote this verbatim as the test evidence; do NOT claim green if it is red):\n${gateEvidence}\n` : ""}${criteria}
 Structure report_markdown:
 1. # <what was built> — one sentence on the outcome and whether the tree builds and tests green.
 2. ## Changes — a markdown table of files touched (path | what changed). Group by module/subsystem. Pull this from the task reports' files_touched.
 3. ## How to build & run — the exact detected commands: ${[c.install, c.build, c.test].filter(Boolean).join(" · ") || "(state the commands the repo uses)"}.
 4. ## Test evidence — the green-gate result above, verbatim (build / typecheck / test pass counts). Be honest: if anything is red or unverified, say so plainly.
-5. ## What's left / known gaps — anything incomplete, with why, mapped to the acceptance criteria.
+5. ## Acceptance criteria — a checklist mapping EACH criterion id to the test/code that satisfies it, or "UNMET" with why. Never mark an item met without evidence.
+6. ## What's left / known gaps — anything incomplete, with why.
 Do NOT write an essay, do NOT fabricate passing tests, and do NOT invent a styled HTML document. Also save this summary as a CHANGES.md artifact. The code is the product.`;
 }
 
@@ -812,6 +924,36 @@ TASK REPORTS
 ${reports}
 
 Reply with EXACTLY "COMPLETE" if the mission's requirements are genuinely covered. Otherwise reply with a short numbered list of concrete gaps (max 5), each one actionable enough to become a task. Do not invent nice-to-haves — only true gaps against the stated mission.`;
+}
+
+/**
+ * Adversarial code-review / spec-conformance critic. It judges the actual DIFF
+ * (ground truth, not task narratives) against the acceptance criteria and
+ * quality rubrics — distinct from the green-gate, which only proved it compiles
+ * and tests pass. Catches spec items met in name only, missing edge cases,
+ * security holes, broken conventions, and trivially-passing tests.
+ */
+export function codeReviewPrompt(mission: string, items: AcceptanceItem[], diff: string): string {
+  const crit = items.length ? items.map((it) => `  [${it.id}] ${it.text}`).join("\n") : "  (none specified — judge against the mission)";
+  return `You are a senior engineer doing a strict, adversarial review of a change before it ships. The tree already builds and its tests pass — do NOT re-check that. Find what "green" hides.
+
+MISSION
+${mission}
+
+ACCEPTANCE CRITERIA
+${crit}
+
+THE DIFF (the only ground truth — review the code, not any description of it)
+${diff}
+
+Review for, in priority order:
+1. Spec conformance — is each acceptance criterion ACTUALLY implemented (not stubbed, faked, or hard-coded to pass a test)? Cite the code.
+2. Correctness & edge cases — off-by-one, null/empty/boundary inputs, error paths, race conditions.
+3. Security — injection, unsafe shell/eval, path traversal, secrets, missing validation on external input.
+4. Test adequacy — do the tests exercise the criteria with real assertions, or do they pass trivially / tautologically?
+5. Conventions & dead code — does it match the codebase's style; any duplicated or unused code?
+
+Reply with EXACTLY "REVIEW-CLEAN" if the change genuinely satisfies the criteria with no material defect. Otherwise reply with a short numbered list (max 6) of CONCRETE, real defects — each one specific enough to become a fix task (name the file/symbol and what's wrong). Do not invent nice-to-haves; only real problems against the stated criteria and basic correctness/security.`;
 }
 
 export function synthCheckPrompt(mission: string, reports: string, finalReport: string, sources?: string): string {

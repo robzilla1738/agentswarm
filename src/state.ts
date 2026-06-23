@@ -1,5 +1,7 @@
 import {
+  AcceptanceItem,
   AggregateForecast,
+  BuildPlan,
   Forecast,
   ForecastQuestion,
   RepoProfile,
@@ -94,6 +96,12 @@ export class RunState {
   codeBranch: string | null = null;
   /** Code mode: the SHA of the last engine commit-on-green (resume's known-green point). */
   lastGreenSha?: string;
+  /** Code mode: the diff-review baseline SHA (pre-work HEAD), restored on resume so the review still runs after a restart. */
+  codeBaselineSha?: string;
+  /** Code mode: acceptance criteria split into tracked items (restored on resume). */
+  acceptanceItems: AcceptanceItem[] = [];
+  /** Code mode: the engine-owned build plan / file partition (restored on resume). */
+  buildPlan?: BuildPlan;
   finalSummary?: string;
   finalReportPath?: string;
   lastSeq = 0;
@@ -350,11 +358,22 @@ export class RunState {
         this.repoProfile = ev.profile as RepoProfile;
         this.codeCommitEnabled = Boolean(ev.commit);
         this.codeBranch = (ev.branch as string | null) ?? null;
+        if (typeof ev.baseline === "string") this.codeBaselineSha = ev.baseline;
         break;
       case "code.checkpoint":
         if (typeof ev.sha === "string") this.lastGreenSha = ev.sha;
         break;
+      case "code.criteria":
+        if (Array.isArray(ev.items)) this.acceptanceItems = ev.items as AcceptanceItem[];
+        break;
+      case "code.design":
+        if (ev.plan) this.buildPlan = ev.plan as BuildPlan;
+        break;
       case "code.gate":
+      case "code.map":
+      case "code.spec":
+      case "code.review":
+      case "code.ensemble":
         // Presentation-only (no reduced field needed beyond the journal record).
         break;
       case "run.final":

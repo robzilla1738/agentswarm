@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { ArtifactsPanel } from "@/components/ArtifactsPanel";
+import { CodePanel } from "@/components/CodePanel";
 import { ForecastBreakdown } from "@/components/ForecastBreakdown";
 import { ForecastHeadline } from "@/components/ForecastHeadline";
 import { ReportPanel } from "@/components/ReportPanel";
@@ -187,6 +188,8 @@ function RunView() {
               )}
             </>
           ))}
+
+        {data.code && <CodePanel code={data.code} />}
 
         {/* Header */}
         <div className="panel p-5 mb-5">

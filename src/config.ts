@@ -103,6 +103,32 @@ export interface SwarmConfig {
   /** Code mode: max conductor fix rounds the pre-synthesis green-gate will drive before giving up. */
   codeGateMaxRounds: number;
   /**
+   * Code mode: author a failing spec test-suite from the acceptance criteria
+   * before implementation (TDD), and refuse a green-gate that ran 0 tests when
+   * criteria exist. The single biggest quality lever — turns the green-gate into
+   * a real oracle instead of "it compiles".
+   */
+  codeTdd: boolean;
+  /**
+   * Code mode: pin an engine-owned BuildPlan (module/file partition + interface
+   * contracts) before the conductor's first turn, and write a DESIGN.md artifact.
+   */
+  codeDesign: boolean;
+  /** Code mode: build a deterministic repo symbol-map and inject it into every worker so edits respect existing structure. */
+  codeRepoMap: boolean;
+  /** Code mode: token budget for the injected repo map (truncated hard to fit). */
+  codeRepoMapMaxTokens: number;
+  /** Code mode: run a blind adversarial diff-review / spec-conformance critic after the tree is green. */
+  codeReview: boolean;
+  /** Code mode: max conductor rounds the diff-review critic will drive to close findings. */
+  codeReviewMaxRounds: number;
+  /** Code mode: allow the conductor to request a best-of-N solution ensemble (isolated worktree attempts, judged by the gate) for hard tasks. */
+  codeEnsemble: boolean;
+  /** Code mode: max attempts in a best-of-N ensemble task. */
+  codeEnsembleN: number;
+  /** Code mode: persist confirmed commands / conventions / flaky tests per repo across runs and reuse them to bootstrap the next run. */
+  codeRepoFacts: boolean;
+  /**
    * Where isolated runs execute. Default "host": the run's private workspace
    * directory on this machine — works out of the box, no Docker or cloud
    * account needed. "auto" opts into auto-detection: configured cloud
@@ -212,6 +238,15 @@ export const DEFAULTS: SwarmConfig = {
   codeGreenGate: true,
   codeAutoCommit: true,
   codeGateMaxRounds: 2,
+  codeTdd: true,
+  codeDesign: true,
+  codeRepoMap: true,
+  codeRepoMapMaxTokens: 6000,
+  codeReview: true,
+  codeReviewMaxRounds: 1,
+  codeEnsemble: true,
+  codeEnsembleN: 3,
+  codeRepoFacts: true,
   sandboxRuntime: "host",
   sandboxImage: "node:22-bookworm",
   e2bApiKey: "",
@@ -434,6 +469,15 @@ export const SETTABLE_KEYS: (keyof SwarmConfig)[] = [
   "codeGreenGate",
   "codeAutoCommit",
   "codeGateMaxRounds",
+  "codeTdd",
+  "codeDesign",
+  "codeRepoMap",
+  "codeRepoMapMaxTokens",
+  "codeReview",
+  "codeReviewMaxRounds",
+  "codeEnsemble",
+  "codeEnsembleN",
+  "codeRepoFacts",
   "maxToolResultChars",
   "sandboxRuntime",
   "sandboxImage",
@@ -465,6 +509,9 @@ const NUM_RANGES: Partial<Record<keyof SwarmConfig, [number, number]>> = {
   forecastPanelSize: [3, 11],
   forecastMaxSubQuestions: [1, 8],
   codeGateMaxRounds: [1, 4],
+  codeReviewMaxRounds: [0, 4],
+  codeEnsembleN: [2, 6],
+  codeRepoMapMaxTokens: [1000, 40_000],
   hubPort: [0, 65535],
   uiPort: [0, 65535],
 };
@@ -510,7 +557,13 @@ export function coerceConfigValue(key: keyof SwarmConfig, raw: unknown): unknown
     key === "forecastSimulate" ||
     key === "forecastDecompose" ||
     key === "codeGreenGate" ||
-    key === "codeAutoCommit"
+    key === "codeAutoCommit" ||
+    key === "codeTdd" ||
+    key === "codeDesign" ||
+    key === "codeRepoMap" ||
+    key === "codeReview" ||
+    key === "codeEnsemble" ||
+    key === "codeRepoFacts"
   ) {
     if (typeof raw === "boolean") return raw;
     return raw === "true" || raw === "1" || raw === "on";

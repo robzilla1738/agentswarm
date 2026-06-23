@@ -42,6 +42,13 @@ export interface ToolCtx {
   readReport?: (taskId: string) => string;
   /** Advisory claim check: warning text if another live task claimed this path. */
   checkClaim?: (relPath: string) => string | null;
+  /**
+   * Code mode HARD write guard: returns an error string if this task may NOT
+   * write the path (another live task owns it), else null and the write proceeds
+   * (acquiring an exclusive lock on first write). Blocks file-collision corruption
+   * at write time instead of as a late integration build failure.
+   */
+  guardWrite?: (relPath: string) => string | null;
   /** Journal a durable progress checkpoint for this task (warm restarts after a crash). */
   addCheckpoint?: (summary: string) => void;
   addArtifact: (relPath: string) => void;
@@ -249,6 +256,8 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
       },
     },
     run: async (args, ctx) => {
+      const block = ctx.guardWrite?.(String(args.path));
+      if (block) return block;
       const abs = resolveWrite(String(args.path), ctx);
       const content = String(args.content ?? "");
       if (content.length > 5_000_000) throw new Error("content too large (>5MB)");
@@ -288,6 +297,8 @@ export function workerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
       },
     },
     run: async (args, ctx) => {
+      const block = ctx.guardWrite?.(String(args.path));
+      if (block) return block;
       const abs = resolveWrite(String(args.path), ctx);
       const raw = await readFileVia(ctx, abs);
       const edits =
@@ -1283,6 +1294,15 @@ export const SPAWN_TASKS_TOOL: ToolSchema = {
             },
             team_max_workers: { type: "number", description: "Parallelism inside the team (default: half the run's)" },
             team_budget_tokens: { type: "number", description: "Token slice for the team (default: a quarter of what remains)" },
+            files: {
+              type: "array",
+              items: { type: "string" },
+              description: "Code mode: the files this task owns EXCLUSIVELY. Disjointness is enforced — a write to a file another live task owns is blocked. Set these from the pinned build plan.",
+            },
+            ensemble: {
+              type: "number",
+              description: "Code mode: run this HARD task as a best-of-N ensemble (e.g. 3) — N isolated attempts in separate worktrees, the one that passes the gate cleanest wins. Use sparingly, only for the algorithmically tricky core.",
+            },
           },
           required: ["title", "objective"],
         },

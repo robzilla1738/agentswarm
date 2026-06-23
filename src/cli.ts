@@ -233,6 +233,13 @@ export function optionOverrides(flags: Args["flags"], cfg: SwarmConfig): Partial
   if (flags.greenfield === true) o.codeGreenfield = true;
   if (flags.gate === false) o.codeGreenGate = false;
   if (flags.commit === false) o.codeAutoCommit = false;
+  // Code mode quality toggles (default on via cfg; these disable per run).
+  if (flags.tdd === false) o.codeTdd = false;
+  if (flags.design === false) o.codeDesign = false;
+  if (flags["repo-map"] === false) o.codeRepoMap = false;
+  if (flags.review === false) o.codeReview = false;
+  if (flags.ensemble === false) o.codeEnsemble = false;
+  if (flags["repo-facts"] === false) o.codeRepoFacts = false;
   if (typeof flags.by === "string") {
     if (!ISO_DATE.test(flags.by) || !Number.isFinite(Date.parse(flags.by))) {
       throw new Error("--by must be an ISO date (YYYY-MM-DD)");
@@ -1335,10 +1342,13 @@ ${b("USAGE")}
                                       --simulate runs a grounded scenario Monte Carlo (auto on
                                       decomposed questions): ranked scenarios + a driver tornado
   swarm code "<build task>" [--accept "<done when>"] [--greenfield] [--no-gate] [--no-commit]
-                                      build software: recon the repo, fan out on disjoint files,
-                                      run the detected build/test after every change, commit on
-                                      green (interrupts resume compiling), gate the tree before
-                                      shipping. Deliverable is a working tree + change summary.
+                            [--no-tdd] [--no-design] [--no-repo-map] [--no-review] [--no-ensemble] [--no-repo-facts]
+                                      build software: recon + an engine-owned build plan, author a
+                                      failing spec test-suite from the acceptance criteria (TDD),
+                                      fan out on disjoint files, run the detected build/test after
+                                      every change, commit on green (interrupts resume compiling),
+                                      best-of-N on hard tasks, then a green-gate + blind diff-review
+                                      before shipping. Deliverable is a working tree + change summary.
   swarm serve [--port 7777] [--open]  start the mission-control web UI + API
   swarm watch <id>                    attach a live dashboard to a run
   swarm resume <id> [--fg]            resume an interrupted run (done tasks keep their results)

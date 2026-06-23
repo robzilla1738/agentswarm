@@ -153,6 +153,36 @@ export function safeJson<T = unknown>(s: string): T | undefined {
   }
 }
 
+/**
+ * Canonical workdir-relative key for a path, normalized the SAME way the file
+ * tools resolve (`path.resolve(workdir, rel)`). Absolute paths and `..` segments
+ * collapse to the same key as their plain-relative spelling, so a write lock
+ * keyed on this can't be dodged by spelling the same file differently. Returns
+ * null for a path that escapes the workdir (not lockable).
+ */
+export function normalizeWorkdirRel(workdir: string, rel: string): string | null {
+  const abs = path.resolve(workdir, rel);
+  const r = path.relative(workdir, abs).replace(/\\/g, "/");
+  if (!r || r.startsWith("..")) return null;
+  return r;
+}
+
+/**
+ * Parse the first JSON value (object or array) out of an LLM reply, tolerating
+ * markdown fences and surrounding prose. Returns undefined if nothing parses.
+ */
+export function parseJsonLoose<T = unknown>(raw: string): T | undefined {
+  const direct = safeJson<T>(raw);
+  if (direct !== undefined) return direct;
+  const obj = raw.indexOf("{");
+  const arr = raw.indexOf("[");
+  const startsArray = arr >= 0 && (obj < 0 || arr < obj);
+  const start = startsArray ? arr : obj;
+  const end = startsArray ? raw.lastIndexOf("]") : raw.lastIndexOf("}");
+  if (start < 0 || end <= start) return undefined;
+  return safeJson<T>(raw.slice(start, end + 1));
+}
+
 // ---------- formatting ----------
 
 export function fmtTokens(n: number): string {

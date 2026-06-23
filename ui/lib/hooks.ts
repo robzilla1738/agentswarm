@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
-import { ClientState, applyEvent, emptyState } from "./reducer";
+import { ClientState, CodeState, applyEvent, emptyState } from "./reducer";
 import type {
   ActivityItem,
   AgentView,
@@ -45,6 +45,8 @@ export interface LiveRun {
   forecastBrief: string;
   forecastDomain: string | null;
   subForecasts: SubForecast[];
+  /** Code (build) runs: engine-owned plan, TDD spec, gate/review/ensemble history. Null for non-code runs. */
+  code: CodeState | null;
   finalSummary?: string;
   finalReportPath?: string;
   lastSeq: number;
@@ -88,6 +90,7 @@ function project(s: ClientState): LiveRun {
           panel: [],
         }
     ),
+    code: s.code,
     finalSummary: s.finalSummary,
     finalReportPath: s.finalReportPath,
     lastSeq: s.lastSeq,

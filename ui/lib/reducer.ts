@@ -50,10 +50,26 @@ export interface ClientState {
   forecastDomain: string | null;
   questions: ForecastQuestion[];
   subForecasts: Map<string, SubForecast>;
+  /** Code (build) runs: the engine-owned plan, TDD spec, gate/review history, ensembles. Null until a code.* event arrives. */
+  code: CodeState | null;
   finalSummary?: string;
   finalReportPath?: string;
   lastSeq: number;
   lastT: number;
+}
+
+export interface CodeState {
+  criteria: { id: string; text: string; met: boolean }[];
+  buildPlan: { modules: { id: string; files: string[]; purpose: string; deps?: string[]; hard?: boolean }[]; waves: string[][] | null } | null;
+  map: { fileCount: number; symbolCount: number; truncated: boolean } | null;
+  specSeeded: boolean;
+  gates: { green: boolean; skipped: boolean; summary: string }[];
+  reviews: { clean: boolean; issues: string[]; round: number }[];
+  ensembles: { taskId: string; n: number; winner: number; merged: boolean; scores: { i: number; score: number; green: boolean }[] }[];
+}
+
+function emptyCode(): CodeState {
+  return { criteria: [], buildPlan: null, map: null, specSeeded: false, gates: [], reviews: [], ensembles: [] };
 }
 
 const PRICING: Record<string, { inMiss: number; inHit: number; out: number }> = {
@@ -88,6 +104,7 @@ export function emptyState(): ClientState {
     forecastDomain: null,
     questions: [],
     subForecasts: new Map(),
+    code: null,
     lastSeq: 0,
     lastT: 0,
   };
@@ -423,6 +440,47 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
         simulation: sim,
       });
       syncPrimaryForecast(s);
+      break;
+    }
+    case "code.criteria": {
+      const c = (s.code ??= emptyCode());
+      if (Array.isArray(ev.items)) c.criteria = ev.items as CodeState["criteria"];
+      break;
+    }
+    case "code.design": {
+      const c = (s.code ??= emptyCode());
+      if (ev.plan) c.buildPlan = ev.plan as CodeState["buildPlan"];
+      break;
+    }
+    case "code.map": {
+      const c = (s.code ??= emptyCode());
+      c.map = { fileCount: Number(ev.fileCount) || 0, symbolCount: Number(ev.symbolCount) || 0, truncated: Boolean(ev.truncated) };
+      break;
+    }
+    case "code.spec": {
+      const c = (s.code ??= emptyCode());
+      c.specSeeded = true;
+      break;
+    }
+    case "code.gate": {
+      const c = (s.code ??= emptyCode());
+      c.gates.push({ green: Boolean(ev.green), skipped: Boolean(ev.skipped), summary: String(ev.summary ?? "") });
+      break;
+    }
+    case "code.review": {
+      const c = (s.code ??= emptyCode());
+      c.reviews.push({ clean: Boolean(ev.clean), issues: Array.isArray(ev.issues) ? (ev.issues as string[]) : [], round: Number(ev.round) || 0 });
+      break;
+    }
+    case "code.ensemble": {
+      const c = (s.code ??= emptyCode());
+      c.ensembles.push({
+        taskId: String(ev.taskId ?? ""),
+        n: Number(ev.n) || 0,
+        winner: Number(ev.winner) || 0,
+        merged: Boolean(ev.merged),
+        scores: Array.isArray(ev.scores) ? (ev.scores as CodeState["ensembles"][number]["scores"]) : [],
+      });
       break;
     }
     case "run.final":

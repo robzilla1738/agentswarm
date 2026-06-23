@@ -496,6 +496,56 @@ export interface CodeGateResult {
   ran: { check: keyof CodeCommands; pass: boolean; failed: number; total: number }[];
 }
 
+/**
+ * Code mode: one atomic acceptance criterion, split from the free-text
+ * `acceptanceCriteria` in planCode and tracked as first-class state so the
+ * spec-test author, the diff-review critic, and the synthesizer all reason over
+ * the same checklist (and "done" is never claimed for an unverified item).
+ */
+export interface AcceptanceItem {
+  id: string;
+  text: string;
+  met: boolean;
+  evidence?: string;
+}
+
+/**
+ * Code mode: the engine-owned build plan — a module/file partition with
+ * interface contracts, produced once before the conductor's first turn (the
+ * planForecast analog) and pinned into the conductor doctrine. The conductor
+ * implements against this partition instead of inventing one per spawn batch.
+ */
+export interface BuildModule {
+  id: string;
+  /** Files this module owns exclusively (no other module may list the same file). */
+  files: string[];
+  purpose: string;
+  /** Optional interface/contract other modules depend on. */
+  interface?: string;
+  /** Module ids this one depends on (used to topo-sort into conflict-free waves). */
+  deps: string[];
+  /** Hint that this module is hard/high-risk — eligible for a best-of-N ensemble. */
+  hard?: boolean;
+}
+
+export interface BuildPlan {
+  modules: BuildModule[];
+  /** Greenfield / missing build command → wave 1 is a single recon+scaffold task. */
+  scaffoldFirst: boolean;
+  /** End each implement wave with a strong-model integration task. */
+  integrationPerWave: boolean;
+  /** Deterministically-computed conflict-free waves (module ids), or null if the plan was unparseable/invalid. */
+  waves: string[][] | null;
+}
+
+/** Code mode: a deterministic symbol map of the repo, injected into workers so a cheap model edits with the codebase's structure. */
+export interface RepoMap {
+  /** Per-file exported symbol signatures, ranked + truncated to a token budget. */
+  files: { path: string; symbols: string[] }[];
+  /** True when the map was truncated to fit the token budget. */
+  truncated: boolean;
+}
+
 export interface RunOptions {
   model: string;
   conductorModel: string;
@@ -516,6 +566,18 @@ export interface RunOptions {
   codeGreenGate?: boolean;
   /** Code mode: per-run override of engine commit-on-green. Undefined → cfg.codeAutoCommit. */
   codeAutoCommit?: boolean;
+  /** Code mode: per-run override of TDD spec-test authoring + 0-test gate guard. Undefined → cfg.codeTdd. */
+  codeTdd?: boolean;
+  /** Code mode: per-run override of the engine-owned BuildPlan / DESIGN.md phase. Undefined → cfg.codeDesign. */
+  codeDesign?: boolean;
+  /** Code mode: per-run override of the injected repo symbol-map. Undefined → cfg.codeRepoMap. */
+  codeRepoMap?: boolean;
+  /** Code mode: per-run override of the adversarial diff-review critic. Undefined → cfg.codeReview. */
+  codeReview?: boolean;
+  /** Code mode: per-run override of best-of-N ensemble availability. Undefined → cfg.codeEnsemble. */
+  codeEnsemble?: boolean;
+  /** Code mode: per-run override of the cross-run repo-facts ledger. Undefined → cfg.codeRepoFacts. */
+  codeRepoFacts?: boolean;
   /** Forecast mode: operator-supplied resolution date (ISO) for the question. */
   resolutionDate?: string;
   /** Forecast mode: independent forecaster panel size (3–11). */
@@ -629,6 +691,10 @@ export interface TaskSpec {
   team?: boolean;
   teamMaxWorkers?: number;
   teamBudgetTokens?: number;
+  /** Code mode: the files this task owns exclusively (enforced disjoint at write time). */
+  files?: string[];
+  /** Code mode: run this hard task as a best-of-N ensemble of N isolated attempts. */
+  ensemble?: number;
 }
 
 export interface Task {
@@ -667,6 +733,10 @@ export interface Task {
   forecast?: Forecast;
   /** Forecast mode: which sub-forecast a forecaster task answers (parsed from "QUESTION: <id>"). Absent → primary. */
   questionId?: string;
+  /** Code mode: files this task owns exclusively (from the pinned build plan / spawn spec). Writes outside are blocked. */
+  ownedFiles?: string[];
+  /** Code mode: run this task as a best-of-N ensemble of N isolated attempts (winner judged by the gate). */
+  ensemble?: number;
   createdAt: number;
   startedAt?: number;
   endedAt?: number;
@@ -743,6 +813,12 @@ export interface RunSummary {
  *  code.plan       { profile: RepoProfile, commit: boolean, branch: string|null } — recon result (code mode)
  *  code.checkpoint { sha, taskId }                — engine commit-on-green (code mode)
  *  code.gate       { green: boolean, summary }    — pre-synthesis green-gate result (code mode)
+ *  code.criteria   { items: AcceptanceItem[] }    — acceptance criteria split into tracked items (code mode)
+ *  code.design     { plan: BuildPlan }            — engine-owned build plan / file partition (code mode)
+ *  code.map        { fileCount, symbolCount, truncated } — repo symbol-map built for workers (code mode)
+ *  code.spec       { testFiles: string[], criteria: string[], initiallyRed: boolean } — TDD spec suite authored (code mode)
+ *  code.review     { clean: boolean, issues: string[], round } — adversarial diff-review critic (code mode)
+ *  code.ensemble   { taskId, n, winner, scores } — best-of-N solution ensemble outcome (code mode)
  */
 export interface SwarmEvent {
   seq: number;

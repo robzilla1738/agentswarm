@@ -24,11 +24,14 @@ import {
   codeVerifierToolset,
 } from "./tools";
 import {
+  acceptanceCriteriaSplitPrompt,
   aggregateBlock,
   budgetLine,
   codeConductorAddendum,
+  codeReviewPrompt,
   codeSynthAddendum,
   completenessPrompt,
+  planBuildSpecPrompt,
   conductorInitialUpdate,
   conductorSystem,
   conductorUpdate,
@@ -110,9 +113,10 @@ import { canonicalizeUrl } from "./searchcore";
 import { aggregateSources, renderFinalHtml, sourcesBlock } from "./report";
 import { SandboxRuntime, createSandbox } from "./sandbox";
 import { RunState } from "./state";
-import { formatCheckResult, gitCommitGreen, gitPrepare, gitResetTo, parseCheckOutput, reconRepo } from "./codeintel";
-import { AggregateForecast, CodeCommands, CodeGateResult, DomainId, FittedParams, Forecast, ForecastQuestion, MarketAnchor, RepoProfile, RunMeta, RunStatus, SimDriver, SourceRef, Task, TaskSpec, Usage, usageCost } from "./types";
-import { canonicalArtifactRel, clip, ensureDir, errMsg, oneLine, rid, sleep, truncateMiddle, validateArtifactFormat, withTimeout } from "./util";
+import { buildRepoMap, coerceBuildModules, formatCheckResult, gitAddWorktree, gitCommitGreen, gitDiffSince, gitMergeWorktreeBranch, gitPrepare, gitRemoveWorktree, gitResetTo, parseCheckOutput, partitionWaves, reconRepo } from "./codeintel";
+import { appendRepoFacts, loadRepoFacts, manifestHash, mergeConfirmedCommands, repoKey } from "./codeledger";
+import { AcceptanceItem, AggregateForecast, BuildPlan, CodeCommands, CodeGateResult, DomainId, FittedParams, Forecast, ForecastQuestion, MarketAnchor, RepoMap, RepoProfile, RunMeta, RunStatus, SimDriver, SourceRef, Task, TaskSpec, Usage, usageCost } from "./types";
+import { canonicalArtifactRel, clip, ensureDir, errMsg, normalizeWorkdirRel, oneLine, parseJsonLoose, rid, sleep, truncateMiddle, validateArtifactFormat, withTimeout } from "./util";
 
 
 export interface ExecutorOptions {
@@ -232,6 +236,22 @@ export class Executor {
   /** Code mode: pre-synthesis green-gate bookkeeping. */
   private gateRounds = 0;
   private gatePassDone = false;
+  /** Code mode: acceptance criteria split into tracked items (set by planCode, restored on resume). */
+  private acceptanceItems: AcceptanceItem[] = [];
+  /** Code mode: the engine-owned build plan / file partition (set by planCode, restored on resume). */
+  private buildPlan?: BuildPlan;
+  /** Code mode: deterministic repo symbol-map injected into workers. */
+  private repoMap?: RepoMap;
+  /** Code mode: the baseline commit the diff-review critic diffs against (set by gitPrepare). */
+  private codeBaselineSha?: string;
+  /** Code mode: manifest hash from the PRISTINE recon profile — the stable ledger key; load + persist must use the same value so the ledger converges. */
+  private codeManifestHash?: string;
+  /** Code mode: diff-review critic bookkeeping. */
+  private reviewRounds = 0;
+  /** Code mode: whether the most recent green-gate actually passed (the review only runs on a green tree). */
+  private lastGateGreen = false;
+  /** Code mode: whether the engine seeded the TDD spec-author task already (resume-idempotent). */
+  private specAuthored = false;
 
   /** The primary (first) sub-forecast — back-compat for readers that only need one. */
   private get question(): ForecastQuestion | null {
@@ -338,6 +358,12 @@ export class Executor {
     this.codeCommit = state.codeCommitEnabled;
     this.codeBranch = state.codeBranch;
     this.resumeResetSha = state.lastGreenSha;
+    // Code mode: rehydrate tracked criteria + build plan so the resumed run
+    // reasons over the same checklist/partition and never re-splits or re-plans.
+    this.acceptanceItems = state.acceptanceItems ?? [];
+    this.buildPlan = state.buildPlan;
+    // The diff-review baseline (set in planCode, which doesn't re-run on resume).
+    this.codeBaselineSha = state.codeBaselineSha;
     this.spentTokens = state.totalUsage.promptTokens + state.totalUsage.completionTokens;
     this.cost = state.cost;
     try {
@@ -494,7 +520,7 @@ export class Executor {
     // (appended AFTER conductorSystem, so it wins by recency).
     const codeDoctrine =
       this.codeMode() && this.repoProfile
-        ? `\n\n${codeConductorAddendum(this.repoProfile, this.meta.options.acceptanceCriteria)}`
+        ? `\n\n${codeConductorAddendum(this.repoProfile, this.meta.options.acceptanceCriteria, this.acceptanceItems, this.buildPlan, this.codeTddEnabled())}`
         : "";
 
     // Real-directory runs remember: prior missions in the same workspace feed
@@ -531,6 +557,11 @@ export class Executor {
       });
     }
 
+    // TDD: engine-seed a strong-tier spec-test author as the first task so the
+    // green-gate has a real oracle. Created BEFORE the conductor's first turn so
+    // it appears in the task table and the conductor deps implementers on it.
+    this.seedSpecTask();
+
     try {
       await this.conductorTurn();
       this.setStatus("running");
@@ -542,6 +573,13 @@ export class Executor {
       // is quiescent; on RED the conductor gets up to codeGateMaxRounds to fix
       // the tree before synthesis ships it.
       while (await this.greenGate()) await this.mainLoop();
+      // Code mode: once the tree is green, a blind adversarial diff-review judges
+      // the change against the acceptance criteria + correctness/security (what
+      // "green" hides). Real findings reopen the loop; re-gate before shipping.
+      while (await this.codeReviewPass()) {
+        await this.mainLoop();
+        while (await this.greenGate()) await this.mainLoop();
+      }
     } catch (e) {
       if (!this.ac.signal.aborted) {
         this.journal.append("log", { level: "error", msg: `executor error: ${errMsg(e)}` });
@@ -561,6 +599,10 @@ export class Executor {
       await this.consolidateTeam();
       return; // the parent owns the sandbox, final flush, and run status
     }
+
+    // Code mode: persist confirmed commands/conventions for the next run (only
+    // if the gate went green — never memorize a setup that didn't actually work).
+    await this.persistRepoFacts();
 
     await this.synthesize();
     // Teardown is best-effort AND bounded — a wedged container must not hang
@@ -631,6 +673,24 @@ export class Executor {
   private codeGateEnabled(): boolean {
     return this.meta.options.codeGreenGate ?? this.cfg.codeGreenGate;
   }
+  private codeTddEnabled(): boolean {
+    return this.meta.options.codeTdd ?? this.cfg.codeTdd;
+  }
+  private codeDesignEnabled(): boolean {
+    return this.meta.options.codeDesign ?? this.cfg.codeDesign;
+  }
+  private codeRepoMapEnabled(): boolean {
+    return this.meta.options.codeRepoMap ?? this.cfg.codeRepoMap;
+  }
+  private codeReviewEnabled(): boolean {
+    return this.meta.options.codeReview ?? this.cfg.codeReview;
+  }
+  private codeEnsembleEnabled(): boolean {
+    return this.meta.options.codeEnsemble ?? this.cfg.codeEnsemble;
+  }
+  private codeRepoFactsEnabled(): boolean {
+    return this.meta.options.codeRepoFacts ?? this.cfg.codeRepoFacts;
+  }
 
   /**
    * Code mode pre-step (the planForecast analog): recon the repo deterministically
@@ -655,6 +715,10 @@ export class Executor {
       ? greenfield
       : await reconRepo(exec, this.sandbox.workdir, this.ac.signal);
 
+    // Cross-run repo memory: bootstrap recon with commands a prior run confirmed
+    // working (detection wins where it found something; confirmed facts fill gaps).
+    if (this.codeRepoFactsEnabled() && !this.repoProfile.greenfield) await this.loadRepoFactsInto(this.repoProfile);
+
     // Commit-on-green, with the three-tier brownfield guardrail (gitPrepare
     // refuses on a dirty real repo and never touches operator config).
     const autoCommit = this.meta.options.codeAutoCommit ?? this.cfg.codeAutoCommit;
@@ -670,9 +734,19 @@ export class Executor {
         level: prep.ok ? "info" : "warn",
         msg: prep.ok ? `code mode: commit-on-green to ${prep.branch}` : `commit-on-green disabled: ${prep.reason}`,
       });
+      // Capture the pre-work HEAD as the diff-review baseline (all swarm changes
+      // are diffed against it). Best-effort; absent → review falls back to skip.
+      if (prep.ok) {
+        try {
+          const h = await exec("git rev-parse HEAD 2>/dev/null", { cwd: this.sandbox.workdir, timeoutSec: 15, signal: this.ac.signal });
+          this.codeBaselineSha = (h.out ?? "").trim().split("\n")[0] || undefined;
+        } catch {
+          /* no baseline — codeReviewPass will skip */
+        }
+      }
     }
 
-    this.journal.append("code.plan", { profile: this.repoProfile, commit: this.codeCommit, branch: this.codeBranch });
+    this.journal.append("code.plan", { profile: this.repoProfile, commit: this.codeCommit, branch: this.codeBranch, baseline: this.codeBaselineSha });
     const p = this.repoProfile;
     this.journal.append("log", {
       level: "info",
@@ -680,6 +754,236 @@ export class Executor {
         ? "code mode: greenfield build (empty working directory)"
         : `code mode: ${p.primaryLanguage ?? "unknown stack"}${p.framework ? ` (${p.framework})` : ""} · build=${p.commands.build ?? "?"} · test=${p.commands.test ?? "?"}`,
     });
+
+    // Acceptance criteria → first-class tracked state, so the spec-test author,
+    // the diff-review critic, and the synthesizer reason over one checklist and
+    // "done" is never claimed for an unverified item.
+    await this.splitAcceptanceCriteria();
+
+    // Engine-owned build plan: a validated, conflict-free module/file partition
+    // pinned before the conductor's first turn (the planForecast analog). The
+    // cheap conductor implements against it instead of inventing a partition.
+    if (this.codeDesignEnabled()) await this.planBuildSpec();
+
+    // Deterministic repo symbol-map for workers (brownfield: edit with the
+    // existing structure; greenfield has nothing to map yet — built post-scaffold).
+    if (this.codeRepoMapEnabled() && !this.repoProfile.greenfield) await this.refreshRepoMap();
+  }
+
+  /** Repo identity for the cross-run facts ledger: git remote URL when present, else the absolute path. */
+  private async repoIdentity(): Promise<string> {
+    let remote: string | null = null;
+    try {
+      const r = await this.sandbox.exec("git config --get remote.origin.url 2>/dev/null", { cwd: this.sandbox.workdir, timeoutSec: 15, signal: this.ac.signal });
+      remote = (r.out ?? "").trim() || null;
+    } catch {
+      /* no remote */
+    }
+    return repoKey(remote, this.meta.cwd);
+  }
+
+  /** Code mode: bootstrap recon with a prior run's confirmed commands/conventions (cross-run memory). */
+  private async loadRepoFactsInto(profile: RepoProfile): Promise<void> {
+    try {
+      // Hash the PRISTINE recon profile (before any merge-fill) and remember it,
+      // so persist uses the identical key — otherwise a filled command changes
+      // the hash and the enriched record is never found again (ledger never converges).
+      this.codeManifestHash = manifestHash({ commands: profile.commands, manifestFiles: profile.manifestFiles, packageManager: profile.packageManager, primaryLanguage: profile.primaryLanguage });
+      const facts = loadRepoFacts(await this.repoIdentity(), this.codeManifestHash);
+      if (!facts) return;
+      const { commands, filled } = mergeConfirmedCommands(profile.commands, facts.commands);
+      profile.commands = commands;
+      if (!profile.conventions.length && facts.conventions.length) profile.conventions = facts.conventions;
+      if (filled.length || facts.conventions.length) {
+        this.journal.append("log", { level: "info", msg: `code mode: applied repo memory from a prior run${filled.length ? ` (filled ${filled.join(", ")})` : ""}` });
+      }
+    } catch {
+      /* repo memory is best-effort */
+    }
+  }
+
+  /** Code mode: persist what this run confirmed about the repo (commands that ran green, conventions) for the next run. */
+  private async persistRepoFacts(): Promise<void> {
+    if (!this.codeMode() || !this.codeRepoFactsEnabled() || !this.repoProfile) return;
+    if (!this.lastGateGreen) return; // only persist a repo whose commands actually passed
+    try {
+      const p = this.repoProfile;
+      // Use the pristine-recon hash captured at load time so the key is stable
+      // across runs even after merge-fill mutated p.commands. Fall back to a
+      // fresh hash only if load never ran (e.g. greenfield path).
+      const hash = this.codeManifestHash ?? manifestHash({ commands: p.commands, manifestFiles: p.manifestFiles, packageManager: p.packageManager, primaryLanguage: p.primaryLanguage });
+      appendRepoFacts({
+        key: await this.repoIdentity(),
+        manifestHash: hash,
+        at: Date.now(),
+        commands: p.commands,
+        conventions: p.conventions,
+      });
+      this.journal.append("log", { level: "info", msg: "code mode: saved repo memory (confirmed commands + conventions) for the next run" });
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  /** (Re)build the repo symbol-map and journal it. Best-effort; never throws. */
+  private async refreshRepoMap(): Promise<void> {
+    try {
+      const map = await buildRepoMap(
+        this.sandbox.exec.bind(this.sandbox),
+        this.sandbox.workdir,
+        this.ac.signal,
+        Math.max(1000, this.cfg.codeRepoMapMaxTokens ?? 6000)
+      );
+      this.repoMap = map;
+      this.journal.append("code.map", {
+        fileCount: map.files.length,
+        symbolCount: map.files.reduce((n, f) => n + f.symbols.length, 0),
+        truncated: map.truncated,
+      });
+    } catch {
+      /* map is best-effort */
+    }
+  }
+
+  /**
+   * Produce + deterministically validate the BuildPlan (one LLM call). The
+   * partition (no two modules own the same file, no dependency cycle) is checked
+   * by partitionWaves(); an invalid or unparseable plan degrades to `waves:null`
+   * and the conductor falls back to the free-form doctrine — never fails the run.
+   */
+  private async planBuildSpec(): Promise<void> {
+    if (this.buildPlan) return; // restored on resume
+    let modules = [] as ReturnType<typeof coerceBuildModules>;
+    let scaffoldFirst = this.repoProfile?.greenfield ?? false;
+    let integrationPerWave = true;
+    try {
+      const res = await chat(this.cfg, {
+        model: this.resolveModel("cheap"),
+        messages: [{ role: "user", content: planBuildSpecPrompt(this.meta.mission, this.repoProfile!, this.acceptanceItems) }],
+        thinking: false,
+        maxTokens: 2048,
+        signal: this.ac.signal,
+      });
+      this.onUsage(this.resolveModel("cheap"), res.usage);
+      const parsed = parseJsonLoose<{ modules?: unknown; scaffoldFirst?: unknown; integrationPerWave?: unknown }>(res.content || "{}");
+      if (parsed && typeof parsed === "object") {
+        modules = coerceBuildModules(parsed.modules);
+        if (typeof parsed.scaffoldFirst === "boolean") scaffoldFirst = parsed.scaffoldFirst;
+        if (typeof parsed.integrationPerWave === "boolean") integrationPerWave = parsed.integrationPerWave;
+      }
+    } catch {
+      /* degrade below */
+    }
+    const waves = partitionWaves({ modules });
+    this.buildPlan = { modules, scaffoldFirst, integrationPerWave, waves };
+    this.journal.append("code.design", { plan: this.buildPlan });
+    if (waves && waves.length) {
+      try {
+        fs.writeFileSync(path.join(this.runDirPath, "artifacts", "DESIGN.md"), this.renderDesignMd(this.buildPlan), "utf8");
+      } catch {
+        /* artifact is best-effort */
+      }
+      this.journal.append("log", {
+        level: "info",
+        msg: `code mode: pinned build plan — ${modules.length} modules in ${waves.length} conflict-free wave(s)`,
+      });
+    } else {
+      this.journal.append("log", {
+        level: "warn",
+        msg: "code mode: build plan unusable (file collision / cycle / empty) — falling back to free-form build doctrine",
+      });
+    }
+  }
+
+  /**
+   * Engine-seed the TDD spec-test author as task T1 (strong tier). For a
+   * brownfield repo the project already exists, so authoring failing spec tests
+   * up front is clean and gives every later wave a real fitness function.
+   * Greenfield is left to the conductor doctrine (it must scaffold + establish a
+   * test command first); the gate-guard enforces "0 tests ≠ green" in both cases.
+   */
+  private seedSpecTask(): void {
+    if (this.resumed || this.specAuthored) return;
+    if (!this.codeMode() || !this.codeTddEnabled() || !this.acceptanceItems.length) return;
+    if (this.repoProfile?.greenfield) return; // nothing to test against yet — doctrine handles it post-scaffold
+    const id = this.allocId();
+    const criteria = this.acceptanceItems.map((it) => `  [${it.id}] ${it.text}`).join("\n");
+    const cmds = this.repoProfile?.commands ?? {};
+    const task: Task = {
+      id,
+      title: "Author failing spec tests from the acceptance criteria (TDD)",
+      objective:
+        `Write a spec test-suite that pins the acceptance criteria as executable, INITIALLY-FAILING tests — the oracle the rest of the build codes against. Do NOT implement the feature.\n\n` +
+        `ACCEPTANCE CRITERIA — one or more tests per item, referencing its id in the test name:\n${criteria}\n\n` +
+        `Rules:\n` +
+        `- ADD tests; do not rewrite or delete the existing suite. Match the repo's existing test framework and conventions.\n` +
+        `- ${cmds.test ? `Run \`${cmds.test}\` (via run_check) and confirm the NEW tests FAIL for the right reason (feature absent), not from a setup/import error.` : `Establish the project's test command if none exists, then confirm the new tests fail for the right reason.`}\n` +
+        `- Tests must assert real behavior (inputs → expected outputs / errors), not tautologies that pass against missing code.\n` +
+        `- report() with files_touched listing every test file you created, and key_facts noting which criterion each test covers and the exact test command.`,
+      role: "test-author",
+      deps: [],
+      verify: false, // the spec IS the verification; we don't blind-verify the oracle
+      status: "pending",
+      attempt: 1,
+      wave: 1,
+      modelTier: "strong",
+      artifacts: [],
+      createdAt: Date.now(),
+      agentIds: [],
+    };
+    this.tasks.set(id, task);
+    this.taskOrder.push(id);
+    this.specAuthored = true;
+    this.journal.append("task.created", { task });
+    this.journal.append("code.spec", { testFiles: [], criteria: this.acceptanceItems.map((it) => it.text), initiallyRed: true, taskId: id });
+    this.journal.append("log", { level: "info", msg: `TDD: seeded spec-test author ${id} for ${this.acceptanceItems.length} acceptance criteria` });
+  }
+
+  /** A human-readable DESIGN.md from the pinned build plan (run artifact). */
+  private renderDesignMd(plan: BuildPlan): string {
+    const lines = [`# Build plan`, ``, `_Mission: ${this.meta.mission}_`, ``];
+    if (this.acceptanceItems.length) {
+      lines.push(`## Acceptance criteria`, ``, ...this.acceptanceItems.map((it) => `- [ ] **${it.id}** ${it.text}`), ``);
+    }
+    lines.push(`## Modules`, ``);
+    for (const m of plan.modules) {
+      lines.push(`### ${m.id}${m.hard ? " · hard" : ""}`, m.purpose || "", `- Files: ${m.files.join(", ") || "(tbd)"}`);
+      if (m.interface) lines.push(`- Interface: ${m.interface}`);
+      if (m.deps.length) lines.push(`- Depends on: ${m.deps.join(", ")}`);
+      lines.push("");
+    }
+    if (plan.waves) {
+      lines.push(`## Waves (conflict-free)`, ``, ...plan.waves.map((w, i) => `${i + 1}. ${w.join(", ")}`), ``);
+    }
+    return lines.join("\n");
+  }
+
+  /**
+   * Split the free-text acceptance criteria into atomic tracked items (one cheap
+   * LLM call). Degrades to a single whole-blob item on any failure — never fails
+   * the run. No-op when there are no criteria or they were already restored on resume.
+   */
+  private async splitAcceptanceCriteria(): Promise<void> {
+    const raw = (this.meta.options.acceptanceCriteria ?? "").trim();
+    if (!raw || this.acceptanceItems.length) return;
+    let items: string[] = [];
+    try {
+      const res = await chat(this.cfg, {
+        model: this.resolveModel("cheap"),
+        messages: [{ role: "user", content: acceptanceCriteriaSplitPrompt(this.meta.mission, raw) }],
+        thinking: false,
+        maxTokens: 1024,
+        signal: this.ac.signal,
+      });
+      this.onUsage(this.resolveModel("cheap"), res.usage);
+      const parsed = parseJsonLoose<unknown>(res.content || "[]");
+      if (Array.isArray(parsed)) items = parsed.map((x) => String(x).trim()).filter(Boolean).slice(0, 12);
+    } catch {
+      /* degrade below */
+    }
+    if (!items.length) items = [raw]; // never lose the criteria — track the whole blob as one item
+    this.acceptanceItems = items.map((text, i) => ({ id: `AC${i + 1}`, text, met: false }));
+    this.journal.append("code.criteria", { items: this.acceptanceItems });
   }
 
   private panelSize(): number {
@@ -2248,6 +2552,78 @@ PROTOCOL
     return false;
   }
 
+  /**
+   * Code mode: adversarial diff-review / spec-conformance critic. Runs after the
+   * tree is green (the gate already proved it compiles + tests pass) and judges
+   * the actual diff against the acceptance criteria + correctness/security/
+   * convention rubrics — what "green" hides. Real findings reopen the conductor
+   * loop, bounded by codeReviewMaxRounds. Returns true when it reopened the loop.
+   */
+  private async codeReviewPass(): Promise<boolean> {
+    if (!this.codeMode() || !this.codeReviewEnabled()) return false;
+    if (this.cfg.verification === "off") return false;
+    if (this.fatal || this.ac.signal.aborted || this.budgetExceeded()) return false;
+    if (this.finishReason.includes("cancel") || this.finishReason.includes("conductor unavailable")) return false;
+    if (!this.lastGateGreen) return false; // only review a green tree
+    const maxRounds = this.cfg.codeReviewMaxRounds ?? 1;
+    if (maxRounds < 1 || this.reviewRounds >= maxRounds) return false;
+    if (!this.codeBaselineSha) return false; // no baseline to diff against
+    if (this.inflight.size) await Promise.allSettled([...this.inflight.values()]);
+
+    let diff = "";
+    try {
+      const r = await this.sandbox.exec(`git diff ${this.codeBaselineSha} 2>/dev/null`, { cwd: this.sandbox.workdir, timeoutSec: 60, signal: this.ac.signal });
+      diff = r.out ?? "";
+    } catch {
+      return false; // can't diff → skip review rather than block the ship
+    }
+    if (!diff.trim()) {
+      this.journal.append("code.review", { clean: true, issues: [], round: this.reviewRounds, note: "no diff against baseline" });
+      return false;
+    }
+    this.reviewRounds++;
+    let verdict = "";
+    try {
+      const res = await chat(this.cfg, {
+        model: this.resolveModel("strong"),
+        messages: [{ role: "user", content: codeReviewPrompt(this.meta.mission, this.acceptanceItems, truncateMiddle(diff, 100_000, "chars")) }],
+        thinking: false,
+        maxTokens: 2048,
+        signal: this.ac.signal,
+      });
+      this.onUsage(this.resolveModel("strong"), res.usage);
+      verdict = (res.content || "").trim();
+    } catch (e) {
+      this.journal.append("log", { level: "warn", msg: `code review failed: ${errMsg(e)}` });
+      return false;
+    }
+    const clean = !verdict || /^REVIEW-CLEAN\b/i.test(verdict);
+    const issues = clean
+      ? []
+      : verdict
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((l) => /^\d+[.)]/.test(l))
+          .map((l) => clip(l, 300))
+          .slice(0, 6);
+    this.journal.append("code.review", { clean, issues: issues.length ? issues : clean ? [] : [clip(verdict, 300)], round: this.reviewRounds });
+    if (clean) {
+      this.journal.append("log", { level: "info", msg: "code review: no material issues" });
+      return false;
+    }
+    this.journal.append("log", { level: "info", msg: `code review found issues:\n${clip(verdict, 1500)}` });
+    this.finishing = false;
+    this.lastGateGreen = false; // fixes will dirty the tree → re-gate before re-review/ship
+    this.gatePassDone = false; // allow the gate to run again after fixes
+    this.gateRounds = 0; // review-driven fixes get a fresh fix-round budget (don't inherit the pre-review gate's exhausted budget)
+    this.appendConductorUpdate(
+      `ADVERSARIAL CODE REVIEW found issues before synthesis (round ${this.reviewRounds}/${maxRounds}). The tree builds, but the diff has real defects:\n${clip(verdict, 2000)}\n` +
+        "Spawn focused fix tasks (verify:true) on the named files to close the REAL issues, then keep the gate green. Skip any you judge immaterial and say why."
+    );
+    await this.conductorTurn();
+    return this.lastConductorAction === "spawn";
+  }
+
   /** Code mode: the last green-gate's summary, fed to the synthesizer as test evidence. */
   private lastGateSummary = "";
 
@@ -2276,6 +2652,8 @@ PROTOCOL
       } catch {
         /* keep the existing profile */
       }
+      // A scaffolded greenfield tree now has source to map.
+      if (this.codeRepoMapEnabled() && !this.repoMap) await this.refreshRepoMap();
     }
 
     const result = await this.runGateChecks();
@@ -2291,6 +2669,7 @@ PROTOCOL
     this.lastGateSummary = result.summary;
     if (result.green) {
       this.gatePassDone = true;
+      this.lastGateGreen = true;
       await this.commitGreen("green-gate passed");
       return false;
     }
@@ -2302,6 +2681,12 @@ PROTOCOL
     }
     this.gateRounds++;
     this.finishing = false;
+    // Engine-driven repair: instead of round-tripping a cheap conductor to
+    // translate a failure log into a task, the engine spawns a targeted fix task
+    // itself — scoped (by bisection) to the files changed since the last green
+    // commit, and escalated to the strong tier once a round has already failed.
+    if (await this.spawnGateFix(result, maxRounds)) return true;
+    // Fallback (task cap hit) — ask the conductor the old way.
     this.appendConductorUpdate(
       `GREEN-GATE RED before synthesis (fix round ${this.gateRounds}/${maxRounds}). The integrated tree does not build/test clean:\n${clip(result.summary, 2000)}\n` +
         "Spawn a focused fix task (verify:true) on the failing files. Do not re-run a failed approach verbatim. This is the final gate before the deliverable ships."
@@ -2310,13 +2695,48 @@ PROTOCOL
     return this.lastConductorAction === "spawn";
   }
 
-  /** Run the detected build → typecheck → test, fail-fast, into a structured result. */
-  private async runGateChecks(): Promise<CodeGateResult> {
+  /**
+   * Engine-spawn a targeted green-gate fix task. Bisects the suspect files via
+   * the last green commit (commit-on-green SHA trail) and escalates to the strong
+   * model tier once a fix round has already failed — spend the expensive model
+   * exactly where the cheap one couldn't. Returns false if the task cap is hit
+   * (caller falls back to the conductor).
+   */
+  private async spawnGateFix(result: CodeGateResult, maxRounds: number): Promise<boolean> {
+    const strong = this.gateRounds >= 2;
+    let suspects: string[] = [];
+    if (this.resumeResetSha) {
+      suspects = await gitDiffSince(this.sandbox.exec.bind(this.sandbox), this.sandbox.workdir, this.resumeResetSha, this.ac.signal);
+    }
+    const failingChecks = result.ran.filter((r) => !r.pass).map((r) => r.check).join(", ") || "build/test";
+    const objective =
+      `The integrated tree FAILS the green-gate (fix round ${this.gateRounds}/${maxRounds}). Make the SMALLEST change that gets every check green — run \`run_check\` until it passes. Do NOT rewrite working code, weaken tests, or re-run an approach that already failed.\n\n` +
+      `FAILING (${failingChecks}):\n${clip(result.summary, 1500)}` +
+      (suspects.length ? `\n\nMOST LIKELY FILES (changed since the last green commit — start here):\n${suspects.slice(0, 30).map((f) => `- ${f}`).join("\n")}` : "");
+    const spec: TaskSpec = {
+      title: `Fix green-gate failures (${failingChecks})`,
+      objective,
+      role: "coder",
+      verify: true,
+      // round 1 = default tier; round ≥2 = strong (escalate where cheap failed).
+      ...(strong ? { model: "strong" as const } : {}),
+    };
+    const res = this.handleSpawn({ tasks: [spec] });
+    this.journal.append("log", {
+      level: "info",
+      msg: `green-gate fix round ${this.gateRounds}: engine spawned a${strong ? " STRONG-tier" : ""} fix task — ${res}`,
+    });
+    return /^Created/.test(res);
+  }
+
+  /** Run the detected build → typecheck → test, fail-fast, into a structured result (against `cwd`, defaulting to the live tree). */
+  private async runGateChecks(cwd: string = this.sandbox.workdir): Promise<CodeGateResult> {
     const cmds: CodeCommands = this.repoProfile?.commands ?? {};
     const order: (keyof CodeCommands)[] = ["build", "typecheck", "test"];
     const ran: CodeGateResult["ran"] = [];
     const parts: string[] = [];
     let green = true;
+    let testParsed: ReturnType<typeof parseCheckOutput> | undefined;
     for (const check of order) {
       const cmd = cmds[check];
       if (!cmd) continue;
@@ -2324,7 +2744,7 @@ PROTOCOL
       let code: number | null;
       let timedOut = false;
       try {
-        const r = await this.sandbox.exec(cmd, { cwd: this.sandbox.workdir, timeoutSec: 600, signal: this.ac.signal });
+        const r = await this.sandbox.exec(cmd, { cwd, timeoutSec: 600, signal: this.ac.signal });
         out = r.out;
         code = r.code;
         timedOut = r.timedOut;
@@ -2341,11 +2761,28 @@ PROTOCOL
         break;
       }
       const parsed = parseCheckOutput(check, out, code);
+      if (check === "test") testParsed = parsed;
       ran.push({ check, pass: parsed.pass, failed: parsed.failed, total: parsed.total });
       parts.push(formatCheckResult(check, cmd, parsed, "—"));
       if (!parsed.pass) {
         green = false;
         break; // fail-fast: no point running tests on a broken build
+      }
+    }
+    // TDD guard: under TDD with acceptance criteria, "it compiles" is NOT green.
+    // A build that passes while no tests genuinely ran leaves every criterion
+    // unverified — turn that into a RED so the swarm authors real spec tests.
+    // Keyed off the explicit no-tests signal (not raw total===0), so a passing
+    // test command that simply doesn't print a count (Go, custom runners) is NOT
+    // falsely red. Bounded by gate rounds; if it still can't, greenGate ships honestly.
+    if (this.codeTddEnabled() && this.acceptanceItems.length && green) {
+      const testRan = ran.find((r) => r.check === "test");
+      const noTestsRan = !testRan || (testParsed !== undefined && testParsed.total === 0 && testParsed.firstFailures.some((f) => /no tests ran/.test(f)));
+      if (noTestsRan) {
+        parts.push(
+          `TDD GUARD: build/typecheck are green but NO tests executed${cmds.test ? " (the test command collected 0 tests)" : " (no test command established)"} — the ${this.acceptanceItems.length} acceptance criteria are UNVERIFIED. Author FAILING spec tests that exercise each criterion (TDD), then make them pass. This is not green.`
+        );
+        return { green: false, summary: parts.join("\n"), ran };
       }
     }
     if (!ran.length) return { green: false, skipped: true, summary: "no build/typecheck/test command detected — green-gate skipped (tree NOT verified)", ran };
@@ -2590,6 +3027,10 @@ PROTOCOL
         team: Boolean(spec.team) && this.mode === "root",
         teamMaxWorkers: Number(rawSpec.team_max_workers ?? rawSpec.teamMaxWorkers) || undefined,
         teamBudgetTokens: Number(rawSpec.team_budget_tokens ?? rawSpec.teamBudgetTokens) || undefined,
+        // Code mode: declared file ownership (shown to the worker; the engine
+        // also enforces disjointness at write time) and best-of-N ensemble size.
+        ownedFiles: this.codeMode() ? codeOwnedFiles(rawSpec) : undefined,
+        ensemble: this.codeMode() && this.codeEnsembleEnabled() ? codeEnsembleN(rawSpec, this.cfg.codeEnsembleN ?? 3) : undefined,
         status: "pending",
         attempt: 1,
         wave,
@@ -2864,12 +3305,49 @@ PROTOCOL
       .join("\n\n");
   }
 
-  private makeToolCtx(agentId: string, task: Task | null, signal: AbortSignal = this.ac.signal): ToolCtx {
+  /**
+   * Code-mode exclusive write lock: the first task to write a file owns it until
+   * it settles; a second LIVE task writing the same file is blocked (hard error)
+   * instead of silently corrupting it — caught at write time, not as a late
+   * integration build failure. Locks are ephemeral runtime state (not journaled,
+   * not resumed) and release on settle alongside claims.
+   */
+  /**
+   * Canonical workdir-relative key for a write target — normalized the SAME way
+   * the file tools resolve (`path.resolve(workdir, rel)`), so absolute paths and
+   * `..` segments can't dodge a lock by spelling the same file differently.
+   * Returns null for a path that escapes the workdir (not lockable).
+   */
+  private normWriteKey(rel: string): string | null {
+    return normalizeWorkdirRel(this.sandbox.workdir, rel);
+  }
+
+  private guardCodeWrite(task: Task, rel: string): string | null {
+    const norm = this.normWriteKey(rel);
+    if (!norm) return null;
+    const held = this.notes.find((n) => {
+      if (n.kind !== "lock" || n.key !== norm || !n.taskId || n.taskId === task.id) return false;
+      if (n.teamId !== this.teamId) return true; // another team's lock — present means live
+      return ["running", "verifying"].includes(this.tasks.get(n.taskId)?.status ?? "");
+    });
+    if (held) {
+      return `BLOCKED — ${held.taskId} owns ${norm} (exclusive write lock). Disjoint-file ownership is enforced: another task is responsible for this file. Write only your own files; coordinate via the blackboard if you truly need a shared change.`;
+    }
+    if (!this.notes.some((n) => n.kind === "lock" && n.key === norm && n.taskId === task.id && n.teamId === this.teamId)) {
+      this.notes.push({ taskId: task.id, teamId: this.teamId, key: norm, kind: "lock", text: `write lock on ${norm}` });
+    }
+    return null;
+  }
+
+  private makeToolCtx(agentId: string, task: Task | null, signal: AbortSignal = this.ac.signal, workdirOverride?: string): ToolCtx {
     return {
       cfg: this.cfg,
       meta: this.meta,
       runDirPath: this.runDirPath,
-      workdir: this.sandbox.workdir,
+      // A best-of-N attempt / isolated worker runs in its own git worktree;
+      // every file tool and shell exec resolves against ctx.workdir, so the
+      // override is the single point that redirects an agent into its tree.
+      workdir: workdirOverride ?? this.sandbox.workdir,
       sandbox: this.sandbox,
       agentId,
       taskId: task?.id,
@@ -2908,7 +3386,7 @@ PROTOCOL
       searchNotes: (q) => this.searchNotes(q),
       readReport: (taskId) => this.readReportText(taskId),
       checkClaim: (rel) => {
-        const norm = rel.replace(/^\.\//, "");
+        const norm = this.normWriteKey(rel) ?? rel.replace(/^\.\//, "");
         const claim = this.notes.find((n) => {
           if (n.kind !== "claim" || n.key !== norm || !n.taskId) return false;
           // Another executor's claim: its tasks aren't in this.tasks, but
@@ -2921,6 +3399,9 @@ PROTOCOL
           ? `⚠ ${claim.taskId} holds a claim on ${norm} ("${oneLine(claim.text, 80)}") — coordinate via the blackboard before further edits.`
           : null;
       },
+      // Code mode HARD write guard — only on the shared tree (a best-of-N attempt
+      // runs in its own worktree, where collisions can't happen, so it gets none).
+      guardWrite: this.codeMode() && !workdirOverride && task ? (rel) => this.guardCodeWrite(task, rel) : undefined,
       addArtifact: (rel) => {
         if (task && !task.artifacts.includes(rel)) task.artifacts.push(rel);
       },
@@ -3009,8 +3490,172 @@ PROTOCOL
     return this.meta.options.model;
   }
 
+  /** Distinct strategy directives that make best-of-N attempts genuinely diverse (varied by index — Math.random is unavailable). */
+  private static ENSEMBLE_STRATEGIES = [
+    "STRATEGY: favor the SIMPLEST correct implementation — minimal code, standard library first, no premature abstraction.",
+    "STRATEGY: favor ROBUSTNESS — handle edge cases, invalid input, and failure modes explicitly; defensive but readable.",
+    "STRATEGY: favor CLEAN STRUCTURE & performance — well-factored modules, efficient data structures, clear names.",
+    "STRATEGY: be strictly TEST-DRIVEN — make the failing spec tests pass one at a time with the most direct code that satisfies them.",
+  ];
+
+  /** Map a gate result to a comparable score: green wins; otherwise reward checks that ran and passed, penalize failures. */
+  private scoreGate(gate: CodeGateResult): number {
+    if (gate.green) return 1000;
+    if (gate.skipped) return 0; // nothing ran — no evidence it works
+    let s = 0;
+    for (const r of gate.ran) s += r.pass ? 100 : -10 * Math.max(1, r.failed);
+    return s;
+  }
+
+  /**
+   * Best-of-N: run N isolated attempts of one hard task, each in its own git
+   * worktree with a distinct strategy, judge them objectively by the gate, merge
+   * the winner into the live tree, and discard the rest. Returns false (→ run a
+   * single normal worker) if no worktree could be created or the winner won't
+   * merge cleanly. The code analog of the forecast ensemble: independent
+   * attempts + an objective selector beat one cheap-model shot.
+   */
+  private async runEnsemble(task: Task): Promise<boolean> {
+    const n = Math.min(task.ensemble ?? 2, Math.max(2, this.cfg.codeEnsembleN ?? 3));
+    const exec = this.sandbox.exec.bind(this.sandbox);
+    this.journal.append("log", { level: "info", msg: `best-of-${n}: ${task.id} — ${n} isolated worktree attempts, judged by the gate` });
+    // All attempts branch from the live HEAD; diff each attempt against THAT exact
+    // base (not HEAD~1, which is wrong for a no-commit attempt and undefined at root).
+    const baseSha = ((await exec("git rev-parse HEAD 2>/dev/null", { cwd: this.sandbox.workdir, timeoutSec: 15, signal: this.ac.signal })).out ?? "").trim().split("\n")[0] || "HEAD";
+    type Att = { i: number; wtPath: string; branch: string; report?: string; ok: boolean; score: number; summary: string; changed: number; committed: boolean };
+    const settled = await Promise.all(
+      Array.from({ length: n }, (_, i) => i).map(async (i): Promise<Att | null> => {
+        const branch = `swarm-ens/${task.id.toLowerCase()}-${i}-${rid("e")}`;
+        const wtPath = `${this.sandbox.workdir.replace(/\/+$/, "")}-ens-${task.id}-${i}`;
+        // git worktree add/remove mutate shared .git state — serialize the plumbing
+        // through the git mutex; the agent run + gate (per-worktree) stay parallel.
+        const created = await this.withGit(() => gitAddWorktree(exec, this.sandbox.workdir, { path: wtPath, branch, signal: this.ac.signal }));
+        if (!created) return null;
+        let report: string | undefined;
+        try {
+          report = await this.runCodeAttempt(task, i, n, wtPath);
+        } catch {
+          /* attempt crashed — it still gets scored (likely 0) and discarded */
+        }
+        const sha = await this.withGit(() => gitCommitGreen(exec, wtPath, `ensemble ${task.id} attempt ${i}`, this.ac.signal));
+        const committed = Boolean(sha); // an attempt that changed nothing produced no commit
+        const gate = await this.runGateChecks(wtPath);
+        // Files this attempt actually changed vs the shared base (0 ⇒ no-op).
+        const changed = committed ? (await gitDiffSince(exec, wtPath, baseSha, this.ac.signal)).length : 0;
+        return { i, wtPath, branch, report, ok: gate.green, score: this.scoreGate(gate), summary: clip(gate.summary, 300), changed, committed };
+      })
+    );
+    const attempts = settled.filter((a): a is Att => a !== null);
+    if (!attempts.length) {
+      this.journal.append("log", { level: "warn", msg: `best-of-N: no worktree could be created for ${task.id} — running a single worker` });
+      return false;
+    }
+    // Only real candidates can win: they produced changes AND scored above zero
+    // (a no-op attempt or an all-red attempt must never merge-and-be-called-done).
+    const candidates = attempts.filter((a) => a.committed && a.score > 0);
+    // Winner: best gate score; tie → the most surgical diff (fewest files changed).
+    const ranked = candidates.length ? candidates : [];
+    ranked.sort((a, b) => b.score - a.score || a.changed - b.changed);
+    const winner = ranked[0];
+    if (!winner) {
+      for (const a of attempts) await this.withGit(() => gitRemoveWorktree(exec, this.sandbox.workdir, a.wtPath, a.branch, this.ac.signal));
+      this.journal.append("code.ensemble", { taskId: task.id, n, winner: -1, merged: false, scores: attempts.map((a) => ({ i: a.i, score: a.score, green: a.ok, changed: a.changed })) });
+      this.journal.append("log", { level: "warn", msg: `best-of-N: no attempt produced a passing change for ${task.id} — falling back to a single worker on the live tree` });
+      return false;
+    }
+    const merged = await this.withGit(() => gitMergeWorktreeBranch(exec, this.sandbox.workdir, winner.branch, this.ac.signal));
+    for (const a of attempts) await this.withGit(() => gitRemoveWorktree(exec, this.sandbox.workdir, a.wtPath, a.branch, this.ac.signal));
+    this.journal.append("code.ensemble", {
+      taskId: task.id,
+      n,
+      winner: winner.i,
+      merged,
+      scores: attempts.map((a) => ({ i: a.i, score: a.score, green: a.ok, changed: a.changed })),
+    });
+    if (!merged) {
+      this.journal.append("log", { level: "warn", msg: `best-of-N: winner of ${task.id} did not merge cleanly — running a single worker on the live tree` });
+      return false;
+    }
+    const report =
+      (winner.report ? winner.report + "\n\n" : "") +
+      `[best-of-${n}] selected attempt ${winner.i} of ${attempts.length} (gate ${winner.ok ? "GREEN" : "best-effort"}, ${winner.changed} files). Gate: ${winner.summary}`;
+    task.report = report;
+    task.reportStatus = "done";
+    this.journal.append("task.report", { taskId: task.id, status: "done", report, artifacts: task.artifacts });
+    // A green winner left the merged tree compiling — commit it like a verified task.
+    if (winner.ok) await this.commitGreen(`${task.id} best-of-${n}: ${oneLine(task.title, 80)}`, task.id);
+    this.finalizeTask(task, "done", report);
+    return true;
+  }
+
+  /** Run one isolated best-of-N attempt in a worktree; returns the worker's report text (or undefined). */
+  private async runCodeAttempt(task: Task, idx: number, total: number, wtPath: string): Promise<string | undefined> {
+    const agentId = rid("w");
+    task.agentIds.push(agentId);
+    const strategy = Executor.ENSEMBLE_STRATEGIES[idx % Executor.ENSEMBLE_STRATEGIES.length];
+    const system = workerSystem({
+      agentId,
+      role: task.role,
+      meta: this.meta,
+      task,
+      maxSteps: this.meta.options.maxStepsPerTask,
+      depReports: this.depReportsFor(task, false),
+      blackboard: "", // isolated attempt — no shared blackboard, like a forecast panelist
+      operatorNotes: this.peekOperatorNotes(),
+      dirListing: this.topListing(),
+      extraCraft: `${strategy}\nYou are isolated attempt ${idx + 1} of ${total} in your OWN private copy of the repo — implement the task fully and independently; another attempt may solve it differently and the best one wins.`,
+      terminalName: "report",
+      repoProfile: this.repoProfile,
+      repoMap: this.repoMap,
+      ownedFiles: task.ownedFiles,
+    });
+    const timeoutMs = this.meta.options.taskTimeoutMs ?? 1_200_000;
+    const deadline = withTimeout(this.ac.signal, timeoutMs);
+    this.journal.append("agent.spawned", { agentId, taskId: task.id, role: task.role, model: this.resolveModel(task.modelTier), purpose: `${task.title} (best-of-${total} #${idx})` });
+    try {
+      const outcome = await runAgent({
+        cfg: this.cfg,
+        agentId,
+        model: this.resolveModel(task.modelTier),
+        thinking: this.meta.options.thinking,
+        reasoningEffort: this.meta.options.reasoningEffort,
+        system,
+        kickoff: WORKER_KICKOFF,
+        tools: codeWorkerToolset(this.cfg),
+        terminal: [REPORT_TOOL],
+        maxSteps: this.meta.options.maxStepsPerTask,
+        signal: deadline.signal,
+        // Isolated attempt (like a forecaster panelist): own worktree (no write
+        // guard — collisions can't happen), and NO shared blackboard/notes so
+        // parallel attempts stay independent and the diversity is real.
+        ctx: {
+          ...this.makeToolCtx(agentId, task, deadline.signal, wtPath),
+          readBlackboard: () => "",
+          searchNotes: undefined,
+          addNote: () => {}, // an attempt's notes must not leak to siblings or the live run
+        },
+        hooks: this.agentHooks(agentId, task.id, task),
+        stop: this.agentStop,
+      });
+      this.flushDeltas(agentId);
+      this.journal.append("agent.done", { agentId, taskId: task.id, steps: outcome.steps });
+      const args = outcome.terminal?.args as Record<string, unknown> | undefined;
+      return args?.report_markdown ? String(args.report_markdown) : outcome.finalText || undefined;
+    } finally {
+      deadline.dispose();
+    }
+  }
+
   /** Returns "retry" to request another attempt, or "done" when finalized. */
   private async runWorker(task: Task): Promise<"retry" | "done"> {
+    // Best-of-N: a hard code task runs as N isolated worktree attempts, judged
+    // by the gate; the winner is merged into the live tree. Only when the engine
+    // controls git (sandbox / clean branch) — otherwise fall through to one worker.
+    if (task.ensemble && this.codeMode() && this.codeEnsembleEnabled() && this.codeCommit && !this.ac.signal.aborted) {
+      const ran = await this.runEnsemble(task);
+      if (ran) return "done";
+      // worktrees unavailable → fall through to a single normal worker
+    }
     const agentId = rid("w");
     const model = this.resolveModel(task.modelTier);
     task.agentIds.push(agentId);
@@ -3039,6 +3684,8 @@ PROTOCOL
         : undefined,
       terminalName: isForecaster ? "submit_forecast" : "report",
       repoProfile: this.codeMode() ? this.repoProfile : undefined,
+      repoMap: this.codeMode() ? this.repoMap : undefined,
+      ownedFiles: this.codeMode() ? task.ownedFiles : undefined,
     });
     const workerCtx = (signal: AbortSignal): ToolCtx =>
       isForecaster
@@ -3245,7 +3892,7 @@ PROTOCOL
       if (!pass) return "retry";
       // Commit-on-green: a verified code task left the tree in a known-good state.
       // The engine (never the worker) commits it, so an interrupt resumes compiling.
-      await this.commitGreen(`${task.id} verified: ${oneLine(task.title, 80)}`);
+      await this.commitGreen(`${task.id} verified: ${oneLine(task.title, 80)}`, task.id);
     }
 
     this.finalizeTask(task, "done", report);
@@ -3303,7 +3950,7 @@ PROTOCOL
   }
 
   /** Code mode: commit the tree after a passing verify / green-gate. Best-effort; never throws. */
-  private async commitGreen(message: string): Promise<void> {
+  private async commitGreen(message: string, taskId?: string): Promise<void> {
     if (!this.codeMode() || !this.codeCommit) return;
     // `git add -A` stages the WHOLE tree, so committing while other tasks are
     // mid-edit would capture their unverified, possibly non-compiling work — and
@@ -3317,7 +3964,7 @@ PROTOCOL
       );
       if (sha) {
         this.resumeResetSha = sha;
-        this.journal.append("code.checkpoint", { sha, message: oneLine(message, 120) });
+        this.journal.append("code.checkpoint", { sha, taskId, message: oneLine(message, 120) });
       }
     } catch (e) {
       this.journal.append("log", { level: "warn", msg: `commit-on-green failed: ${errMsg(e)}` });
@@ -3513,7 +4160,7 @@ PROTOCOL
     // teams share this array by reference.
     for (let i = this.notes.length - 1; i >= 0; i--) {
       const n = this.notes[i];
-      if (n.kind === "claim" && n.taskId === task.id && n.teamId === this.teamId) this.notes.splice(i, 1);
+      if ((n.kind === "claim" || n.kind === "lock") && n.taskId === task.id && n.teamId === this.teamId) this.notes.splice(i, 1);
     }
     this.journal.append("task.status", { taskId: task.id, status, attempt: task.attempt, reason });
     this.settledSinceUpdate.push(task.id);
@@ -3830,7 +4477,7 @@ PROTOCOL
             sources: sourcesText,
           }) +
           (this.aggregates.size ? `\n${forecastSynthAddendum(this.forecastBlocks(), this.aggregates.size, this.forecastBrief, this.forecastSimBlock())}` : "") +
-          (this.codeMode() && this.repoProfile ? `\n${codeSynthAddendum(this.repoProfile, this.lastGateSummary || undefined)}` : ""),
+          (this.codeMode() && this.repoProfile ? `\n${codeSynthAddendum(this.repoProfile, this.lastGateSummary || undefined, this.acceptanceItems)}` : ""),
         kickoff: SYNTH_KICKOFF,
         tools: synthToolset(),
         terminal: [SUBMIT_FINAL_TOOL],
@@ -4050,6 +4697,21 @@ function inferRole(spec: TaskSpec): string {
   if (/\b(analy|compare|evaluate|benchmark)\b/.test(s)) return "analyst";
   if (/\b(code|implement|build|fix|refactor|api|function|component)\b/.test(s)) return "coder";
   return "generalist";
+}
+
+/** Code mode: the files a spawn spec declares its task owns (accepts files / owned_files / ownedFiles). */
+function codeOwnedFiles(spec: TaskSpec & { owned_files?: unknown; ownedFiles?: unknown }): string[] | undefined {
+  const raw = spec.files ?? spec.owned_files ?? spec.ownedFiles;
+  if (!Array.isArray(raw)) return undefined;
+  const files = raw.map((f) => String(f).trim()).filter(Boolean);
+  return files.length ? files : undefined;
+}
+
+/** Code mode: the best-of-N ensemble size a spawn spec requests, clamped to [2, cap]. */
+function codeEnsembleN(spec: TaskSpec, cap: number): number | undefined {
+  const n = Number(spec.ensemble);
+  if (!Number.isFinite(n) || n < 2) return undefined;
+  return Math.min(Math.max(2, Math.round(n)), Math.max(2, cap));
 }
 
 function safeArgs(s: string): Record<string, unknown> {
