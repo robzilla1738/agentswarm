@@ -205,7 +205,8 @@ src/                         TypeScript engine (zero runtime deps)
   agent.ts      the agent loop: stream → tool calls → results → repeat, with compaction
   executor.ts   the orchestrator: conductor loop, parallel scheduler, verify, synth, budget
   tools.ts      worker toolbelt (shell, files, web, blackboard, artifacts) + safety + grep/replace + run_check (code mode)
-  codeintel.ts  code-mode repo intelligence: deterministic recon → RepoProfile (build/test/lint command detection), check-output parsing, and the commit-on-green/branch-safety git primitives
+  codeintel.ts  code-mode repo intelligence: deterministic recon → RepoProfile (build/test/lint detection), check-output parsing, the validated BuildPlan partition (partitionWaves) + repo symbol-map, and the commit-on-green / worktree / branch-safety git primitives
+  codeledger.ts cross-run repo memory: per-repo confirmed commands/conventions keyed by repo identity + manifest hash (bootstraps recon next run)
   webtools.ts   web search/fetch: SearchKit → TinyFish → DuckDuckGo fallback chain, with cooldowns + reformulation
   searchcore.ts search ranking (freshness boost, academic intent, primary-source up-rank) + academic engines (arXiv/Crossref/Semantic Scholar/PubMed)
   pdftext.ts    PDF text extraction (zero deps, zlib only)
@@ -229,8 +230,8 @@ ui/             Next.js 15 + Tailwind 4 web app (static-exported, served by the 
   app/settings/page.tsx Test buttons for crawl/search backends, key management
   app/forecasts/page.tsx Forecast ledger, stat cards, reliability diagram, resolve buttons
 test/           end-to-end test with a scripted mock model (no API key needed)
-  e2e.js        24 phases covering the full pipeline, including citations + force + resume + budget + verify + teams + forecast + scenario simulation
-  unit/*.test.js individual suites for tools, crawl, memory, pdftext, webtools, searchcore, citations, forecast math, sports line anchoring + resolution, scenario simulation
+  e2e.js        31 phases covering the full pipeline, including citations + force + resume + budget + verify + teams + forecast + scenario simulation + code mode (brownfield, best-of-N ensemble, engine repair, honest-unverified, ensemble fallback, greenfield)
+  unit/*.test.js individual suites for tools, crawl, memory, pdftext, webtools, searchcore, citations, forecast math, sports line anchoring + resolution, scenario simulation, and code mode (codeintel partition/repo-map, codeledger, lock-key normalization, resume reducer)
 ```
 
 ## Testing
