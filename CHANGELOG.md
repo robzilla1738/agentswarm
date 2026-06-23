@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.22.0
+
+Code (build) mode, overhauled so a cheap model produces far-above-its-weight results. The v0.21.0 code mode handed all structure to a cheap conductor and verified only "it compiles"; this release gives it the same discipline that makes forecast mode strong — engine-owned structure, independent executable oracles, and adversarial verification. Full feature doc: [`docs/code-mode.md`](docs/code-mode.md).
+
+### Engine-owned structure
+- **BuildPlan + deterministic partition.** Before any implementation, the engine pins a validated module/file partition with conflict-free waves (no two modules own a file, no dependency cycle) and writes a `DESIGN.md`. The conductor implements against it instead of inventing a partition per spawn batch; an invalid plan degrades to the free-form doctrine.
+- **Acceptance criteria as tracked state.** `--accept` text is split into atomic items the spec author, the diff-review critic, and the synthesizer all reason over; "done" is never claimed for an unverified criterion.
+- **Repo symbol-map** injected into every worker, so a cheap model edits with the codebase's structure instead of reinventing helpers or breaking callers.
+
+### Executable oracles + adversarial verification
+- **TDD spec oracle.** The engine seeds a strong-tier spec-test author that writes failing tests from the criteria first; the green-gate then refuses to pass while zero tests ran — "it compiles" is not done. Count-less passing runners (e.g. `go test`) are not falsely red.
+- **Best-of-N ensemble.** A hard task runs N isolated attempts in separate git worktrees with diverse strategies, judged by the gate; the winner merges, the rest are discarded. No-op or all-red attempts never win — it falls back to a single worker.
+- **Engine-driven repair.** A red green-gate spawns the engine's own targeted fix task (bisected to files changed since the last green commit, escalated to the strong tier on a repeat), not a conductor round-trip.
+- **Adversarial diff-review.** Once green, a blind strong critic judges the actual diff against the criteria and correctness/security/convention rubrics — what "green" hides — and reopens the loop on real findings.
+- **Cross-run repo memory.** Confirmed commands/conventions persist per repo so run N+1 starts where run N ended.
+
+### Hardening + UI
+- **Honest-failure invariants** are pinned by deterministic tests: 0-test-under-TDD ⇒ red, no-command ⇒ UNVERIFIED (never a fake green, no commit), hard write-lock can't be dodged by absolute/`..` paths, ensemble fallback recovers, resume restores criteria/plan/baseline. The full unit + e2e suite covers greenfield, brownfield, repair, unverified, ensemble, and ensemble-fallback paths.
+- **Build pipeline UI panel** (`CodePanel`) surfaces the criteria, pinned plan/waves, TDD/repo-map status, gate + review outcomes, and best-of-N results live from the journal.
+
 ## 0.20.0
 
 A UI release: the live web UI now visualizes the entire forecast structure the engine already computes — not just the synthesized report afterward — plus an adversarial UI-quality sweep across the dashboard, run view, settings, and ledger. No engine or forecasting-math changes; the numbers are identical, the difference is what you can see while a run computes.

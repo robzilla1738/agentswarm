@@ -9,3 +9,4 @@ out/
 ui/next-env.d.ts
 *.tgz
 *.tsbuildinfo
+.supergoal/
