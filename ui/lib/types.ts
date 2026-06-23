@@ -21,7 +21,7 @@ export interface Usage {
   cacheMissTokens: number;
 }
 
-export type RunMode = "research" | "forecast";
+export type RunMode = "research" | "forecast" | "code";
 export type ForecastKind = "binary" | "numeric" | "mc" | "date";
 
 export interface Quantiles {

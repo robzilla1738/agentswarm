@@ -20,10 +20,14 @@ import {
   synthToolset,
   verifierToolset,
   workerToolset,
+  codeWorkerToolset,
+  codeVerifierToolset,
 } from "./tools";
 import {
   aggregateBlock,
   budgetLine,
+  codeConductorAddendum,
+  codeSynthAddendum,
   completenessPrompt,
   conductorInitialUpdate,
   conductorSystem,
@@ -106,7 +110,8 @@ import { canonicalizeUrl } from "./searchcore";
 import { aggregateSources, renderFinalHtml, sourcesBlock } from "./report";
 import { SandboxRuntime, createSandbox } from "./sandbox";
 import { RunState } from "./state";
-import { AggregateForecast, DomainId, FittedParams, Forecast, ForecastQuestion, MarketAnchor, RunMeta, RunStatus, SimDriver, SourceRef, Task, TaskSpec, Usage, usageCost } from "./types";
+import { formatCheckResult, gitCommitGreen, gitPrepare, gitResetTo, parseCheckOutput, reconRepo } from "./codeintel";
+import { AggregateForecast, CodeCommands, CodeGateResult, DomainId, FittedParams, Forecast, ForecastQuestion, MarketAnchor, RepoProfile, RunMeta, RunStatus, SimDriver, SourceRef, Task, TaskSpec, Usage, usageCost } from "./types";
 import { canonicalArtifactRel, clip, ensureDir, errMsg, oneLine, rid, sleep, truncateMiddle, validateArtifactFormat, withTimeout } from "./util";
 
 
@@ -216,6 +221,18 @@ export class Executor {
    */
   private forecastLedgerByQ = new Map<string, LedgerCreated>();
 
+  /** Code mode: the detected repo profile (set once by planCode, restored on resume). */
+  private repoProfile?: RepoProfile;
+  /** Code mode: whether engine commit-on-green is enabled for this run (disabled on a dirty real repo). */
+  private codeCommit = false;
+  /** Code mode: the git branch the engine commits to (swarm/<runid> on a real repo). */
+  private codeBranch: string | null = null;
+  /** Code mode: a known-green SHA to hard-reset to on resume (SANDBOX-ONLY). */
+  private resumeResetSha?: string;
+  /** Code mode: pre-synthesis green-gate bookkeeping. */
+  private gateRounds = 0;
+  private gatePassDone = false;
+
   /** The primary (first) sub-forecast — back-compat for readers that only need one. */
   private get question(): ForecastQuestion | null {
     return this.questions[0] ?? null;
@@ -314,6 +331,13 @@ export class Executor {
     for (const q of this.questions) {
       if (q.id && this.aggregates.has(q.id)) this.panelTasksByQ.set(q.id, this.panelFromTasks(q.id));
     }
+    // Code mode: rehydrate the recon profile (so recon never re-runs), the
+    // commit-on-green decision + branch, and the last known-green SHA (the
+    // sandbox resume-reset target). On the host the tree is never reset.
+    this.repoProfile = state.repoProfile;
+    this.codeCommit = state.codeCommitEnabled;
+    this.codeBranch = state.codeBranch;
+    this.resumeResetSha = state.lastGreenSha;
     this.spentTokens = state.totalUsage.promptTokens + state.totalUsage.completionTokens;
     this.cost = state.cost;
     try {
@@ -435,6 +459,13 @@ export class Executor {
         await this.fail(this.fatal);
         return;
       }
+
+      // Code-mode resume re-asserts git invariants (planCode / gitPrepare's
+      // guardrail does NOT re-run on resume — the profile is restored from the
+      // journal — so the guarantees must be re-established here before any commit).
+      if (this.resumed && this.codeMode()) {
+        await this.reassertCodeGitOnResume();
+      }
     }
 
     // Operator control must land while agents are mid-task, not only when the
@@ -452,17 +483,25 @@ export class Executor {
     // (Resumed runs already re-read it from the journal in seedFromState.)
     if (this.forecastMode() && !this.questions.length) {
       await this.planForecast();
+    } else if (this.codeMode() && !this.repoProfile) {
+      await this.planCode();
     }
     const forecastDoctrine =
       this.forecastMode() && this.questions.length
         ? `\n\n${forecastConductorAddendum(this.questions, this.panelSize(), this.safeCalibrationBlock(), Boolean(this.meta.options.forecastOrigin), this.forecastBrief)}`
+        : "";
+    // Code doctrine overrides the generic "go wide with scouts" research doctrine
+    // (appended AFTER conductorSystem, so it wins by recency).
+    const codeDoctrine =
+      this.codeMode() && this.repoProfile
+        ? `\n\n${codeConductorAddendum(this.repoProfile, this.meta.options.acceptanceCriteria)}`
         : "";
 
     // Real-directory runs remember: prior missions in the same workspace feed
     // the conductor so it builds on settled decisions instead of starting cold.
     const memory = this.mode === "root" && !this.meta.sandbox ? memoryBlock(this.meta.cwd) : "";
     this.conductorMessages = [
-      { role: "system", content: conductorSystem(this.meta) + forecastDoctrine + (memory ? `\n\n${memory}` : "") },
+      { role: "system", content: conductorSystem(this.meta) + forecastDoctrine + codeDoctrine + (memory ? `\n\n${memory}` : "") },
       {
         role: "user",
         content: this.resumed
@@ -499,6 +538,10 @@ export class Executor {
       // Strict verification: one completeness review before synthesis; if it
       // finds real gaps the conductor gets one chance to fill them.
       if (await this.completenessPass()) await this.mainLoop();
+      // Code mode: the engine green-gate runs the real build+test once the run
+      // is quiescent; on RED the conductor gets up to codeGateMaxRounds to fix
+      // the tree before synthesis ships it.
+      while (await this.greenGate()) await this.mainLoop();
     } catch (e) {
       if (!this.ac.signal.aborted) {
         this.journal.append("log", { level: "error", msg: `executor error: ${errMsg(e)}` });
@@ -577,6 +620,66 @@ export class Executor {
   /** Forecast behavior is root-only: team sub-swarms inherit meta.options but never run the pipeline. */
   private forecastMode(): boolean {
     return this.mode === "root" && (this.meta.options.mode ?? "research") === "forecast";
+  }
+
+  /** Code (build) behavior is root-only — like forecast, a team inherits the mode but never runs the pipeline. */
+  private codeMode(): boolean {
+    return this.mode === "root" && this.meta.options.mode === "code";
+  }
+
+  /** Code mode: per-run green-gate / commit toggles (per-run option → cfg default). */
+  private codeGateEnabled(): boolean {
+    return this.meta.options.codeGreenGate ?? this.cfg.codeGreenGate;
+  }
+
+  /**
+   * Code mode pre-step (the planForecast analog): recon the repo deterministically
+   * and decide commit-on-green, ALL before the conductor's first turn. No LLM call —
+   * the build spec rides meta.options.acceptanceCriteria and the conductor's own
+   * update_plan. Resumed runs restore the profile from the journal and skip this.
+   */
+  private async planCode(): Promise<void> {
+    const greenfield: RepoProfile = {
+      greenfield: true,
+      primaryLanguage: null,
+      packageManager: null,
+      framework: null,
+      commands: {},
+      monorepo: { tool: null, packages: [] },
+      git: { isRepo: false, branch: null, dirty: false },
+      conventions: [],
+      manifestFiles: [],
+    };
+    const exec = this.sandbox.exec.bind(this.sandbox);
+    this.repoProfile = this.meta.options.codeGreenfield
+      ? greenfield
+      : await reconRepo(exec, this.sandbox.workdir, this.ac.signal);
+
+    // Commit-on-green, with the three-tier brownfield guardrail (gitPrepare
+    // refuses on a dirty real repo and never touches operator config).
+    const autoCommit = this.meta.options.codeAutoCommit ?? this.cfg.codeAutoCommit;
+    if (autoCommit) {
+      const prep = await gitPrepare(exec, this.sandbox.workdir, {
+        isSandbox: this.meta.sandbox,
+        runId: this.meta.id,
+        signal: this.ac.signal,
+      });
+      this.codeCommit = prep.ok;
+      this.codeBranch = prep.branch;
+      this.journal.append("log", {
+        level: prep.ok ? "info" : "warn",
+        msg: prep.ok ? `code mode: commit-on-green to ${prep.branch}` : `commit-on-green disabled: ${prep.reason}`,
+      });
+    }
+
+    this.journal.append("code.plan", { profile: this.repoProfile, commit: this.codeCommit, branch: this.codeBranch });
+    const p = this.repoProfile;
+    this.journal.append("log", {
+      level: "info",
+      msg: p.greenfield
+        ? "code mode: greenfield build (empty working directory)"
+        : `code mode: ${p.primaryLanguage ?? "unknown stack"}${p.framework ? ` (${p.framework})` : ""} · build=${p.commands.build ?? "?"} · test=${p.commands.test ?? "?"}`,
+    });
   }
 
   private panelSize(): number {
@@ -2145,6 +2248,110 @@ PROTOCOL
     return false;
   }
 
+  /** Code mode: the last green-gate's summary, fed to the synthesizer as test evidence. */
+  private lastGateSummary = "";
+
+  /**
+   * Code-mode green-gate: at run quiescence (the only true barrier — currentWave
+   * is a spawn counter, not a barrier), run the detected build → typecheck → test
+   * once. On RED, return the failures to the conductor for a bounded number of fix
+   * rounds. Returns true when it reopened the loop (the caller runs mainLoop again).
+   */
+  private async greenGate(): Promise<boolean> {
+    if (!this.codeMode() || !this.codeGateEnabled() || this.gatePassDone) return false;
+    if (this.fatal || this.ac.signal.aborted || this.budgetExceeded()) return false;
+    if (this.finishReason.includes("cancel") || this.finishReason.includes("conductor unavailable")) return false;
+    if (!this.taskList().some((t) => t.status === "done")) return false;
+
+    // The gate runs the real build/test against the LIVE tree — quiesce first so
+    // it never reads (or commits) a tree a concurrent worker is mid-write on.
+    if (this.inflight.size) await Promise.allSettled([...this.inflight.values()]);
+
+    // Refresh commands if none are known yet (a greenfield run that has since
+    // scaffolded a project) so the gate has something real to run.
+    if (this.repoProfile && !Object.values(this.repoProfile.commands).some(Boolean)) {
+      try {
+        const fresh = await reconRepo(this.sandbox.exec.bind(this.sandbox), this.sandbox.workdir, this.ac.signal);
+        if (Object.values(fresh.commands).some(Boolean)) this.repoProfile = fresh;
+      } catch {
+        /* keep the existing profile */
+      }
+    }
+
+    const result = await this.runGateChecks();
+    this.journal.append("code.gate", { green: result.green, skipped: result.skipped ?? false, summary: clip(result.summary, 2000) });
+
+    // No build/test command detected: the tree was NOT verified. Never claim
+    // green or make a "green-gate passed" commit — tell the synth honestly.
+    if (result.skipped) {
+      this.gatePassDone = true;
+      this.lastGateSummary = "UNVERIFIED — no build/typecheck/test command was detected; the tree was not gate-checked.";
+      return false;
+    }
+    this.lastGateSummary = result.summary;
+    if (result.green) {
+      this.gatePassDone = true;
+      await this.commitGreen("green-gate passed");
+      return false;
+    }
+    const maxRounds = this.cfg.codeGateMaxRounds ?? 2;
+    if (this.gateRounds >= maxRounds) {
+      this.gatePassDone = true; // out of rounds — ship with an honest red note in the report
+      this.journal.append("log", { level: "warn", msg: "green-gate still red after max fix rounds — shipping with known failures" });
+      return false;
+    }
+    this.gateRounds++;
+    this.finishing = false;
+    this.appendConductorUpdate(
+      `GREEN-GATE RED before synthesis (fix round ${this.gateRounds}/${maxRounds}). The integrated tree does not build/test clean:\n${clip(result.summary, 2000)}\n` +
+        "Spawn a focused fix task (verify:true) on the failing files. Do not re-run a failed approach verbatim. This is the final gate before the deliverable ships."
+    );
+    await this.conductorTurn();
+    return this.lastConductorAction === "spawn";
+  }
+
+  /** Run the detected build → typecheck → test, fail-fast, into a structured result. */
+  private async runGateChecks(): Promise<CodeGateResult> {
+    const cmds: CodeCommands = this.repoProfile?.commands ?? {};
+    const order: (keyof CodeCommands)[] = ["build", "typecheck", "test"];
+    const ran: CodeGateResult["ran"] = [];
+    const parts: string[] = [];
+    let green = true;
+    for (const check of order) {
+      const cmd = cmds[check];
+      if (!cmd) continue;
+      let out: string;
+      let code: number | null;
+      let timedOut = false;
+      try {
+        const r = await this.sandbox.exec(cmd, { cwd: this.sandbox.workdir, timeoutSec: 600, signal: this.ac.signal });
+        out = r.out;
+        code = r.code;
+        timedOut = r.timedOut;
+      } catch (e) {
+        parts.push(`${check} (${cmd}): ERROR — ${errMsg(e)}`);
+        ran.push({ check, pass: false, failed: 1, total: 1 });
+        green = false;
+        break;
+      }
+      if (timedOut) {
+        parts.push(`${check} (${cmd}): TIMED OUT after 600s`);
+        ran.push({ check, pass: false, failed: 1, total: 1 });
+        green = false;
+        break;
+      }
+      const parsed = parseCheckOutput(check, out, code);
+      ran.push({ check, pass: parsed.pass, failed: parsed.failed, total: parsed.total });
+      parts.push(formatCheckResult(check, cmd, parsed, "—"));
+      if (!parsed.pass) {
+        green = false;
+        break; // fail-fast: no point running tests on a broken build
+      }
+    }
+    if (!ran.length) return { green: false, skipped: true, summary: "no build/typecheck/test command detected — green-gate skipped (tree NOT verified)", ran };
+    return { green, summary: parts.join("\n"), ran };
+  }
+
   // ---------------------------------------------------------------- conductor
 
   private nextId(): number {
@@ -2667,6 +2874,8 @@ PROTOCOL
       agentId,
       taskId: task?.id,
       signal,
+      // Code mode: the detected build/test commands so run_check needs no re-detect.
+      codeCommands: this.repoProfile?.commands,
       addCheckpoint: task ? (summary) => this.recordCheckpoint(task, agentId, summary) : undefined,
       addNote: (text, key, kind, url) => {
         this.notes.push({ taskId: task?.id, teamId: this.teamId, key, kind, text, url });
@@ -2829,6 +3038,7 @@ PROTOCOL
             .join("\n\n") || undefined
         : undefined,
       terminalName: isForecaster ? "submit_forecast" : "report",
+      repoProfile: this.codeMode() ? this.repoProfile : undefined,
     });
     const workerCtx = (signal: AbortSignal): ToolCtx =>
       isForecaster
@@ -2867,7 +3077,7 @@ PROTOCOL
         reasoningEffort: this.meta.options.reasoningEffort,
         system,
         kickoff: isForecaster ? FORECASTER_KICKOFF : WORKER_KICKOFF,
-        tools: workerToolset(this.cfg),
+        tools: this.codeMode() ? codeWorkerToolset(this.cfg) : workerToolset(this.cfg),
         terminal: isForecaster && taskQ ? [submitForecastTool(taskQ.kind, taskQ.options)] : [REPORT_TOOL],
         maxSteps: this.meta.options.maxStepsPerTask,
         signal: deadline.signal,
@@ -3033,10 +3243,85 @@ PROTOCOL
       }
       const pass = await this.runVerifier(task);
       if (!pass) return "retry";
+      // Commit-on-green: a verified code task left the tree in a known-good state.
+      // The engine (never the worker) commits it, so an interrupt resumes compiling.
+      await this.commitGreen(`${task.id} verified: ${oneLine(task.title, 80)}`);
     }
 
     this.finalizeTask(task, "done", report);
     return "done";
+  }
+
+  /**
+   * Resume safety for code mode: planCode (and gitPrepare's guardrail) does NOT
+   * re-run on resume, so re-establish the invariants before any commit fires.
+   *  - sandbox: hard-reset the tree to the last known-green commit (safe — ours).
+   *  - real --cwd: NEVER reset; keep committing only if HEAD is still the run's
+   *    work branch. If the operator switched branches, disable commit-on-green so
+   *    we never commit onto their branch.
+   */
+  private async reassertCodeGitOnResume(): Promise<void> {
+    if (!this.codeMode()) return;
+    const exec = this.sandbox.exec.bind(this.sandbox);
+    if (this.meta.sandbox) {
+      if (this.resumeResetSha) {
+        const ok = await this.withGit(() => gitResetTo(exec, this.sandbox.workdir, this.resumeResetSha!, this.ac.signal));
+        this.journal.append("log", {
+          level: ok ? "info" : "warn",
+          msg: ok ? `code mode: resumed at last green commit ${this.resumeResetSha}` : `could not reset to green commit ${this.resumeResetSha}`,
+        });
+      }
+      return;
+    }
+    // Real operator directory: never reset their tree. Only continue committing
+    // if HEAD is still the branch we created — otherwise we'd commit to theirs.
+    if (!this.codeCommit) return;
+    try {
+      const r = await exec("git rev-parse --abbrev-ref HEAD 2>/dev/null", { cwd: this.sandbox.workdir, timeoutSec: 15, signal: this.ac.signal });
+      const head = (r.out ?? "").trim();
+      if (this.codeBranch && head !== this.codeBranch) {
+        this.codeCommit = false;
+        this.journal.append("log", {
+          level: "warn",
+          msg: `commit-on-green disabled on resume: HEAD is "${head}", not the run's branch "${this.codeBranch}"`,
+        });
+      }
+    } catch {
+      this.codeCommit = false; // can't verify the branch → fail closed, never commit
+    }
+  }
+
+  /** Serializes engine-owned git ops so concurrent commit-on-green calls never collide on .git/index.lock. */
+  private gitMutex: Promise<void> = Promise.resolve();
+  private withGit<T>(fn: () => Promise<T>): Promise<T> {
+    const result = this.gitMutex.then(fn, fn);
+    this.gitMutex = result.then(
+      () => undefined,
+      () => undefined
+    );
+    return result;
+  }
+
+  /** Code mode: commit the tree after a passing verify / green-gate. Best-effort; never throws. */
+  private async commitGreen(message: string): Promise<void> {
+    if (!this.codeMode() || !this.codeCommit) return;
+    // `git add -A` stages the WHOLE tree, so committing while other tasks are
+    // mid-edit would capture their unverified, possibly non-compiling work — and
+    // a sandbox resume would hard-reset to exactly that tree. Only commit when
+    // this is the sole in-flight task (per-task verify = 1 [itself], drained
+    // green-gate = 0); otherwise a later sole-task commit or the gate captures it.
+    if (this.inflight.size > 1) return;
+    try {
+      const sha = await this.withGit(() =>
+        gitCommitGreen(this.sandbox.exec.bind(this.sandbox), this.sandbox.workdir, message, this.ac.signal)
+      );
+      if (sha) {
+        this.resumeResetSha = sha;
+        this.journal.append("code.checkpoint", { sha, message: oneLine(message, 120) });
+      }
+    } catch (e) {
+      this.journal.append("log", { level: "warn", msg: `commit-on-green failed: ${errMsg(e)}` });
+    }
   }
 
   /** True iff `p` is a non-empty regular file — directories never count as artifacts. */
@@ -3126,7 +3411,7 @@ PROTOCOL
       reasoningEffort: this.meta.options.reasoningEffort,
       system: verifierSystem(this.meta, task, this.depReportsFor(task)),
       kickoff,
-      tools: verifierToolset(),
+      tools: this.codeMode() ? codeVerifierToolset() : verifierToolset(),
       terminal: [VERDICT_TOOL],
       maxSteps: Math.min(14, this.meta.options.maxStepsPerTask),
       signal: this.ac.signal,
@@ -3543,7 +3828,9 @@ PROTOCOL
             artifactList,
             reason: this.finishReason || "completed",
             sources: sourcesText,
-          }) + (this.aggregates.size ? `\n${forecastSynthAddendum(this.forecastBlocks(), this.aggregates.size, this.forecastBrief, this.forecastSimBlock())}` : ""),
+          }) +
+          (this.aggregates.size ? `\n${forecastSynthAddendum(this.forecastBlocks(), this.aggregates.size, this.forecastBrief, this.forecastSimBlock())}` : "") +
+          (this.codeMode() && this.repoProfile ? `\n${codeSynthAddendum(this.repoProfile, this.lastGateSummary || undefined)}` : ""),
         kickoff: SYNTH_KICKOFF,
         tools: synthToolset(),
         terminal: [SUBMIT_FINAL_TOOL],

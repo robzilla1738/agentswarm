@@ -1,10 +1,10 @@
 {
   "name": "@robzilla1738/agentswarm",
-  "version": "0.20.0",
+  "version": "0.21.0",
   "publishConfig": {
     "access": "public"
   },
-  "description": "Local agent swarm: a conductor model splits missions into parallel sub-agents with real tools, optional sandboxes, and a localhost web UI. Works with DeepSeek, OpenAI, Anthropic, Grok, MiniMax, OpenRouter, Ollama, and LM Studio.",
+  "description": "Local agent swarm: a conductor model splits missions into parallel sub-agents with real tools, optional sandboxes, and a localhost web UI. Research, forecasting, and software-build (code) modes. Works with DeepSeek, OpenAI, Anthropic, Grok, MiniMax, OpenRouter, Ollama, and LM Studio.",
   "license": "MIT",
   "repository": {
     "type": "git",

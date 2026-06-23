@@ -18,8 +18,9 @@ export type TaskStatus =
 
 export type Verification = "off" | "normal" | "strict";
 
-/** What kind of run this is. Forecast runs follow the superforecasting pipeline. */
-export type RunMode = "research" | "forecast";
+/** What kind of run this is. Forecast runs follow the superforecasting pipeline;
+ *  code runs follow the software-engineering pipeline (recon → build → green-gate). */
+export type RunMode = "research" | "forecast" | "code";
 
 /**
  * Binary questions resolve YES/NO; numeric to a value; mc to one of a fixed
@@ -455,6 +456,46 @@ export interface FittedParams {
   fitAt: number;
 }
 
+/**
+ * Code mode: the repo's real build/test commands, detected deterministically by
+ * reconRepo (src/codeintel.ts) and injected into the conductor, every worker,
+ * and the green-gate. A missing field means "none detected".
+ */
+export interface CodeCommands {
+  install?: string;
+  build?: string;
+  typecheck?: string;
+  test?: string;
+  lint?: string;
+}
+
+/**
+ * Code mode: the deterministic recon of the working directory, produced once
+ * before the conductor's first turn and journaled as `code.plan` (restored on
+ * resume so recon never re-runs). Greenfield (empty) dirs skip recon and get
+ * `{ greenfield: true, commands: {} }`.
+ */
+export interface RepoProfile {
+  greenfield: boolean;
+  primaryLanguage: string | null;
+  packageManager: string | null;
+  framework: string | null;
+  commands: CodeCommands;
+  monorepo: { tool: string | null; packages: string[] };
+  git: { isRepo: boolean; branch: string | null; dirty: boolean };
+  conventions: string[];
+  manifestFiles: string[];
+}
+
+/** Code mode: the result of one green-gate run (build → typecheck → test). */
+export interface CodeGateResult {
+  green: boolean;
+  /** True when NO build/typecheck/test command was detected — the tree was NOT verified (distinct from "all passed"). */
+  skipped?: boolean;
+  summary: string;
+  ran: { check: keyof CodeCommands; pass: boolean; failed: number; total: number }[];
+}
+
 export interface RunOptions {
   model: string;
   conductorModel: string;
@@ -467,6 +508,14 @@ export interface RunOptions {
   taskTimeoutMs?: number;
   /** Run mode. Missing on pre-forecast runs — readers default to "research". */
   mode?: RunMode;
+  /** Code mode: free-text acceptance criteria ("done when …") for the whole build. */
+  acceptanceCriteria?: string;
+  /** Code mode: skip repo recon and treat the workdir as greenfield (force a from-scratch build). */
+  codeGreenfield?: boolean;
+  /** Code mode: per-run override of the engine green-gate before synthesis. Undefined → cfg.codeGreenGate. */
+  codeGreenGate?: boolean;
+  /** Code mode: per-run override of engine commit-on-green. Undefined → cfg.codeAutoCommit. */
+  codeAutoCommit?: boolean;
   /** Forecast mode: operator-supplied resolution date (ISO) for the question. */
   resolutionDate?: string;
   /** Forecast mode: independent forecaster panel size (3–11). */
@@ -691,6 +740,9 @@ export interface RunSummary {
  *  forecast.question   { question: ForecastQuestion }           — sharpened question (forecast mode)
  *  forecast.submitted  { taskId, agentId, forecast: Forecast }  — one panelist's forecast
  *  forecast.aggregated { aggregate: AggregateForecast, panel: {taskId,method,probability?,p50?}[], ledgerId? }
+ *  code.plan       { profile: RepoProfile, commit: boolean, branch: string|null } — recon result (code mode)
+ *  code.checkpoint { sha, taskId }                — engine commit-on-green (code mode)
+ *  code.gate       { green: boolean, summary }    — pre-synthesis green-gate result (code mode)
  */
 export interface SwarmEvent {
   seq: number;

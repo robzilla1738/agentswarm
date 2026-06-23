@@ -63,9 +63,14 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
   const [effort, setEffort] = useState("high");
   const [workspace, setWorkspace] = useState<"sandbox" | "dir">("sandbox");
   const [cwd, setCwd] = useState("");
-  const [mode, setMode] = useState<"research" | "forecast">("research");
+  const [mode, setMode] = useState<"research" | "forecast" | "code">("research");
   const [resolutionDate, setResolutionDate] = useState("");
   const [panelSize, setPanelSize] = useState(5);
+
+  // Code (build) mode tunables.
+  const [acceptance, setAcceptance] = useState("");
+  const [codeGate, setCodeGate] = useState(true);
+  const [codeAutoCommit, setCodeAutoCommit] = useState(true);
 
   // Forecast intent + saved models + per-run tunables.
   const [savedModels, setSavedModels] = useState<ForecastModelView[]>([]);
@@ -229,6 +234,13 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
                 },
               }
             : {}),
+          ...(mode === "code"
+            ? {
+                ...(acceptance.trim() ? { acceptanceCriteria: acceptance.trim() } : {}),
+                ...(codeGate ? {} : { codeGreenGate: false }),
+                ...(codeAutoCommit ? {} : { codeAutoCommit: false }),
+              }
+            : {}),
         },
       });
       router.push(`/run?id=${id}`);
@@ -256,6 +268,13 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
         >
           Forecast
         </PresetChip>
+        <PresetChip
+          active={mode === "code"}
+          onClick={() => setMode("code")}
+          title="Build software: recon the repo, fan out on disjoint files, run the detected build/test after every change, commit on green, and gate the tree before shipping a working build"
+        >
+          Code
+        </PresetChip>
       </div>
 
       <textarea
@@ -265,7 +284,9 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
         placeholder={
           mode === "forecast"
             ? 'Ask anything about the future — "Who will win the game tonight?" or "Will X ship before year end?" — and get a calibrated probability from an independent forecaster panel. Leave the date blank and we will infer when it resolves.'
-            : "Describe a mission — the swarm decomposes it into parallel tasks and runs them autonomously."
+            : mode === "code"
+              ? 'Describe what to build — "add a REST API with auth + tests to this Express app" or "build a CLI todo app in Rust". The swarm recons the repo, fans out on disjoint files, keeps the build green, and ships a working tree.'
+              : "Describe a mission — the swarm decomposes it into parallel tasks and runs them autonomously."
         }
         value={mission}
         onChange={(e) => setMission(e.target.value)}
@@ -287,6 +308,29 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
             }}
           />
           <span className="text-2xs text-ink-faint">model & settings tune automatically — open Options to adjust</span>
+        </div>
+      )}
+
+      {mode === "code" && (
+        <div className="mt-3 space-y-2">
+          <textarea
+            className="input resize-none leading-relaxed text-sm"
+            rows={2}
+            placeholder='Acceptance criteria (optional) — "done when: npm test passes, /health returns 200, README documents the endpoints"'
+            value={acceptance}
+            onChange={(e) => setAcceptance(e.target.value)}
+          />
+          <div className="flex flex-wrap items-center gap-3 text-2xs text-ink-faint">
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input type="checkbox" checked={codeGate} onChange={(e) => setCodeGate(e.target.checked)} />
+              green-gate before ship
+            </label>
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input type="checkbox" checked={codeAutoCommit} onChange={(e) => setCodeAutoCommit(e.target.checked)} />
+              commit on green
+            </label>
+            <span>repo build/test commands are detected automatically</span>
+          </div>
         </div>
       )}
 

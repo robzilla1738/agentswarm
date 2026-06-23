@@ -67,7 +67,7 @@ interface Args {
 
 /** Flags that never take a value — they must not swallow the next positional
  *  (`swarm run --fg "mission"` would otherwise eat the mission). */
-const BOOL_FLAGS = new Set(["fg", "open", "resume", "auto", "dry-run", "reforecast", "single", "simulate"]);
+const BOOL_FLAGS = new Set(["fg", "open", "resume", "auto", "dry-run", "reforecast", "single", "simulate", "greenfield"]);
 
 function parseArgs(argv: string[]): Args {
   const _: string[] = [];
@@ -110,6 +110,10 @@ export async function main(): Promise<void> {
         break;
       case "forecast":
         await cmdRun(_.slice(1).join(" "), { ...flags, mode: "forecast" });
+        break;
+      case "code":
+      case "build":
+        await cmdRun(_.slice(1).join(" "), { ...flags, mode: "code" });
         break;
       case "_exec":
         await cmdExec(_[1], Boolean(flags.resume));
@@ -219,11 +223,16 @@ export function optionOverrides(flags: Args["flags"], cfg: SwarmConfig): Partial
   }
   if (flags.safe === false) o.safeMode = false;
   if (typeof flags.mode === "string") {
-    if (!["research", "forecast"].includes(flags.mode)) {
-      throw new Error("--mode must be one of: research | forecast");
+    if (!["research", "forecast", "code"].includes(flags.mode)) {
+      throw new Error("--mode must be one of: research | forecast | code");
     }
     o.mode = flags.mode as RunOptions["mode"];
   }
+  // Code mode tunables.
+  if (typeof flags.accept === "string") o.acceptanceCriteria = flags.accept;
+  if (flags.greenfield === true) o.codeGreenfield = true;
+  if (flags.gate === false) o.codeGreenGate = false;
+  if (flags.commit === false) o.codeAutoCommit = false;
   if (typeof flags.by === "string") {
     if (!ISO_DATE.test(flags.by) || !Number.isFinite(Date.parse(flags.by))) {
       throw new Error("--by must be an ISO date (YYYY-MM-DD)");
@@ -1325,6 +1334,11 @@ ${b("USAGE")}
                                       into several resolvable sub-forecasts; --single forces one.
                                       --simulate runs a grounded scenario Monte Carlo (auto on
                                       decomposed questions): ranked scenarios + a driver tornado
+  swarm code "<build task>" [--accept "<done when>"] [--greenfield] [--no-gate] [--no-commit]
+                                      build software: recon the repo, fan out on disjoint files,
+                                      run the detected build/test after every change, commit on
+                                      green (interrupts resume compiling), gate the tree before
+                                      shipping. Deliverable is a working tree + change summary.
   swarm serve [--port 7777] [--open]  start the mission-control web UI + API
   swarm watch <id>                    attach a live dashboard to a run
   swarm resume <id> [--fg]            resume an interrupted run (done tasks keep their results)

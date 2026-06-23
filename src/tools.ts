@@ -3,7 +3,8 @@ import * as path from "path";
 import { SwarmConfig } from "./config";
 import { ToolSchema } from "./deepseek";
 import { SandboxRuntime } from "./sandbox";
-import { ForecastKind, RunMeta } from "./types";
+import { CodeCommands, ForecastKind, RunMeta } from "./types";
+import { formatCheckResult, parseCheckOutput, reconRepo } from "./codeintel";
 import { crawlSite, resolveCrawlBackend, slugForUrl } from "./crawltools";
 import {
   DataFeed,
@@ -54,6 +55,8 @@ export interface ToolCtx {
    * coalesce into one network call; failures are evicted so they retry.
    */
   webCache?: Map<string, Promise<string>>;
+  /** Code mode: the repo's detected build/test/typecheck/lint commands (run_check uses these). */
+  codeCommands?: CodeCommands;
 }
 
 /** Cache-through helper for webCache: coalesces concurrent calls, evicts failures. */
@@ -944,6 +947,84 @@ export function verifierToolset(): Record<string, ToolDef> {
     list_dir: all.list_dir,
     fetch_url: all.fetch_url,
     web_search: all.web_search,
+  };
+}
+
+/**
+ * The compact build/typecheck/test runner. Defined standalone (NOT inside
+ * workerToolset) so it appears ONLY in the code-mode toolsets — a research or
+ * forecast worker must never carry a code affordance or pay for its schema.
+ */
+export const RUN_CHECK_TOOL: ToolDef = {
+  schema: {
+    name: "run_check",
+    description:
+      "Run the repo's detected build / typecheck / test / lint command and return a COMPACT result — `PASS 142/142` or `FAIL 3/142` plus the first failures — instead of a raw multi-thousand-line log. Use this (not a raw shell test pipeline) to verify your changes: one round-trip, failures already parsed. Code (build) missions only.",
+    parameters: {
+      type: "object",
+      properties: {
+        check: { type: "string", enum: ["build", "typecheck", "test", "lint"], description: "Which check to run" },
+      },
+      required: ["check"],
+    },
+  },
+  run: async (args, ctx) => {
+    const check = String(args.check) as keyof CodeCommands;
+    if (!["build", "typecheck", "test", "lint"].includes(check)) {
+      throw new Error("check must be build | typecheck | test | lint");
+    }
+    let cmd = ctx.codeCommands?.[check];
+    if (!cmd) {
+      // No cached command (greenfield that just scaffolded, or commands not yet
+      // detected) — re-recon once so a freshly created package.json is picked up.
+      try {
+        const prof = await reconRepo(ctx.sandbox.exec.bind(ctx.sandbox), ctx.workdir, ctx.signal);
+        cmd = prof.commands[check];
+      } catch {
+        /* fall through to the no-command message */
+      }
+    }
+    if (!cmd) {
+      return `no ${check} command detected for this repo — establish one (e.g. add a package.json "${check}" script) or run it via shell`;
+    }
+    const t0 = Date.now();
+    const r = await ctx.sandbox.exec(cmd, { cwd: ctx.workdir, timeoutSec: 600, signal: ctx.signal });
+    const dur = ((Date.now() - t0) / 1000).toFixed(1);
+    if (r.timedOut) {
+      return `FAIL ${check} (${cmd}) — TIMED OUT after 600s. A check must terminate; if this is a watcher/dev server it cannot be used as a check.`;
+    }
+    return formatCheckResult(check, cmd, parseCheckOutput(check, r.out, r.code), dur);
+  },
+};
+
+/**
+ * Code-mode worker toolset: the full edit/build/inspect surface plus run_check,
+ * minus the forecasting/data feeds a build never needs. Web search/fetch stay —
+ * coding still reads docs — but the academic/market/series/wiki tools are
+ * dropped to keep the toolset tight and the prompt cheap.
+ */
+export function codeWorkerToolset(cfg?: SwarmConfig): Record<string, ToolDef> {
+  const all = workerToolset(cfg);
+  const keep = [
+    "shell", "read_file", "write_file", "replace_in_file", "grep_files", "list_dir",
+    "save_artifact", "checkpoint", "note", "search_notes", "read_report", "web_search", "fetch_url",
+  ];
+  const out: Record<string, ToolDef> = { run_check: RUN_CHECK_TOOL };
+  for (const k of keep) if (all[k]) out[k] = all[k];
+  if (all.crawl_site) out.crawl_site = all.crawl_site;
+  return out;
+}
+
+/** Code-mode verifier toolset: verify by RUNNING the code — verifierToolset minus web_search, plus run_check. */
+export function codeVerifierToolset(): Record<string, ToolDef> {
+  const all = workerToolset();
+  return {
+    shell: all.shell,
+    read_file: all.read_file,
+    list_dir: all.list_dir,
+    grep_files: all.grep_files,
+    run_check: RUN_CHECK_TOOL,
+    fetch_url: all.fetch_url,
   };
 }
 

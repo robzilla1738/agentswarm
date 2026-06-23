@@ -89,6 +89,20 @@ export interface SwarmConfig {
   /** Forecast mode: cap on sub-forecasts a decomposed question fans out into. */
   forecastMaxSubQuestions: number;
   /**
+   * Code mode: run the engine green-gate (build → typecheck → test) once before
+   * synthesis; on RED the conductor gets one round to fix it. `--no-gate` per run.
+   */
+  codeGreenGate: boolean;
+  /**
+   * Code mode: engine commits the tree on every passing verify (commit-on-green)
+   * so an interrupted run resumes from a compiling commit. On the operator's real
+   * directory it branches `swarm/<runid>` and refuses if the tree is dirty.
+   * `--no-commit` per run.
+   */
+  codeAutoCommit: boolean;
+  /** Code mode: max conductor fix rounds the pre-synthesis green-gate will drive before giving up. */
+  codeGateMaxRounds: number;
+  /**
    * Where isolated runs execute. Default "host": the run's private workspace
    * directory on this machine — works out of the box, no Docker or cloud
    * account needed. "auto" opts into auto-detection: configured cloud
@@ -195,6 +209,9 @@ export const DEFAULTS: SwarmConfig = {
   forecastSportsMarketWeight: 0.75,
   forecastDecompose: true,
   forecastMaxSubQuestions: 6,
+  codeGreenGate: true,
+  codeAutoCommit: true,
+  codeGateMaxRounds: 2,
   sandboxRuntime: "host",
   sandboxImage: "node:22-bookworm",
   e2bApiKey: "",
@@ -414,6 +431,9 @@ export const SETTABLE_KEYS: (keyof SwarmConfig)[] = [
   "forecastSportsMarketWeight",
   "forecastDecompose",
   "forecastMaxSubQuestions",
+  "codeGreenGate",
+  "codeAutoCommit",
+  "codeGateMaxRounds",
   "maxToolResultChars",
   "sandboxRuntime",
   "sandboxImage",
@@ -444,6 +464,7 @@ const NUM_RANGES: Partial<Record<keyof SwarmConfig, [number, number]>> = {
   maxToolResultChars: [4_000, 500_000],
   forecastPanelSize: [3, 11],
   forecastMaxSubQuestions: [1, 8],
+  codeGateMaxRounds: [1, 4],
   hubPort: [0, 65535],
   uiPort: [0, 65535],
 };
@@ -482,7 +503,15 @@ export function coerceConfigValue(key: keyof SwarmConfig, raw: unknown): unknown
     if (!Number.isFinite(n)) throw new Error(`${key} must be a number`);
     return Math.min(floatRange[1], Math.max(floatRange[0], n));
   }
-  if (key === "thinking" || key === "safeMode" || key === "forecastCoherenceProbe" || key === "forecastSimulate" || key === "forecastDecompose") {
+  if (
+    key === "thinking" ||
+    key === "safeMode" ||
+    key === "forecastCoherenceProbe" ||
+    key === "forecastSimulate" ||
+    key === "forecastDecompose" ||
+    key === "codeGreenGate" ||
+    key === "codeAutoCommit"
+  ) {
     if (typeof raw === "boolean") return raw;
     return raw === "true" || raw === "1" || raw === "on";
   }

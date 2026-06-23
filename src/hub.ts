@@ -726,7 +726,14 @@ function sanitizeOptions(raw: unknown): Partial<RunOptions> {
   if (SANDBOX_KINDS.includes(o.sandboxRuntime as SandboxKind)) {
     out.sandboxRuntime = o.sandboxRuntime as SandboxKind;
   }
-  if (o.mode === "research" || o.mode === "forecast") out.mode = o.mode;
+  if (o.mode === "research" || o.mode === "forecast" || o.mode === "code") out.mode = o.mode;
+  // Code mode tunables.
+  if (typeof o.acceptanceCriteria === "string" && o.acceptanceCriteria.trim()) {
+    out.acceptanceCriteria = o.acceptanceCriteria.trim().slice(0, 4000);
+  }
+  bool("codeGreenfield");
+  bool("codeGreenGate");
+  bool("codeAutoCommit");
   if (typeof o.resolutionDate === "string" && ISO_DATE.test(o.resolutionDate) && Number.isFinite(Date.parse(o.resolutionDate))) {
     out.resolutionDate = o.resolutionDate;
   }

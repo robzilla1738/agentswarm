@@ -2,6 +2,7 @@ import {
   AggregateForecast,
   Forecast,
   ForecastQuestion,
+  RepoProfile,
   RunMeta,
   RunStatus,
   RunSummary,
@@ -86,6 +87,13 @@ export class RunState {
   /** Forecast mode: the domain pack id that planned this run (restored on resume). */
   domainPack?: string;
   aggregates: { questionId: string; aggregate: AggregateForecast; panel: RunState["forecastPanel"]; ledgerId?: string }[] = [];
+  /** Code mode: the recon profile (restored on resume so recon never re-runs). */
+  repoProfile?: RepoProfile;
+  /** Code mode: whether engine commit-on-green was enabled for this run, and the work branch. */
+  codeCommitEnabled = false;
+  codeBranch: string | null = null;
+  /** Code mode: the SHA of the last engine commit-on-green (resume's known-green point). */
+  lastGreenSha?: string;
   finalSummary?: string;
   finalReportPath?: string;
   lastSeq = 0;
@@ -338,6 +346,17 @@ export class RunState {
         }
         break;
       }
+      case "code.plan":
+        this.repoProfile = ev.profile as RepoProfile;
+        this.codeCommitEnabled = Boolean(ev.commit);
+        this.codeBranch = (ev.branch as string | null) ?? null;
+        break;
+      case "code.checkpoint":
+        if (typeof ev.sha === "string") this.lastGreenSha = ev.sha;
+        break;
+      case "code.gate":
+        // Presentation-only (no reduced field needed beyond the journal record).
+        break;
       case "run.final":
         this.finalSummary = ev.summary as string;
         this.finalReportPath = ev.reportPath as string | undefined;

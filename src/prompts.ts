@@ -1,6 +1,6 @@
 import * as os from "os";
 import { daysToIso } from "./forecast";
-import { AggregateForecast, ForecastQuestion, RunMeta, SimDriver, SimulationResult, Task } from "./types";
+import { AggregateForecast, ForecastQuestion, RepoProfile, RunMeta, SimDriver, SimulationResult, Task } from "./types";
 import { clip, fmtTokens } from "./util";
 
 // ============================================================ conductor
@@ -159,7 +159,7 @@ const ROLE_HINTS: Record<string, string> = {
     "• Record findings as blackboard notes (with url=<source>) and save a structured markdown file of sources+findings as an artifact for the synthesizer.\n" +
     "• If a crawl_site tool is available, use it to ingest whole documentation sites or multi-page sources into local markdown — far cheaper and broader than fetching pages one by one.",
   coder:
-    "Engineering craft: read existing code before changing it; match its conventions; build/run/test after every meaningful change and include the command + result in your report. Leave the tree compiling.",
+    "Engineering craft: read existing code before changing it; match its conventions exactly. After every meaningful change, verify it with run_check (build / typecheck / test) — NOT raw shell test pipelines, so failures come back as compact counts, not truncated log spew — and include the result in your report. Leave the tree compiling: never report done on a red typecheck or failing test. Touch ONLY the files this task owns; never edit a file another task is writing (search_notes for claims first, then note(kind:'claim', key:'<path>')). An integration task additionally runs the FULL gate (build + typecheck + test) and reports done only when every check is green.",
   analyst:
     "Analysis craft: quantify wherever possible; state assumptions explicitly; separate observation from interpretation; sanity-check numbers twice.",
   writer:
@@ -210,6 +210,8 @@ export function workerSystem(opts: {
   extraCraft?: string;
   /** Terminal tool the agent must end with (forecaster panelists use submit_forecast). */
   terminalName?: "report" | "submit_forecast";
+  /** Code mode: the detected repo profile — its real build/test commands are injected as BUILD CONTEXT. */
+  repoProfile?: RepoProfile;
 }): string {
   const { meta, task } = opts;
   const roleHint = [ROLE_HINTS[opts.role.toLowerCase()] ?? "", opts.extraCraft ?? ""].filter(Boolean).join("\n\n");
@@ -242,7 +244,7 @@ ${opts.blackboard ? `Blackboard digest:\n${opts.blackboard}` : ""}
 ${opts.operatorNotes.length ? `Operator notes:\n${opts.operatorNotes.map((n) => `- ${n}`).join("\n")}` : ""}
 Working directory: ${meta.cwd}
 ${opts.dirListing ? `Top of the working directory:\n${opts.dirListing}` : ""}
-
+${opts.repoProfile ? buildContextBlock(opts.repoProfile) : ""}
 OPERATING PROTOCOL
 - You are fully autonomous. Never ask questions; decide and act.
 - Plan briefly, then act in small verified steps: after changing anything, prove it worked (run it, read it back, test it).
@@ -717,6 +719,82 @@ export function aggregateBlock(q: ForecastQuestion, agg: AggregateForecast, pane
   }
   lines.push("", "PANEL:", ...panelLines);
   return lines.join("\n");
+}
+
+// ============================================================ code mode
+
+/** The repo's real build/test commands, rendered for a worker's prompt (and reused inside the conductor addendum). */
+function commandsBlock(p: RepoProfile): string {
+  const c = p.commands;
+  return [
+    `- Build:     ${c.build ?? "(none detected)"}`,
+    `- Typecheck: ${c.typecheck ?? "(none detected)"}`,
+    `- Test:      ${c.test ?? "(none detected — establish a test command first)"}`,
+    `- Lint:      ${c.lint ?? "(none detected)"}`,
+  ].join("\n");
+}
+
+/** Injected into every code-mode worker's prompt: the real commands + conventions so it never guesses how to build. */
+function buildContextBlock(p: RepoProfile): string {
+  if (p.greenfield) {
+    return `
+BUILD CONTEXT — GREENFIELD (empty working directory): no existing project. Choose a stack appropriate to the task, scaffold it, and ESTABLISH a test command early — it is part of the deliverable. Use run_check once the project's scripts exist.`;
+  }
+  return `
+BUILD CONTEXT — these are the repo's REAL commands (detected automatically; use them via run_check, don't invent your own):
+- Stack: ${p.primaryLanguage ?? "unknown"}${p.framework ? ` (${p.framework})` : ""}${p.packageManager ? ` · ${p.packageManager}` : ""}${p.monorepo.tool ? ` · monorepo: ${p.monorepo.tool}` : ""}
+${commandsBlock(p)}${p.conventions.length ? `\n- Conventions: ${p.conventions.join("; ")}` : ""}`;
+}
+
+/**
+ * Appended to the conductor system prompt in code mode — the software-
+ * engineering pipeline doctrine. Appended AFTER conductorSystem so it overrides
+ * the generic "parallelize aggressively / go wide with scouts" doctrine, which
+ * is wrong for a build. The structure and the commands are engine-owned facts.
+ */
+export function codeConductorAddendum(profile: RepoProfile, acceptance?: string): string {
+  const repo = profile.greenfield
+    ? `REPO: greenfield — the working directory is empty. Wave 1 chooses the stack, scaffolds it, and establishes the build + test commands as the first acceptance criterion.`
+    : `REPO (detected — these are the real commands; pass them to your workers and have them verify with run_check):
+- Stack: ${profile.primaryLanguage ?? "unknown"}${profile.framework ? ` (${profile.framework})` : ""}${profile.packageManager ? ` · ${profile.packageManager}` : ""}${profile.git.isRepo ? ` · git branch ${profile.git.branch ?? "?"}${profile.git.dirty ? " (dirty)" : ""}` : " · not a git repo"}
+${commandsBlock(profile)}${profile.conventions.length ? `\n- Conventions: ${profile.conventions.join("; ")}` : ""}`;
+
+  return `
+THIS IS A CODE (BUILD) MISSION. The deliverable is a WORKING TREE that builds and passes its tests — not a report. The generic "PARALLELIZE AGGRESSIVELY / go WIDE with 10+ scouts" research doctrine DOES NOT APPLY here; follow this build doctrine instead.
+
+${repo}
+${acceptance ? `\nACCEPTANCE CRITERIA (the build is done when): ${acceptance}\nSeed these into mission-plan.md (update_plan) as a checklist and tick each item as it passes the gate.\n` : ""}
+BUILD PIPELINE — structure the run exactly like this:
+1. WAVE 1 = ONE task only — recon + scaffold. Read the relevant code, confirm the tree builds with the command above (and if dependencies aren't installed, install them); if greenfield, choose the stack and establish the test command. Do NOT fan out before you understand the code.
+2. IMPLEMENT WAVES — parallel tasks on STRICTLY DISJOINT files/modules. Partition the work so NO two tasks ever write the same file. Each task: read before editing, match conventions, run run_check after every change, leave its files compiling.
+3. Every implement wave ENDS with an INTEGRATION task (verify:true, model:"strong") that deps on all of that wave's implementers, runs the FULL build + typecheck + test, and reports done ONLY when green. The verifier runs the commands itself and fails it back on red — and on a passing verify the engine commits the tree, so an interrupted run resumes from a compiling commit.
+4. Before final synthesis the engine runs ONE green-gate. If the integrated tree is red it returns to you with the exact failures — spawn a focused fix task on the failing files (do not re-run the failed approach verbatim).
+5. finish only when the tree is green and the acceptance criteria are met. Use set_phase for the arc (recon → build → integrate → harden) and keep mission-plan.md current with update_plan.
+
+CODE RULES
+- Disjoint-file ownership is the convergence guarantee: two writers on one file corrupt it. Pre-partition files across tasks; the integration task catches any collision as a build failure.
+- Big coherent subsystems → spawn with team:true (its own sub-swarm), not one giant task.
+- Model tiers: cheap for mechanical/boilerplate tasks, strong for architecture, integration, and verified deliverables.
+- Deliver the WORKING TREE plus a short PR-style change summary — never a long prose report. The code is the product.`;
+}
+
+/**
+ * Appended to the synthesizer system prompt in code mode. The deliverable is
+ * the working tree + a PR-style change summary, NOT a research report.
+ */
+export function codeSynthAddendum(profile: RepoProfile, gateEvidence?: string): string {
+  const c = profile.commands;
+  return `
+CODE DELIVERABLE
+This was a build mission. The deliverable is the WORKING TREE, not a prose report. Keep the report tight and PR-shaped.
+${gateEvidence ? `\nFINAL GREEN-GATE (engine-run — quote this verbatim as the test evidence; do NOT claim green if it is red):\n${gateEvidence}\n` : ""}
+Structure report_markdown:
+1. # <what was built> — one sentence on the outcome and whether the tree builds and tests green.
+2. ## Changes — a markdown table of files touched (path | what changed). Group by module/subsystem. Pull this from the task reports' files_touched.
+3. ## How to build & run — the exact detected commands: ${[c.install, c.build, c.test].filter(Boolean).join(" · ") || "(state the commands the repo uses)"}.
+4. ## Test evidence — the green-gate result above, verbatim (build / typecheck / test pass counts). Be honest: if anything is red or unverified, say so plainly.
+5. ## What's left / known gaps — anything incomplete, with why, mapped to the acceptance criteria.
+Do NOT write an essay, do NOT fabricate passing tests, and do NOT invent a styled HTML document. Also save this summary as a CHANGES.md artifact. The code is the product.`;
 }
 
 // ============================================================ completeness / synthesis checks
