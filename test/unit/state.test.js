@@ -129,6 +129,26 @@ test("team usage events never overwrite the run's cumulative cost", () => {
   assert.ok(s.cost > before, `team usage must accrue (got ${s.cost} after ${before})`);
 });
 
+test("code mode: resume idempotency — criteria, build plan, baseline + green SHA restore from the journal", () => {
+  // INVARIANT: planCode does NOT re-run on resume, so the engine must rehydrate
+  // its tracked state from the journal — else it would re-split criteria, re-plan,
+  // and the diff-review baseline would be lost (review silently skipped).
+  const s = new RunState();
+  const profile = { greenfield: false, commands: { build: "npm run build", test: "npm test" }, conventions: [], manifestFiles: ["package.json"], packageManager: "npm", primaryLanguage: "TypeScript", framework: null, monorepo: { tool: null, packages: [] }, git: { isRepo: true, branch: "main", dirty: false } };
+  s.apply(ev("code.plan", { profile, commit: true, branch: "swarm/run_x", baseline: "abc1234" }));
+  s.apply(ev("code.criteria", { items: [{ id: "AC1", text: "does X", met: false }, { id: "AC2", text: "does Y", met: false }] }));
+  s.apply(ev("code.design", { plan: { modules: [{ id: "m1", files: ["a.ts"], purpose: "p", deps: [] }], scaffoldFirst: false, integrationPerWave: true, waves: [["m1"]] } }));
+  s.apply(ev("code.checkpoint", { sha: "green99", taskId: "T2" }));
+
+  assert.equal(s.codeCommitEnabled, true);
+  assert.equal(s.codeBranch, "swarm/run_x");
+  assert.equal(s.codeBaselineSha, "abc1234", "diff-review baseline restored (else review never runs after resume)");
+  assert.equal(s.acceptanceItems.length, 2, "tracked acceptance criteria restored (no re-split on resume)");
+  assert.equal(s.acceptanceItems[1].id, "AC2");
+  assert.ok(s.buildPlan && s.buildPlan.waves.length === 1, "build plan restored (no re-plan on resume)");
+  assert.equal(s.lastGreenSha, "green99", "last green SHA restored (sandbox resume-reset target)");
+});
+
 test("source tracking: tool events, notes, and reports roll up deduped", () => {
   const s = new RunState();
   s.apply(ev("task.created", { task: task("T1") }));

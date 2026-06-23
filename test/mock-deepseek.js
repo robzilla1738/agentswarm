@@ -188,6 +188,48 @@ const server = http.createServer((req, res) => {
         }
         return sse(res, [...toolChunks("wait", { reason: "scouts in flight" })]);
       }
+      // code-green: greenfield (empty repo). One task scaffolds the project
+      // (package.json + test runner + greet.js) and establishes the test command;
+      // finish when it's done. No T1 spec seed on greenfield (doctrine-driven).
+      if (SCENARIO === "code-green") {
+        if (update.includes("No tasks exist yet")) {
+          return sse(res, [...toolChunks("spawn_tasks", { tasks: [{ title: "Scaffold + implement greet", objective: "Greenfield: scaffold package.json with a `test` script (node run-tests.js), write run-tests.js, implement greet.js, and make run_check test green.", role: "coder" }] })]);
+        }
+        if (/T1 \[done/.test(update)) return sse(res, [...toolChunks("finish", { notes: "scaffolded + implemented; tests green." })]);
+        return sse(res, [...toolChunks("wait", { reason: "scaffolding" })]);
+      }
+      // code-unverified: a repo with no detected commands, no acceptance criteria
+      // (so no T1 spec seed) — spawn one implement task; finish when it's done.
+      if (SCENARIO === "code-unverified") {
+        if (update.includes("No tasks exist yet")) {
+          return sse(res, [...toolChunks("spawn_tasks", { tasks: [{ title: "Add greet", objective: "Create greet.js. (No build/test command exists in this repo.)", role: "coder" }] })]);
+        }
+        if (/T1 \[done/.test(update)) return sse(res, [...toolChunks("finish", { notes: "added greet; no test command to verify with." })]);
+        return sse(res, [...toolChunks("wait", { reason: "in flight" })]);
+      }
+      if (/^code/.test(SCENARIO)) {
+        // T1 (spec-test author) is engine-seeded. Spawn the implement task that
+        // depends on it, owning greet.js; finish once it's done. Variants:
+        //  code-ens / code-ens-fallback → request a best-of-N ensemble;
+        //  code-repair → implement with verify:false so the BROKEN tree reaches
+        //    the engine green-gate, which spawns its own fix task (T3).
+        if (!/\bT2\b/.test(update)) {
+          const impl = { title: "Implement greet", objective: "Create greet.js exporting greet(name)=>`Hello ${name}`; make run_check test green.", role: "coder", deps: ["T1"], verify: SCENARIO !== "code-repair", files: ["greet.js"] };
+          if (SCENARIO === "code-ens" || SCENARIO === "code-ens-fallback") impl.ensemble = 2;
+          return sse(res, [...toolChunks("spawn_tasks", { tasks: [impl] })]);
+        }
+        // code-repair: just finish once T2 is done — the engine green-gate catches
+        // the broken tree and drives the fix task itself; re-finishing after the
+        // fix re-runs is harmless (the gate loop owns convergence).
+        if (SCENARIO === "code-repair") {
+          if (/T2 \[done/.test(update)) return sse(res, [...toolChunks("finish", { notes: "implementation reported; engine gate will verify." })]);
+          return sse(res, [...toolChunks("wait", { reason: "implement in flight" })]);
+        }
+        if (/T1 \[done/.test(update) && /T2 \[done/.test(update)) {
+          return sse(res, [...toolChunks("finish", { notes: "greet implemented; tests pass." })]);
+        }
+        return sse(res, [...toolChunks("wait", { reason: "implement in flight" })]);
+      }
       if (SCENARIO === "forecast") {
         if (update.includes("No tasks exist yet")) {
           return sse(res, [...toolChunks("spawn_tasks", {
@@ -400,6 +442,13 @@ const server = http.createServer((req, res) => {
 
     // Synthesizer
     if (names.has("submit_final")) {
+      if (/^code/.test(SCENARIO)) {
+        const gateEvidence = /FINAL GREEN-GATE/.test(sysContent);
+        return sse(res, [...toolChunks("submit_final", {
+          report_markdown: `# greet implemented\n\nGATE-EVIDENCE-PINNED: ${gateEvidence}\n\n## Changes\n| file | change |\n|---|---|\n| greet.js | new greet(name) |\n\n## Acceptance criteria\n- [AC1] met — tests pass.\n`,
+          summary: "greet implemented; tree builds and tests pass.",
+        })]);
+      }
       if (SCENARIO === "forecast-multi") {
         // The engine pins one ENSEMBLE line per sub-forecast; echo a count so
         // the e2e confirms all three blocks reached the synthesizer.
@@ -449,6 +498,11 @@ const server = http.createServer((req, res) => {
     // Verifier
     if (names.has("verdict")) {
       verdictCalls++;
+      if (/^code/.test(SCENARIO)) {
+        // Gather real evidence (run the tests) before passing — fail-closed safe.
+        if (!hasToolResult(messages)) return sse(res, [...toolChunks("run_check", { check: "test" })]);
+        return sse(res, [...toolChunks("verdict", { pass: true, feedback: "clean", summary: "tests pass; greet implemented correctly." })]);
+      }
       if (SCENARIO === "blind-verify") {
         // Report whether the swarm's blackboard leaked into the verifier's context.
         const leaked = JSON.stringify(messages).includes("SECRET-NOTE-XYZ");
@@ -488,6 +542,43 @@ const server = http.createServer((req, res) => {
     // Worker: run one real shell tool, then report on the next turn.
     if (names.has("report")) {
       const system = String((messages[0] && messages[0].content) || "");
+      // Greenfield scaffold worker: lay down package.json + runner + greet.js, then verify.
+      if (SCENARIO === "code-green") {
+        const trs = messages.filter((m) => m.role === "tool").length;
+        if (trs === 0) return sse(res, [...toolChunks("write_file", { path: "package.json", content: JSON.stringify({ name: "greet-app", version: "1.0.0", scripts: { test: "node run-tests.js" } }, null, 2) + "\n" })]);
+        if (trs === 1) return sse(res, [...toolChunks("write_file", { path: "run-tests.js", content: "let g; try { g = require('./greet.js'); } catch (e) { console.log('0 passed, 1 total, 1 failed'); process.exit(1); }\nif (g.greet && g.greet('World') === 'Hello World') { console.log('1 passed, 1 total'); process.exit(0); }\nconsole.log('0 passed, 1 total, 1 failed'); process.exit(1);\n" })]);
+        if (trs === 2) return sse(res, [...toolChunks("write_file", { path: "greet.js", content: "module.exports.greet = (name) => `Hello ${name}`;\n" })]);
+        if (trs === 3) return sse(res, [...toolChunks("run_check", { check: "test" })]);
+        return sse(res, [...toolChunks("report", { status: "done", report: "Scaffolded greet-app: package.json, run-tests.js, greet.js; test command established and green.", files_touched: ["package.json", "run-tests.js", "greet.js"] })]);
+      }
+      if (/^code/.test(SCENARIO)) {
+        const trs = messages.filter((m) => m.role === "tool").length;
+        const CORRECT = "module.exports.greet = (name) => `Hello ${name}`;\n";
+        const BROKEN = "module.exports.greet = (name) => `Hi ${name}`;\n"; // wrong → run-tests.js fails
+        // Engine-seeded spec-test author (T1): record the spec, then report.
+        if (/\ba test-author agent\b/i.test(system)) {
+          if (trs === 0) return sse(res, [...toolChunks("write_file", { path: "greet.spec-notes.md", content: "# spec [AC1]: greet(name) returns 'Hello <name>'. Verified by run-tests.js (red until greet.js exists).\n" })]);
+          return sse(res, [...toolChunks("report", { status: "done", report: "Authored the spec for AC1; run-tests.js currently fails until greet.js exists (red).", files_touched: ["greet.spec-notes.md"], key_facts: ["AC1 is exercised by run-tests.js"] })]);
+        }
+        // No build/test command in this repo — just write + report (no run_check).
+        if (SCENARIO === "code-unverified") {
+          if (trs === 0) return sse(res, [...toolChunks("write_file", { path: "greet.js", content: CORRECT })]);
+          return sse(res, [...toolChunks("report", { status: "done", report: "Added greet.js. No test command exists to verify with.", files_touched: ["greet.js"] })]);
+        }
+        // Decide what this worker writes:
+        //  - the engine fix task (code-repair) → CORRECT (its objective names the gate failure);
+        //  - an isolated ensemble attempt in code-ens-fallback → BROKEN (forces all attempts red);
+        //  - the implement task in code-repair → BROKEN (the gate must catch it);
+        //  - everything else (incl. the fallback single worker) → CORRECT.
+        const isFix = /Fix green-gate|integrated tree FAILS/i.test(system);
+        const isAttempt = /isolated attempt/i.test(system);
+        let content = CORRECT;
+        if (SCENARIO === "code-repair" && !isFix) content = BROKEN;
+        if (SCENARIO === "code-ens-fallback" && isAttempt) content = BROKEN;
+        if (trs === 0) return sse(res, [...toolChunks("write_file", { path: "greet.js", content })]);
+        if (trs === 1) return sse(res, [...toolChunks("run_check", { check: "test" })]);
+        return sse(res, [...toolChunks("report", { status: "done", report: content === CORRECT ? "Implemented greet.js; run_check test is green." : "Implemented greet.js.", files_touched: ["greet.js"] })]);
+      }
       if (SCENARIO === "forecast" && /FC-RESEARCH/.test(system)) {
         return sse(res, [...toolChunks("report", {
           status: "done",
@@ -607,6 +698,23 @@ const server = http.createServer((req, res) => {
     // Tool-less helper calls: completeness critic / faithfulness check (strict mode).
     if (!tools.length) {
       const lu = lastUser(messages);
+      if (/^code/.test(SCENARIO)) {
+        if (/Split this build's acceptance criteria/.test(lu)) {
+          // code-green exercises the NON-JSON fallback: garbage ⇒ the engine must
+          // track the whole accept blob as a single AC1 item (no loss, no throw).
+          if (SCENARIO === "code-green") return sse(res, [textChunk("Sure — the build is done when greet works."), { usage: { prompt_tokens: 20, completion_tokens: 10 } }]);
+          return sse(res, [textChunk(JSON.stringify(["greet(name) returns 'Hello <name>'"])), { usage: { prompt_tokens: 20, completion_tokens: 10 } }]);
+        }
+        if (/MODULE\/FILE PARTITION/.test(lu)) {
+          // code-green returns an INVALID (file-colliding) plan ⇒ partitionWaves
+          // null ⇒ engine takes the free-form fallback (waves null) without crashing.
+          if (SCENARIO === "code-green") return sse(res, [textChunk(JSON.stringify({ scaffoldFirst: true, integrationPerWave: true, modules: [{ id: "a", files: ["greet.js"], purpose: "x", deps: [] }, { id: "b", files: ["greet.js"], purpose: "y", deps: [] }] })), { usage: { prompt_tokens: 30, completion_tokens: 20 } }]);
+          return sse(res, [textChunk(JSON.stringify({ scaffoldFirst: false, integrationPerWave: true, modules: [{ id: "greet", files: ["greet.js"], purpose: "the greet function", deps: [], hard: false }] })), { usage: { prompt_tokens: 30, completion_tokens: 20 } }]);
+        }
+        if (/adversarial review|THE DIFF/.test(lu)) {
+          return sse(res, [textChunk("REVIEW-CLEAN"), { usage: { prompt_tokens: 20, completion_tokens: 5 } }]);
+        }
+      }
       // Open-ended decomposition: 3 binary sub-forecasts + a brief.
       if (/turning a forecasting mission into the set/.test(lu) && SCENARIO === "forecast-multi") {
         return sse(res, [

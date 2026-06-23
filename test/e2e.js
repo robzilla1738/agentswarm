@@ -960,6 +960,298 @@ async function phaseCitations() {
   fs.rmSync(home, { recursive: true, force: true });
 }
 
+async function phaseCode() {
+  console.log("\n▶ Phase 26: code mode — build plan, TDD spec, green-gate, diff-review, repo memory");
+  // Skip cleanly where git isn't available (the pipeline relies on it).
+  if (spawnSync("git", ["--version"], { encoding: "utf8" }).status !== 0) {
+    ok("git unavailable — skipping code-mode phase");
+    return;
+  }
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  // A small BROWNFIELD repo so recon detects a real test command and the
+  // engine seeds the spec-author task. run-tests.js is red until greet.js exists.
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-code-"));
+  fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "e2e-code", version: "1.0.0", scripts: { test: "node run-tests.js" } }, null, 2));
+  fs.writeFileSync(
+    path.join(repo, "run-tests.js"),
+    "let g; try { g = require('./greet.js'); } catch (e) { console.log('0 passed, 1 total, 1 failed'); process.exit(1); }\n" +
+      "if (g.greet && g.greet('World') === 'Hello World') { console.log('1 passed, 1 total'); process.exit(0); }\n" +
+      "console.log('0 passed, 1 total, 1 failed'); process.exit(1);\n"
+  );
+  for (const cmd of [["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base"]]) {
+    const r = spawnSync("git", cmd, { cwd: repo, encoding: "utf8" });
+    if (r.status !== 0) { console.error(r.stderr); fail(`git ${cmd.join(" ")} failed`); }
+  }
+
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "code" });
+  ok(`mock model server on :${port} (code script)`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const res = spawnSync(
+    process.execPath,
+    [SWARM, "code", "Add a greet function", "--accept", "greet(name) returns 'Hello <name>'", "--cwd", repo, "--fg"],
+    { env, encoding: "utf8", timeout: 180000 }
+  );
+  proc.kill();
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); fail(`swarm code exited ${res.status}`); }
+
+  const { runDir, evs } = soleRunEvents(home);
+  const one = (t) => evs.find((e) => e.type === t);
+
+  const plan = one("code.plan");
+  if (!plan || plan.profile.greenfield !== false || !plan.profile.commands.test) fail("code.plan should record a brownfield repo with a detected test command");
+  ok("recon detected the brownfield repo + test command (code.plan)");
+
+  const crit = one("code.criteria");
+  if (!crit || !Array.isArray(crit.items) || !crit.items.length) fail("acceptance criteria should be split into tracked items (code.criteria)");
+  ok(`acceptance criteria tracked as ${crit.items.length} item(s) (code.criteria)`);
+
+  const design = one("code.design");
+  if (!design || !design.plan || !Array.isArray(design.plan.waves) || !design.plan.waves.length) fail("engine should pin a validated BuildPlan with conflict-free waves (code.design)");
+  ok("engine pinned a conflict-free BuildPlan (code.design) + DESIGN.md");
+  if (!fs.existsSync(path.join(runDir, "artifacts", "DESIGN.md"))) fail("DESIGN.md artifact should be written");
+
+  if (!one("code.spec")) fail("TDD: engine should seed a spec-test author (code.spec)");
+  ok("TDD spec-test author seeded (code.spec)");
+
+  if (!one("code.map")) fail("a repo symbol-map should be built for workers (code.map)");
+  ok("repo symbol-map built (code.map)");
+
+  const gate = evs.filter((e) => e.type === "code.gate").pop();
+  if (!gate || gate.green !== true) fail(`green-gate should pass (got ${gate && gate.green})`);
+  ok("engine green-gate passed on the real test command (code.gate)");
+
+  const review = one("code.review");
+  if (!review || review.clean !== true) fail("adversarial diff-review should run and pass clean (code.review)");
+  ok("adversarial diff-review ran clean (code.review)");
+
+  if (!fs.existsSync(path.join(repo, "greet.js"))) fail("the deliverable greet.js should exist in the working tree");
+  const runOut = spawnSync(process.execPath, ["run-tests.js"], { cwd: repo, encoding: "utf8" });
+  if (runOut.status !== 0) fail("the delivered tree should pass its own tests");
+  ok("deliverable greet.js is in the tree and its tests pass");
+
+  const report = fs.readFileSync(path.join(runDir, "artifacts", "final-report.md"), "utf8");
+  if (!/GATE-EVIDENCE-PINNED: true/.test(report)) fail("the synthesizer should receive the verbatim green-gate evidence");
+  ok("synthesizer received the green-gate evidence (honest test reporting)");
+
+  if (!fs.existsSync(path.join(home, "repo-facts.jsonl"))) fail("a green run should persist cross-run repo memory");
+  ok("repo memory persisted for the next run (repo-facts.jsonl)");
+
+  if (evs.filter((e) => e.type === "run.status").pop().status !== "done") fail("code run did not end done");
+  ok("run finished with status=done");
+
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(repo, { recursive: true, force: true });
+}
+
+async function phaseCodeEnsemble() {
+  console.log("\n▶ Phase 27: code mode — best-of-N ensemble (isolated git worktrees, judged by the gate)");
+  if (spawnSync("git", ["--version"], { encoding: "utf8" }).status !== 0) {
+    ok("git unavailable — skipping ensemble phase");
+    return;
+  }
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-code-"));
+  fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "e2e-ens", version: "1.0.0", scripts: { test: "node run-tests.js" } }, null, 2));
+  fs.writeFileSync(
+    path.join(repo, "run-tests.js"),
+    "let g; try { g = require('./greet.js'); } catch (e) { console.log('0 passed, 1 total, 1 failed'); process.exit(1); }\n" +
+      "if (g.greet && g.greet('World') === 'Hello World') { console.log('1 passed, 1 total'); process.exit(0); }\n" +
+      "console.log('0 passed, 1 total, 1 failed'); process.exit(1);\n"
+  );
+  for (const cmd of [["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base"]]) {
+    if (spawnSync("git", cmd, { cwd: repo, encoding: "utf8" }).status !== 0) fail(`git ${cmd.join(" ")} failed`);
+  }
+
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "code-ens" });
+  ok(`mock model server on :${port} (code-ens script)`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+
+  const res = spawnSync(
+    process.execPath,
+    [SWARM, "code", "Add a greet function", "--accept", "greet(name) returns 'Hello <name>'", "--cwd", repo, "--fg"],
+    { env, encoding: "utf8", timeout: 180000 }
+  );
+  proc.kill();
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); fail(`swarm code (ensemble) exited ${res.status}`); }
+
+  const { evs } = soleRunEvents(home);
+  const ens = evs.find((e) => e.type === "code.ensemble");
+  if (!ens) fail("a best-of-N task should journal code.ensemble");
+  if (ens.n !== 2 || !Array.isArray(ens.scores) || ens.scores.length < 1) fail(`code.ensemble should record N attempts and their scores (got n=${ens.n})`);
+  if (ens.merged !== true) fail("the winning ensemble attempt should merge cleanly into the live tree");
+  ok(`best-of-${ens.n} ran ${ens.scores.length} isolated worktree attempts and merged the winner (code.ensemble)`);
+
+  if (!fs.existsSync(path.join(repo, "greet.js"))) fail("the merged winner's greet.js should be in the working tree");
+  const gate = evs.filter((e) => e.type === "code.gate").pop();
+  if (!gate || gate.green !== true) fail("the post-merge green-gate should pass");
+  ok("merged winner builds green; no leftover worktrees block the gate");
+
+  // Worktrees must be cleaned up (no -ens- siblings left behind).
+  const leftover = fs.readdirSync(path.dirname(repo)).filter((d) => d.startsWith(path.basename(repo) + "-ens-"));
+  if (leftover.length) fail(`ensemble worktrees were not cleaned up: ${leftover.join(", ")}`);
+  ok("ensemble worktrees cleaned up");
+
+  if (evs.filter((e) => e.type === "run.status").pop().status !== "done") fail("ensemble run did not end done");
+  ok("run finished with status=done");
+
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(repo, { recursive: true, force: true });
+}
+
+/** Shared: a brownfield git repo whose `npm test` runs a node-only runner red until greet.js is correct. */
+function makeGreetRepo(withTestCmd = true) {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-code-"));
+  fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "e2e-code", version: "1.0.0", scripts: withTestCmd ? { test: "node run-tests.js" } : {} }, null, 2));
+  if (withTestCmd) {
+    fs.writeFileSync(
+      path.join(repo, "run-tests.js"),
+      "let g; try { g = require('./greet.js'); } catch (e) { console.log('0 passed, 1 total, 1 failed'); process.exit(1); }\n" +
+        "if (g.greet && g.greet('World') === 'Hello World') { console.log('1 passed, 1 total'); process.exit(0); }\n" +
+        "console.log('0 passed, 1 total, 1 failed'); process.exit(1);\n"
+    );
+  }
+  for (const cmd of [["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base"]]) {
+    if (spawnSync("git", cmd, { cwd: repo, encoding: "utf8" }).status !== 0) fail(`git ${cmd.join(" ")} failed`);
+  }
+  return repo;
+}
+
+async function phaseCodeRepair() {
+  console.log("\n▶ Phase 28: code mode — engine-driven repair (RED gate → engine-authored fix task → GREEN)");
+  if (spawnSync("git", ["--version"], { encoding: "utf8" }).status !== 0) { ok("git unavailable — skipping repair phase"); return; }
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const repo = makeGreetRepo(true);
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "code-repair" });
+  ok(`mock model server on :${port} (code-repair script)`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+  const res = spawnSync(process.execPath, [SWARM, "code", "Add a greet function", "--accept", "greet(name) returns 'Hello <name>'", "--cwd", repo, "--fg"], { env, encoding: "utf8", timeout: 180000 });
+  proc.kill();
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); fail(`swarm code (repair) exited ${res.status}`); }
+  const { evs } = soleRunEvents(home);
+  const gates = evs.filter((e) => e.type === "code.gate");
+  if (!gates.some((g) => g.green === false && !g.skipped)) fail("the broken implementation should produce a RED green-gate");
+  if (!gates.some((g) => g.green === true)) fail("the engine repair should drive the gate GREEN");
+  ok("green-gate went RED on the broken tree, then GREEN after repair (code.gate)");
+  const fixTask = evs.find((e) => e.type === "task.created" && /fix green-gate/i.test(String(e.task && e.task.title)));
+  if (!fixTask) fail("the engine must spawn its OWN targeted fix task (not round-trip the conductor)");
+  if (fixTask.task.role !== "coder" || fixTask.task.ownedFiles) fail("the fix task must be a coder with no ownedFiles (so it can edit any failing file)");
+  ok(`engine authored a targeted fix task (${fixTask.task.id}, role coder, no file lock)`);
+  const out = spawnSync(process.execPath, ["run-tests.js"], { cwd: repo, encoding: "utf8" });
+  if (out.status !== 0) fail("the repaired tree should pass its tests");
+  ok("repaired greet.js passes its tests");
+  if (evs.filter((e) => e.type === "run.status").pop().status !== "done") fail("repair run did not end done");
+  ok("run finished with status=done");
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(repo, { recursive: true, force: true });
+}
+
+async function phaseCodeUnverified() {
+  console.log("\n▶ Phase 29: code mode — honest UNVERIFIED when no build/test command exists");
+  if (spawnSync("git", ["--version"], { encoding: "utf8" }).status !== 0) { ok("git unavailable — skipping unverified phase"); return; }
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const repo = makeGreetRepo(false); // package.json with NO scripts → no detectable commands
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "code-unverified" });
+  ok(`mock model server on :${port} (code-unverified script)`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+  // No --accept (no criteria → no TDD guard) so the honest "skipped/UNVERIFIED" path is exercised.
+  const res = spawnSync(process.execPath, [SWARM, "code", "Add a greet function", "--cwd", repo, "--fg"], { env, encoding: "utf8", timeout: 180000 });
+  proc.kill();
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); fail(`swarm code (unverified) exited ${res.status}`); }
+  const { evs } = soleRunEvents(home);
+  const gate = evs.filter((e) => e.type === "code.gate").pop();
+  if (!gate || gate.skipped !== true || gate.green === true) fail(`with no command the gate must be skipped/UNVERIFIED, never green (got ${JSON.stringify(gate)})`);
+  ok("gate honestly reported skipped/UNVERIFIED — never a fake green (code.gate)");
+  if (evs.some((e) => e.type === "code.checkpoint")) fail("no commit-on-green should fire when the tree was never verified");
+  ok("no green commit was made on an unverified tree");
+  if (evs.filter((e) => e.type === "run.status").pop().status !== "done") fail("unverified run did not end done");
+  ok("run finished with status=done (honest, not blocked)");
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(repo, { recursive: true, force: true });
+}
+
+async function phaseCodeEnsembleFallback() {
+  console.log("\n▶ Phase 30: code mode — best-of-N fallback (all attempts fail → single worker on the live tree)");
+  if (spawnSync("git", ["--version"], { encoding: "utf8" }).status !== 0) { ok("git unavailable — skipping ensemble-fallback phase"); return; }
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const repo = makeGreetRepo(true);
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "code-ens-fallback" });
+  ok(`mock model server on :${port} (code-ens-fallback script)`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+  const res = spawnSync(process.execPath, [SWARM, "code", "Add a greet function", "--accept", "greet(name) returns 'Hello <name>'", "--cwd", repo, "--fg"], { env, encoding: "utf8", timeout: 180000 });
+  proc.kill();
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); fail(`swarm code (ens-fallback) exited ${res.status}`); }
+  const { evs } = soleRunEvents(home);
+  const ens = evs.find((e) => e.type === "code.ensemble");
+  if (!ens) fail("ensemble must journal code.ensemble even on fallback");
+  if (ens.winner !== -1 || ens.merged !== false) fail(`all-failing attempts must NOT merge a winner (got winner=${ens.winner} merged=${ens.merged})`);
+  ok("no passing attempt → ensemble merged nothing and fell back (code.ensemble winner=-1)");
+  const out = spawnSync(process.execPath, ["run-tests.js"], { cwd: repo, encoding: "utf8" });
+  if (out.status !== 0) fail("the single-worker fallback should still produce a passing tree");
+  ok("single-worker fallback recovered the task — tree passes its tests");
+  const gate = evs.filter((e) => e.type === "code.gate").pop();
+  if (!gate || gate.green !== true) fail("the post-fallback green-gate should pass");
+  ok("post-fallback green-gate passed");
+  if (evs.filter((e) => e.type === "run.status").pop().status !== "done") fail("ens-fallback run did not end done");
+  ok("run finished with status=done");
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(repo, { recursive: true, force: true });
+}
+
+async function phaseCodeGreenfield() {
+  console.log("\n▶ Phase 31: code mode — greenfield (empty repo → scaffold → green) + plan/criteria fallbacks");
+  if (spawnSync("git", ["--version"], { encoding: "utf8" }).status !== 0) { ok("git unavailable — skipping greenfield phase"); return; }
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-green-")); // EMPTY repo
+  for (const cmd of [["init", "-q"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "root"]]) {
+    if (spawnSync("git", cmd, { cwd: repo, encoding: "utf8" }).status !== 0) fail(`git ${cmd.join(" ")} failed`);
+  }
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "code-green" });
+  ok(`mock model server on :${port} (code-green script)`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+  const res = spawnSync(process.execPath, [SWARM, "code", "Build a greet module", "--accept", "greet(name) returns 'Hello <name>'", "--cwd", repo, "--fg"], { env, encoding: "utf8", timeout: 180000 });
+  proc.kill();
+  if (res.status !== 0) { console.error(res.stdout, res.stderr); fail(`swarm code (greenfield) exited ${res.status}`); }
+  const { evs } = soleRunEvents(home);
+  const one = (t) => evs.find((e) => e.type === t);
+
+  const plan = one("code.plan");
+  if (!plan || plan.profile.greenfield !== true) fail("an empty repo must recon as greenfield (code.plan greenfield=true)");
+  ok("empty repo reconned as greenfield (code.plan)");
+
+  // Non-JSON criteria-split ⇒ the whole accept blob tracked as a single AC1 item.
+  const crit = one("code.criteria");
+  if (!crit || crit.items.length !== 1 || !/greet\(name\)/.test(crit.items[0].text)) fail("non-JSON criteria-split must fall back to one AC1 item carrying the whole blob");
+  ok("non-JSON criteria-split fell back to a single tracked criterion (no loss)");
+
+  // Invalid (file-colliding) BuildPlan ⇒ free-form fallback (waves null), no crash.
+  const design = one("code.design");
+  if (!design || design.plan.waves !== null) fail("a file-colliding BuildPlan must degrade to free-form (waves null), not pin a broken partition");
+  ok("invalid BuildPlan degraded to the free-form fallback (waves null), run continued");
+
+  const gate = evs.filter((e) => e.type === "code.gate").pop();
+  if (!gate || gate.green !== true) fail(`greenfield green-gate should pass after scaffold (got ${gate && gate.green})`);
+  ok("greenfield scaffolded a test command and the gate passed green (code.gate)");
+
+  for (const f of ["package.json", "greet.js"]) {
+    if (!fs.existsSync(path.join(repo, f))) fail(`greenfield deliverable ${f} should exist`);
+  }
+  const out = spawnSync(process.execPath, ["run-tests.js"], { cwd: repo, encoding: "utf8" });
+  if (out.status !== 0) fail("the scaffolded greenfield project should pass its own tests");
+  ok("greenfield deliverables present and the scaffolded project's tests pass");
+
+  if (evs.filter((e) => e.type === "run.status").pop().status !== "done") fail("greenfield run did not end done");
+  ok("run finished with status=done");
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(repo, { recursive: true, force: true });
+}
+
 async function phaseForecast() {
   console.log("\n▶ Phase 22: forecast mode — panel, mechanical aggregation, ledger, resolution");
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
@@ -1297,8 +1589,14 @@ async function main() {
   await phaseForecast();
   await phaseForecastMulti();
   await phaseTournamentPreset();
+  await phaseCode();
+  await phaseCodeEnsemble();
+  await phaseCodeRepair();
+  await phaseCodeUnverified();
+  await phaseCodeEnsembleFallback();
+  await phaseCodeGreenfield();
   console.log(
-    "\n✅ E2E passed — pipeline, auth failure, resume (with ledger re-seed), budget cap, verify-retry, steering + cancel, compaction, hub API, checkpoint resume, conductor breaker, blind verification, SIGTERM safety, 429 limiter, model tiers, hierarchical teams, the living plan, cascade root causes, failure diagnostics, forecast mode (panel → mechanical aggregation → ledger → resolution → calibration), open-ended decomposition (one question → independent sub-forecasts), and tournament imports (preset question, ledger origin, platform-resolution fallback) all work."
+    "\n✅ E2E passed — pipeline, auth failure, resume (with ledger re-seed), budget cap, verify-retry, steering + cancel, compaction, hub API, checkpoint resume, conductor breaker, blind verification, SIGTERM safety, 429 limiter, model tiers, hierarchical teams, the living plan, cascade root causes, failure diagnostics, forecast mode (panel → mechanical aggregation → ledger → resolution → calibration), open-ended decomposition (one question → independent sub-forecasts), tournament imports (preset question, ledger origin, platform-resolution fallback), and code mode (engine-owned build plan, TDD spec oracle, green-gate, adversarial diff-review, cross-run repo memory) all work."
   );
 }
 

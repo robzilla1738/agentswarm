@@ -1,8 +1,29 @@
 const test = require("node:test");
 const assert = require("node:assert");
 
-const { withTimeout } = require("../../dist/util.js");
+const { withTimeout, normalizeWorkdirRel, parseJsonLoose } = require("../../dist/util.js");
 const { synthReserve } = require("../../dist/executor.js");
+
+test("normalizeWorkdirRel: same file → same key (lock can't be dodged by spelling)", () => {
+  const wd = "/work/repo";
+  const k = normalizeWorkdirRel(wd, "src/a.ts");
+  assert.equal(k, "src/a.ts");
+  // INVARIANT (hard write-lock): absolute, ./, and ..-rejoined spellings of the
+  // SAME file must normalize to ONE key, else two live tasks could each write it.
+  assert.equal(normalizeWorkdirRel(wd, "./src/a.ts"), k);
+  assert.equal(normalizeWorkdirRel(wd, "/work/repo/src/a.ts"), k, "absolute path normalizes to the same key");
+  assert.equal(normalizeWorkdirRel(wd, "src/../src/a.ts"), k, "..-rejoin normalizes to the same key");
+  // A path escaping the workdir is not lockable (null), never silently mis-keyed.
+  assert.equal(normalizeWorkdirRel(wd, "../outside.ts"), null);
+  assert.equal(normalizeWorkdirRel(wd, "/etc/passwd"), null);
+});
+
+test("parseJsonLoose: tolerates fences/prose, picks the first array or object", () => {
+  assert.deepEqual(parseJsonLoose('["a","b"]'), ["a", "b"]);
+  assert.deepEqual(parseJsonLoose('here you go:\n```json\n["x"]\n```'), ["x"]);
+  assert.deepEqual(parseJsonLoose('prose {"k":1} trailing'), { k: 1 });
+  assert.equal(parseJsonLoose("not json at all"), undefined);
+});
 
 test("withTimeout aborts after the deadline and reports timedOut", async () => {
   const parent = new AbortController();

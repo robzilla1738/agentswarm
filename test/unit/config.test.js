@@ -38,6 +38,39 @@ test("crawl integration keys round-trip through save/load (trimmed)", () => {
   }
 });
 
+test("code-mode quality flags round-trip and coerce/clamp correctly", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-cfg-"));
+  const prevHome = process.env.AGENTSWARM_HOME;
+  try {
+    const { saveConfig, loadConfig, coerceConfigValue } = freshConfig(home);
+    // Defaults: all quality levers on.
+    const def = loadConfig();
+    assert.equal(def.codeTdd, true);
+    assert.equal(def.codeDesign, true);
+    assert.equal(def.codeRepoMap, true);
+    assert.equal(def.codeReview, true);
+    assert.equal(def.codeEnsemble, true);
+    assert.equal(def.codeRepoFacts, true);
+    assert.equal(def.codeEnsembleN, 3);
+    // Round-trip toggles + numeric clamping.
+    saveConfig({
+      codeTdd: coerceConfigValue("codeTdd", "false"),
+      codeReview: coerceConfigValue("codeReview", "false"),
+      codeEnsembleN: coerceConfigValue("codeEnsembleN", "99"), // clamped to max 6
+      codeReviewMaxRounds: coerceConfigValue("codeReviewMaxRounds", "0"), // min 0 allowed
+    });
+    const cfg = loadConfig();
+    assert.equal(cfg.codeTdd, false);
+    assert.equal(cfg.codeReview, false);
+    assert.equal(cfg.codeEnsembleN, 6, "ensemble N clamped to its max");
+    assert.equal(cfg.codeReviewMaxRounds, 0);
+  } finally {
+    if (prevHome) process.env.AGENTSWARM_HOME = prevHome;
+    else delete process.env.AGENTSWARM_HOME;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("crawlBackend enum rejects bogus values", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-cfg-"));
   const prevHome = process.env.AGENTSWARM_HOME;
