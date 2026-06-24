@@ -31,8 +31,8 @@ import {
   listRuns,
   loadMeta,
   loadRunState,
-  optionsFromConfig,
   readPid,
+  resolvedOptions,
   resumeInfo,
 } from "./run";
 import { SANDBOX_KINDS, SandboxKind, dockerAvailable, resolveSandboxKind, testSandbox } from "./sandbox";
@@ -364,7 +364,7 @@ async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL
       mission: body.mission.trim(),
       cwd,
       sandbox,
-      options: optionsFromConfig(cfg, overrides),
+      options: await resolvedOptions(cfg, overrides),
     });
     launchDetached(meta.id, opts.binPath);
     return sendJson(res, 200, { id: meta.id });
@@ -733,6 +733,7 @@ function sanitizeOptions(raw: unknown): Partial<RunOptions> {
   }
   bool("codeGreenfield");
   bool("codeGreenGate");
+  bool("codeCleanGate");
   bool("codeAutoCommit");
   bool("codeTdd");
   bool("codeDesign");

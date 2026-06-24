@@ -4,12 +4,29 @@ const {
   looksGreenfield,
   detectCommands,
   parseCheckOutput,
+  codeCacheCleanCommand,
   partitionWaves,
   coerceBuildModules,
   moduleFileOwner,
   buildRepoMap,
   gitDiffSince,
 } = require("../../dist/codeintel.js");
+
+/** Minimal RepoProfile for the cache-clean tests. */
+function profile(over = {}) {
+  return {
+    greenfield: false,
+    primaryLanguage: null,
+    packageManager: null,
+    framework: null,
+    commands: {},
+    monorepo: { tool: null, packages: [] },
+    git: { isRepo: true, branch: "main", dirty: false },
+    conventions: [],
+    manifestFiles: [],
+    ...over,
+  };
+}
 
 test("looksGreenfield: only dotfiles / README / LICENSE counts as empty", () => {
   assert.equal(looksGreenfield([]), true);
@@ -65,6 +82,37 @@ test("parseCheckOutput: typecheck error lines", () => {
   const r = parseCheckOutput("typecheck", "src/a.ts(3,1): error TS2345: bad\nok", 1);
   assert.equal(r.pass, false);
   assert.ok(r.failed >= 1);
+});
+
+test("codeCacheCleanCommand: JS/TS projects clear regenerable caches, never source/deliverables", () => {
+  // A JS project (detected by package manager) clears the framework + TS incremental caches.
+  const cmd = codeCacheCleanCommand(profile({ packageManager: "npm", primaryLanguage: "TypeScript", framework: "Next.js" }));
+  assert.ok(cmd, "a JS/TS project must get a clean command");
+  assert.match(cmd, /rm -rf /);
+  for (const c of [".next", "node_modules/.cache", "tsconfig.tsbuildinfo", "*.tsbuildinfo"]) {
+    assert.ok(cmd.includes(c), `should clear the regenerable cache ${c}`);
+  }
+  // NEVER touch source, node_modules itself, or a build output that could be the deliverable.
+  for (const danger of [" src", " node_modules ", " dist", " build", " out "]) {
+    assert.ok(!cmd.includes(danger), `must not remove ${danger.trim()}`);
+  }
+  // A no-match glob must not fail the gate.
+  assert.match(cmd, /; true\s*$/);
+});
+
+test("codeCacheCleanCommand: detects JS by a package.json manifest even without a package manager", () => {
+  const cmd = codeCacheCleanCommand(profile({ manifestFiles: ["package.json"] }));
+  assert.ok(cmd && cmd.includes(".next"), "package.json alone marks a JS project");
+});
+
+test("codeCacheCleanCommand: Python clears mypy/pytest caches", () => {
+  const cmd = codeCacheCleanCommand(profile({ primaryLanguage: "Python", manifestFiles: ["pyproject.toml"] }));
+  assert.ok(cmd && cmd.includes(".mypy_cache") && cmd.includes(".pytest_cache"));
+});
+
+test("codeCacheCleanCommand: nothing safe to clear → null (e.g. Rust/Go, content-addressed caches)", () => {
+  assert.equal(codeCacheCleanCommand(profile({ primaryLanguage: "Rust", manifestFiles: ["Cargo.toml"] })), null);
+  assert.equal(codeCacheCleanCommand(profile({ primaryLanguage: "Go", manifestFiles: ["go.mod"] })), null);
 });
 
 test("partitionWaves: disjoint modules with deps topo-sort into conflict-free waves", () => {

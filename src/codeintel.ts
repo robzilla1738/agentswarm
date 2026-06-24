@@ -498,6 +498,40 @@ export function formatCheckResult(
   return r.firstFailures.length ? `${head}\n${r.firstFailures.map((f) => `  ${f}`).join("\n")}` : head;
 }
 
+/**
+ * Best-effort shell command to wipe an ecosystem's REGENERABLE build/incremental
+ * caches before an authoritative cold build — or `null` when there's nothing safe
+ * to clear. A stale JS/TS incremental cache (Next's `.next`, a poisoned
+ * `tsconfig.tsbuildinfo`, Vite's `node_modules/.vite`, …) is the usual reason a
+ * tree the gate proved green still fails the operator's very first build: the
+ * on-disk source is correct, but the cache pins an older, broken view of a file.
+ * Only ever removes caches the next build regenerates — never source, never a
+ * `dist`/`build`/`out` directory (those can BE the deliverable), never
+ * `node_modules` itself. The trailing `; true` keeps a no-match glob from
+ * failing the gate.
+ */
+export function codeCacheCleanCommand(profile: RepoProfile): string | null {
+  const paths: string[] = [];
+  const isJs =
+    profile.packageManager !== null ||
+    profile.primaryLanguage === "TypeScript" ||
+    profile.primaryLanguage === "JavaScript" ||
+    profile.manifestFiles.some((f) => /(^|\/)package\.json$/.test(f));
+  if (isJs) {
+    paths.push(
+      ".next", ".turbo", ".svelte-kit", ".astro", ".nuxt", ".cache", ".parcel-cache",
+      "node_modules/.cache", "node_modules/.vite",
+      "tsconfig.tsbuildinfo", "*.tsbuildinfo"
+    );
+  }
+  const isPy =
+    profile.primaryLanguage === "Python" ||
+    profile.manifestFiles.some((f) => /(pyproject\.toml|setup\.py|requirements[^/]*\.txt)$/.test(f));
+  if (isPy) paths.push(".mypy_cache", ".pytest_cache", ".ruff_cache");
+  if (!paths.length) return null;
+  return `rm -rf ${paths.join(" ")} 2>/dev/null; true`;
+}
+
 // ---------------------------------------------------------------- git
 
 const GIT_ID = `-c user.name=agentswarm -c user.email=swarm@agentswarm.local -c commit.gpgsign=false`;

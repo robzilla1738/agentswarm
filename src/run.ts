@@ -2,12 +2,13 @@ import { spawn } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import { SwarmConfig, runDir, runsDir } from "./config";
+import { listModels, providerOf } from "./deepseek";
 import { Executor } from "./executor";
 import { Journal, TailState, eventsFile, readEvents, readNewEvents } from "./journal";
 import { resolveSandboxKind } from "./sandbox";
 import { RunState } from "./state";
 import { RunMeta, RunOptions, RunSummary } from "./types";
-import { ensureDir, rid, writeJson } from "./util";
+import { ensureDir, errMsg, rid, writeJson } from "./util";
 
 export interface CreateRunInput {
   mission: string;
@@ -35,6 +36,53 @@ export function optionsFromConfig(cfg: SwarmConfig, overrides: Partial<RunOption
     sandboxRuntime: resolveSandboxKind(cfg),
     ...overrides,
   };
+}
+
+/**
+ * The model ids a NEW run should launch with — resolved once at creation so the
+ * run is reproducible across resume. For a LOCAL provider with no model
+ * configured (LM Studio / custom / a fresh Ollama ship no default), this
+ * auto-picks the first model the server reports, so a keyless local setup just
+ * works instead of launching a `model:""` run that 404s on every call. Cloud
+ * providers — and any case where a model is already set — skip the lookup, so
+ * there is zero added latency on the common path.
+ */
+export async function resolveRunModels(
+  cfg: SwarmConfig,
+  overrides: Partial<RunOptions> = {}
+): Promise<{ model: string; conductorModel: string }> {
+  let model = overrides.model || cfg.model;
+  const provider = providerOf(cfg);
+  if (provider.local && !model) {
+    let models: string[] = [];
+    try {
+      models = await listModels(cfg);
+    } catch (e) {
+      throw new Error(
+        `Could not reach ${provider.label} at ${cfg.baseUrl} to auto-pick a model: ${errMsg(e)}. ` +
+          `Start the server, or set a model: swarm config set model <id>`
+      );
+    }
+    if (!models.length) {
+      throw new Error(
+        `No model is loaded on ${provider.label} (${cfg.baseUrl}). ` +
+          `Load/pull a model, or set one explicitly: swarm config set model <id>`
+      );
+    }
+    // Prefer a chat/instruct model — never auto-pick a text-embedding model,
+    // which can't drive the agent loop. Fall back to the first model if every
+    // one looks like an embedding model.
+    const usable = models.filter((m) => !/embed/i.test(m));
+    model = usable[0] || models[0];
+  }
+  const conductorModel = overrides.conductorModel || cfg.conductorModel || model;
+  return { model, conductorModel };
+}
+
+/** `optionsFromConfig` with the local-provider model auto-pick applied (async). */
+export async function resolvedOptions(cfg: SwarmConfig, overrides: Partial<RunOptions> = {}): Promise<RunOptions> {
+  const { model, conductorModel } = await resolveRunModels(cfg, overrides);
+  return optionsFromConfig(cfg, { ...overrides, model, conductorModel });
 }
 
 export function createRun(input: CreateRunInput): RunMeta {

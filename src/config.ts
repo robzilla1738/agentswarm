@@ -94,6 +94,15 @@ export interface SwarmConfig {
    */
   codeGreenGate: boolean;
   /**
+   * Code mode: after the incremental green-gate converges, run ONE authoritative
+   * build from cleared caches before shipping. Catches an error a warm
+   * incremental cache masked, and — just as important — leaves the delivered tree
+   * with a clean, reproducible cache instead of a poisoned one (a stale `.next` /
+   * `tsconfig.tsbuildinfo`) that fails the operator's first build. On by default;
+   * exhaustive builds always run it regardless of this flag.
+   */
+  codeCleanGate: boolean;
+  /**
    * Code mode: engine commits the tree on every passing verify (commit-on-green)
    * so an interrupted run resumes from a compiling commit. On the operator's real
    * directory it branches `swarm/<runid>` and refuses if the tree is dirty.
@@ -238,6 +247,7 @@ export const DEFAULTS: SwarmConfig = {
   forecastDecompose: true,
   forecastMaxSubQuestions: 6,
   codeGreenGate: true,
+  codeCleanGate: true,
   codeAutoCommit: true,
   codeGateMaxRounds: 2,
   codeTdd: true,
@@ -358,11 +368,15 @@ export function loadConfig(): SwarmConfig {
     apiKey: cred.apiKey || "",
     baseUrl: cred.baseUrl || info.baseUrl,
   };
-  // A cleared/hand-edited model must fall back, not brick every run with
-  // model:"" requests. (cheapModel/strongModel legitimately clear to "" —
-  // they mean "use `model`".)
-  if (!cfg.model) cfg.model = info.defaultModel;
-  if (!cfg.conductorModel) cfg.conductorModel = cfg.model;
+  // When the config file doesn't pin a model, default to the ACTIVE PROVIDER's
+  // default — NOT the global DEFAULTS (which is a DeepSeek id). Otherwise
+  // switching provider (e.g. to a local one, whose default is "" → auto-picked
+  // at launch from what the server has loaded) would silently keep a stale model
+  // from another provider and 404 every call. An explicit `model` in the file is
+  // always honored. (cheapModel/strongModel legitimately clear to "" — they mean
+  // "use `model`".)
+  if (!file.model) cfg.model = info.defaultModel;
+  if (!file.conductorModel) cfg.conductorModel = cfg.model;
   // Env overrides: provider-specific key env, plus legacy DEEPSEEK_API_KEY.
   if (info.keyEnv && process.env[info.keyEnv]) cfg.apiKey = process.env[info.keyEnv]!;
   if (process.env.TINYFISH_API_KEY) cfg.tinyfishApiKey = process.env.TINYFISH_API_KEY;
@@ -472,6 +486,7 @@ export const SETTABLE_KEYS: (keyof SwarmConfig)[] = [
   "forecastDecompose",
   "forecastMaxSubQuestions",
   "codeGreenGate",
+  "codeCleanGate",
   "codeAutoCommit",
   "codeGateMaxRounds",
   "codeTdd",
@@ -564,6 +579,7 @@ export function coerceConfigValue(key: keyof SwarmConfig, raw: unknown): unknown
     key === "forecastSimulate" ||
     key === "forecastDecompose" ||
     key === "codeGreenGate" ||
+    key === "codeCleanGate" ||
     key === "codeAutoCommit" ||
     key === "codeTdd" ||
     key === "codeDesign" ||

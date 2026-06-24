@@ -26,7 +26,7 @@ import {
   listRuns,
   loadMeta,
   loadRunState,
-  optionsFromConfig,
+  resolvedOptions,
   resumeInfo,
   writePid,
 } from "./run";
@@ -297,7 +297,7 @@ async function cmdRun(mission: string, flags: Args["flags"]): Promise<void> {
     mission: mission.trim(),
     cwd,
     sandbox,
-    options: optionsFromConfig(cfg, overrides),
+    options: await resolvedOptions(cfg, overrides),
   });
 
   if (flags.fg) {
@@ -644,7 +644,7 @@ async function cmdForecasts(sub?: string, flags: Args["flags"] = {}): Promise<vo
           mission: `Re-forecast (update trigger fired): ${entry.question.text}\nWhat fired: ${a.summary}`,
           cwd: process.cwd(),
           sandbox: true,
-          options: optionsFromConfig(cfg, {
+          options: await resolvedOptions(cfg, {
             maxTasks: Math.min(cfg.maxTasks, 16),
             maxTokens: Math.min(cfg.maxTokensPerRun, 4_000_000),
             ...(cfg.cheapModel ? { model: cfg.cheapModel } : {}),
@@ -806,7 +806,7 @@ async function cmdTournament(flags: Args["flags"]): Promise<void> {
       mission: `Forecast: ${q.title}`,
       cwd: process.cwd(),
       sandbox: true,
-      options: optionsFromConfig(cfg, {
+      options: await resolvedOptions(cfg, {
         // Tournament defaults: small cheap panels — volume over polish. Any
         // explicit flag (--panel/--budget/--model/...) wins over these. The
         // budget must survive a compact research wave + panel + red team;
@@ -1261,7 +1261,10 @@ async function cmdConfig(rest: string[], flags: Args["flags"]): Promise<void> {
 
 async function cmdModels(): Promise<void> {
   const cfg = loadConfig();
-  if (!cfg.apiKey) {
+  // Keyless local providers (LM Studio / Ollama / custom) still have a live
+  // /models (or /api/tags) endpoint — only fall back to the priced list when a
+  // key is genuinely required and missing.
+  if (!cfg.apiKey && PROVIDERS[cfg.provider].keyRequired) {
     console.log(ansi.gray("known (priced) models:"));
     for (const m of Object.keys(cfg.pricing)) console.log("  " + m);
     console.log(ansi.gray("\nset an API key to list live models: swarm config set apiKey <sk-...>"));
@@ -1295,7 +1298,7 @@ async function cmdDemo(flags: Args["flags"]): Promise<void> {
     mission,
     cwd: process.cwd(),
     sandbox: true,
-    options: optionsFromConfig(cfg, { maxWorkers: 4, maxTasks: 12, ...optionOverrides(flags, cfg) }),
+    options: await resolvedOptions(cfg, { maxWorkers: 4, maxTasks: 12, ...optionOverrides(flags, cfg) }),
   });
   console.log(ansi.cyan("running demo mission in an isolated workspace…\n"));
   await execForeground(cfg, meta, true);
@@ -1386,7 +1389,7 @@ ${b("USAGE")}
   swarm cancel <id>                   stop a run gracefully (still synthesizes)
   swarm config [list|get|set|unset|path]  manage config (~/.agentswarm/config.json)
   swarm sandbox [test|<runtime>]      show / smoke-test the shell runtime (host, docker, e2b, modal, vercel)
-  swarm models                        list models from the active provider
+  swarm models                        list models from the active provider (no key needed for local servers)
   swarm demo [--mission "..."]        run a self-contained demo mission (override the canned prompt)
 
 ${b("RUN OPTIONS")}

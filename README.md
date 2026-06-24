@@ -85,6 +85,25 @@ Type a mission, hit Launch swarm, and watch it work. Or stay in the terminal:
 swarm run "Research the best open-source vector DBs in 2026 and write a recommendation"
 ```
 
+### Local models (LM Studio / Ollama) — fully offline, no key
+
+Every mode (research, forecast, code) runs on a local model. Point the swarm at a local server and it handles the rest:
+
+```bash
+# LM Studio: start its server and load a model in the app, then —
+swarm config set provider lmstudio        # or: ollama   (custom = any OpenAI-compatible server)
+swarm models                              # lists the models the server has loaded/pulled — no key needed
+swarm run "Summarize what an agent swarm is"   # auto-picks a loaded model if you didn't set one
+```
+
+- **No API key** — local providers are keyless; the swarm never asks for one.
+- **Auto-discovery** — `swarm models` (and the Settings/composer pickers) list what the server actually has, live. Ollama is read from its native `/api/tags` (what you've pulled); LM Studio/custom from `/v1/models` (what's loaded).
+- **Auto-pick** — if you don't set a model, the engine launches with the first one the server reports, so there's nothing to configure. Pin one anytime with `swarm config set model <id>`.
+- **Tuned for one GPU** — concurrency is capped for local servers (they serve ~one request at a time), and the idle timeout is relaxed so a cold model load isn't aborted mid-prefill.
+- **Custom endpoint** — vLLM, llama.cpp, or anything OpenAI-compatible: `swarm config set provider custom` then `swarm config set baseUrl http://host:port/v1`.
+
+> Quality scales with the local model. A capable instruction-tuned model with reliable tool-calling (e.g. a 14B+ coder/instruct) handles the swarm's tool protocol best; very small models may struggle with multi-step tool use. Switch back to a cloud provider anytime — keys are kept per provider, so nothing is lost.
+
 ## CLI
 
 | Command | What it does |

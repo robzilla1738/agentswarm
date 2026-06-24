@@ -114,7 +114,7 @@ import { canonicalizeUrl } from "./searchcore";
 import { aggregateSources, renderFinalHtml, sourcesBlock } from "./report";
 import { SandboxRuntime, createSandbox } from "./sandbox";
 import { RunState } from "./state";
-import { buildRepoMap, coerceBuildModules, formatCheckResult, gitAddWorktree, gitCommitGreen, gitDiffSince, gitMergeWorktreeBranch, gitPrepare, gitRemoveWorktree, gitResetTo, parseCheckOutput, partitionWaves, reconRepo } from "./codeintel";
+import { buildRepoMap, codeCacheCleanCommand, coerceBuildModules, formatCheckResult, gitAddWorktree, gitCommitGreen, gitDiffSince, gitMergeWorktreeBranch, gitPrepare, gitRemoveWorktree, gitResetTo, parseCheckOutput, partitionWaves, reconRepo } from "./codeintel";
 import { appendRepoFacts, loadRepoFacts, manifestHash, mergeConfirmedCommands, repoKey } from "./codeledger";
 import { AcceptanceItem, AggregateForecast, BuildPlan, CodeCommands, CodeDepth, CodeGateResult, DomainId, FittedParams, Forecast, ForecastQuestion, MarketAnchor, RepoMap, RepoProfile, RunMeta, RunStatus, SimDriver, SourceRef, Task, TaskSpec, Usage, usageCost } from "./types";
 import { canonicalArtifactRel, clip, ensureDir, errMsg, normalizeWorkdirRel, oneLine, parseJsonLoose, rid, sleep, truncateMiddle, validateArtifactFormat, withTimeout } from "./util";
@@ -602,6 +602,11 @@ export class Executor {
           while (await this.greenGate()) await this.mainLoop();
         }
       }
+      // Code mode: one authoritative COLD build (caches cleared) seals the run —
+      // it catches an error a warm incremental cache hid and leaves the delivered
+      // tree with a clean, reproducible cache instead of a poisoned one that fails
+      // the operator's first build.
+      await this.finalCleanGate();
     } catch (e) {
       if (!this.ac.signal.aborted) {
         this.journal.append("log", { level: "error", msg: `executor error: ${errMsg(e)}` });
@@ -694,6 +699,11 @@ export class Executor {
   /** Code mode: per-run green-gate / commit toggles (per-run option → cfg default). */
   private codeGateEnabled(): boolean {
     return this.meta.options.codeGreenGate ?? this.cfg.codeGreenGate;
+  }
+  /** The authoritative cold-cache build before ship — on by default, and always on for exhaustive builds. */
+  private codeCleanGateEnabled(): boolean {
+    if (this.codeAmbition() === "exhaustive") return true;
+    return (this.meta.options.codeCleanGate ?? this.cfg.codeCleanGate) !== false;
   }
   private codeTddEnabled(): boolean {
     return this.meta.options.codeTdd ?? this.cfg.codeTdd;
@@ -3057,8 +3067,21 @@ PROTOCOL
   }
 
   /** Run the detected build → typecheck → test, fail-fast, into a structured result (against `cwd`, defaulting to the live tree). */
-  private async runGateChecks(cwd: string = this.sandbox.workdir): Promise<CodeGateResult> {
+  private async runGateChecks(cwd: string = this.sandbox.workdir, opts: { clean?: boolean } = {}): Promise<CodeGateResult> {
     const cmds: CodeCommands = this.repoProfile?.commands ?? {};
+    // Authoritative cold build: wipe regenerable framework/incremental caches first
+    // so an error a warm cache masked surfaces, and the delivered tree isn't left
+    // carrying a poisoned cache. Best-effort — a clean failure must never block the gate.
+    if (opts.clean && this.repoProfile) {
+      const cleanCmd = codeCacheCleanCommand(this.repoProfile);
+      if (cleanCmd) {
+        try {
+          await this.sandbox.exec(cleanCmd, { cwd, timeoutSec: 120, signal: this.ac.signal });
+        } catch {
+          /* best-effort cache clear */
+        }
+      }
+    }
     const order: (keyof CodeCommands)[] = ["build", "typecheck", "test"];
     const ran: CodeGateResult["ran"] = [];
     const parts: string[] = [];
@@ -3114,6 +3137,63 @@ PROTOCOL
     }
     if (!ran.length) return { green: false, skipped: true, summary: "no build/typecheck/test command detected — green-gate skipped (tree NOT verified)", ran };
     return { green, summary: parts.join("\n"), ran };
+  }
+
+  /**
+   * The authoritative COLD build that seals the run. The per-round green-gate
+   * builds incrementally for speed — fast, but a warm cache can both hide a real
+   * error AND get left on disk in a poisoned state, so the OPERATOR's very first
+   * `npm run build` fails on code that is actually correct (the exact "the gate
+   * said green but it doesn't build" complaint). Once the incremental loops have
+   * converged, this clears the regenerable caches and re-runs build→typecheck→test
+   * from cold: a masked error is caught (and gets a small bounded fix budget), and
+   * the delivered tree carries a clean, reproducible cache. The green it produces
+   * is what the synthesizer quotes as test evidence; on RED past the budget the
+   * run still ships, honestly, with the cold failure recorded.
+   */
+  private async finalCleanGate(): Promise<void> {
+    if (!this.codeMode() || !this.codeGateEnabled() || !this.codeCleanGateEnabled()) return;
+    if (this.fatal || this.ac.signal.aborted || this.budgetExceeded()) return;
+    if (this.finishReason.includes("cancel") || this.finishReason.includes("conductor unavailable")) return;
+    if (!this.taskList().some((t) => t.status === "done")) return;
+    const cmds: CodeCommands = this.repoProfile?.commands ?? {};
+    if (!cmds.build && !cmds.typecheck && !cmds.test) return; // nothing to verify cold — leave the incremental verdict
+
+    const base = this.cfg.codeGateMaxRounds ?? 2;
+    const maxRounds = this.codeAmbition() === "exhaustive" ? Math.max(2, base) : Math.max(1, base);
+    for (let round = 0; ; round++) {
+      if (this.fatal || this.ac.signal.aborted || this.budgetExceeded()) return;
+      // The clean build runs against the LIVE tree — quiesce any in-flight worker first.
+      if (this.inflight.size) await Promise.allSettled([...this.inflight.values()]);
+      const result = await this.runGateChecks(this.sandbox.workdir, { clean: true });
+      this.journal.append("code.gate", { green: result.green, clean: true, skipped: result.skipped ?? false, summary: clip(result.summary, 2000) });
+      if (result.skipped) return; // commands vanished mid-run — nothing ran
+      this.lastGateSummary = result.summary;
+      if (result.green) {
+        this.lastGateGreen = true;
+        await this.commitGreen("clean-build verified");
+        return;
+      }
+      // Cold build is RED: an error the warm incremental cache hid, or a regression
+      // a late fix introduced. Spend a small bounded budget driving it green.
+      this.lastGateGreen = false;
+      if (round >= maxRounds) {
+        this.journal.append("log", { level: "warn", msg: "clean build still red after fix rounds — shipping with known failures" });
+        return;
+      }
+      this.gateRounds = round + 1; // drives spawnGateFix's messaging + strong-tier escalation
+      this.finishing = false;
+      if (!(await this.spawnGateFix(result, maxRounds))) {
+        // Task cap hit — fall back to one targeted conductor ask.
+        this.appendConductorUpdate(
+          `CLEAN-BUILD RED before shipping (fix round ${round + 1}/${maxRounds}). A from-scratch build with caches cleared does NOT pass:\n${clip(result.summary, 2000)}\n` +
+            "Spawn ONE focused fix task (verify:true) on the failing files. This is the final cold gate before the deliverable ships."
+        );
+        await this.conductorTurn();
+        if (this.lastConductorAction !== "spawn") return; // conductor declined — ship honest red
+      }
+      await this.mainLoop();
+    }
   }
 
   // ---------------------------------------------------------------- conductor

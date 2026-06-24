@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.24.0
+
+Two things: local models that just work, and code builds you can trust.
+
+### Local models (LM Studio / Ollama), done right
+
+Every mode — research, forecast, code — runs fully offline on a local model. The provider plumbing already spoke OpenAI-compatible to local servers; this release closes the gaps that stopped a keyless local setup from being hands-off, and tunes it for a single local GPU.
+
+- **Keyless model discovery.** `swarm models` (and the Settings/composer pickers) now list a local server's loaded/pulled models without an API key — previously the CLI demanded a key first. Ollama is read from its native `/api/tags` (what you've pulled); LM Studio / custom from `/v1/models`.
+- **Auto-pick a loaded model.** Local providers ship no default model, so a fresh `swarm config set provider lmstudio` (or `ollama`) just works: the engine launches with the first chat model the server reports (skipping embedding models), resolved once at run creation so it's stable across resume. Pin one anytime with `swarm config set model <id>`.
+- **No more stale cross-provider model.** Switching providers without setting a model now defaults to *that provider's* default instead of silently keeping a DeepSeek id (which 404'd every call). An explicit model is always honored.
+- **Tuned for one GPU.** Concurrency is capped per-provider for local servers (they serve ~one request at a time), so a wide swarm no longer thrashes them — your own lower `maxConcurrentCalls` still wins. The idle timeout is relaxed for local providers so a cold model load isn't aborted mid-prefill.
+- **Composer shows live models.** The per-run worker-model picker now lists the active provider's live models, not just static suggestions.
+- `custom` is now treated as a local provider (vLLM, llama.cpp, any OpenAI-compatible `/v1`). Verified live against LM Studio: keyless discovery, auto-pick, generation, and tool-calling all work.
+
+### Reliable code builds — the gate now matches the operator's first build
+
+Fixes the most damaging code-mode failure: **the gate said green, but the operator's first `npm run build` failed.**
+
+- **Authoritative clean (cold-cache) build before ship.** The per-round green-gate builds *incrementally* for speed — fast, but a warm framework cache (Next's `.next`, a stale `tsconfig.tsbuildinfo`, Vite's `node_modules/.vite`, …) can both hide a real error and, worse, get left on disk in a poisoned state, so the delivered tree fails the operator's first build on code that is actually correct. Once the incremental loops converge, the engine now clears the regenerable caches and re-runs build→typecheck→test **from cold**: a masked error is caught (and gets its own small bounded fix budget), and the tree ships with a clean, reproducible cache instead of a poisoned one. The cold-build result is what the report quotes as test evidence. On by default (`codeCleanGate`); exhaustive builds always run it.
+- The cache-clear only ever removes caches the next build regenerates — never source, never a `dist`/`build`/`out` directory, never `node_modules` itself.
+- **Build Console** labels the final cold build distinctly ("clean build · cold") in the verification timeline.
+- Dev ergonomics: `E2E_ONLY=<substr>` runs a subset of e2e phases (e.g. `E2E_ONLY=code`).
+
 ## 0.23.0
 
 Code (build) mode, tuned for **exhaustive, ambitious builds**. v0.22.0 gave code mode engine-owned structure and adversarial verification; this release fixes the failure mode where an ambitious mission ("a 1:1, beautiful clone of X, with skills + connectors") was quietly collapsed into a generic prototype and then graded against its own shrunken bar. Full feature doc: [`docs/code-mode.md`](docs/code-mode.md).

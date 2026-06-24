@@ -65,7 +65,7 @@ export interface CodeState {
   specSeeded: boolean;
   /** The build arc (recon → build → integrate → harden …) as the engine sets each phase. */
   phases: { name: string; goal?: string; exit?: string; t: number }[];
-  gates: { green: boolean; skipped: boolean; summary: string }[];
+  gates: { green: boolean; skipped: boolean; clean: boolean; summary: string }[];
   reviews: { clean: boolean; issues: string[]; round: number }[];
   /** Completeness / parity critic verdicts: whether the green tree delivers the FULL mission. */
   completeness: { complete: boolean; gaps: string[]; round: number }[];
@@ -480,7 +480,7 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
     }
     case "code.gate": {
       const c = (s.code ??= emptyCode());
-      c.gates.push({ green: Boolean(ev.green), skipped: Boolean(ev.skipped), summary: String(ev.summary ?? "") });
+      c.gates.push({ green: Boolean(ev.green), skipped: Boolean(ev.skipped), clean: Boolean(ev.clean), summary: String(ev.summary ?? "") });
       break;
     }
     case "code.review": {

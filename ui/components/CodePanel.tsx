@@ -156,7 +156,8 @@ function VerificationTimeline({ code }: { code: CodeState }) {
         {code.gates.map((g, i) => (
           <div key={`g${i}`} className="tile px-2.5 py-2">
             <div className="flex items-center gap-2 flex-wrap">
-              <span className="mono text-2xs" style={{ color: "var(--color-ink-faint)" }}>gate {i + 1}</span>
+              <span className="mono text-2xs" style={{ color: "var(--color-ink-faint)" }}>{g.clean ? "clean build" : `gate ${i + 1}`}</span>
+              {g.clean && <span className="chip" title="Authoritative build from cleared caches — what the operator's first build will see.">cold</span>}
               <span className={`chip ${g.green ? "chip-solid" : ""}`}>{g.green ? "green" : g.skipped ? "unverified" : "red"}</span>
               {parseGate(g.summary).map((c, j) => (
                 <span key={j} className="mono text-2xs" style={{ color: c.status === "fail" ? "var(--color-ink)" : "var(--color-ink-dim)" }} title={g.summary}>

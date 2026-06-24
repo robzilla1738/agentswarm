@@ -21,7 +21,7 @@ export interface ChatMsg {
   tool_call_id?: string;
 }
 
-function providerOf(cfg: SwarmConfig): ProviderInfo {
+export function providerOf(cfg: SwarmConfig): ProviderInfo {
   return PROVIDERS[cfg.provider] ?? PROVIDERS.deepseek;
 }
 
@@ -215,12 +215,17 @@ const gates = new Map<string, CallGate>();
 
 export function gateFor(cfg: SwarmConfig): CallGate {
   const key = cfg.baseUrl;
+  // A provider's own cap (local servers serve ~one request at a time) bounds the
+  // user's maxConcurrentCalls — whichever is lower wins, so a 16-wide swarm never
+  // thrashes one local GPU, but a user who lowers maxConcurrentCalls is honored.
+  const cap = providerOf(cfg).maxConcurrency;
+  const limit = cap ? Math.min(cfg.maxConcurrentCalls, cap) : cfg.maxConcurrentCalls;
   let g = gates.get(key);
   if (!g) {
-    g = new CallGate(cfg.maxConcurrentCalls);
+    g = new CallGate(limit);
     gates.set(key, g);
   }
-  g.configure(cfg.maxConcurrentCalls);
+  g.configure(limit);
   return g;
 }
 
@@ -297,9 +302,13 @@ async function chatOnce(cfg: SwarmConfig, o: ChatOpts): Promise<ChatResult> {
   const onOuterAbort = () => ac.abort();
   o.signal?.addEventListener("abort", onOuterAbort, { once: true });
 
+  // A local model loading cold can take minutes before its first token — give
+  // local providers a much longer idle window so a slow prefill isn't aborted as
+  // a hung request. The hard ceiling (requestTimeoutMs) still bounds the call.
+  const idleMs = providerOf(cfg).local ? Math.max(cfg.idleTimeoutMs, 600_000) : cfg.idleTimeoutMs;
   let lastActivity = Date.now();
   const idleTimer = setInterval(() => {
-    if (Date.now() - lastActivity > cfg.idleTimeoutMs) ac.abort();
+    if (Date.now() - lastActivity > idleMs) ac.abort();
   }, 5000);
   const hardTimer = setTimeout(() => ac.abort(), cfg.requestTimeoutMs);
 
@@ -469,6 +478,17 @@ export async function listModels(cfg: SwarmConfig): Promise<string[]> {
   const base = cfg.baseUrl.replace(/\/+$/, "");
   const headers: Record<string, string> = {};
   if (cfg.apiKey) headers.authorization = `Bearer ${cfg.apiKey}`;
+  // Ollama: prefer the native /api/tags — it's the canonical list of *pulled*
+  // models and stays populated even when the OpenAI-compat /v1/models shim is
+  // empty. Fall through to /v1/models on any failure.
+  if (cfg.provider === "ollama") {
+    try {
+      const tags = await ollamaTags(base, headers);
+      if (tags.length) return tags;
+    } catch {
+      /* fall back to /v1/models below */
+    }
+  }
   const res = await fetch(`${base}/models`, {
     headers,
     signal: AbortSignal.timeout(15000),
@@ -476,4 +496,17 @@ export async function listModels(cfg: SwarmConfig): Promise<string[]> {
   if (!res.ok) throw new ApiError(res.status, await res.text().catch(() => ""));
   const data: any = await res.json();
   return (data.data || []).map((m: any) => m.id).filter(Boolean);
+}
+
+/** Ollama's native pulled-model endpoint, derived from the OpenAI-compat base (…:11434/v1 → …:11434/api/tags). */
+export function ollamaTagsUrl(base: string): string {
+  return `${base.replace(/\/+$/, "").replace(/\/v1$/, "")}/api/tags`;
+}
+
+/** Pulled Ollama models via the native /api/tags (returns model names). */
+async function ollamaTags(base: string, headers: Record<string, string>): Promise<string[]> {
+  const res = await fetch(ollamaTagsUrl(base), { headers, signal: AbortSignal.timeout(15000) });
+  if (!res.ok) throw new ApiError(res.status, await res.text().catch(() => ""));
+  const data: any = await res.json();
+  return (data.models || []).map((m: any) => m.name).filter(Boolean);
 }

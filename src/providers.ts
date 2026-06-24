@@ -37,6 +37,12 @@ export interface ProviderInfo {
   /** Fallback suggestions when /models is unavailable. */
   knownModels: string[];
   local?: boolean;
+  /**
+   * Cap on concurrent requests to this provider, independent of the user's
+   * `maxConcurrentCalls`. Local servers (one GPU) serve ~one request at a time,
+   * so a wide swarm must not pile 16 calls onto them. Omitted → no extra cap.
+   */
+  maxConcurrency?: number;
   note?: string;
 }
 
@@ -131,9 +137,12 @@ export const PROVIDERS: Record<ProviderId, ProviderInfo> = {
     deepseekThinking: false,
     efforts: [],
     maxTokensParam: "max_tokens",
-    defaultModel: "qwen3",
+    // Empty default → the engine auto-picks the first pulled model, so a fresh
+    // Ollama with any model works without `swarm config set model`.
+    defaultModel: "",
     knownModels: ["qwen3", "llama3.3", "deepseek-r1", "gpt-oss:20b"],
     local: true,
+    maxConcurrency: 4,
     note: "Free + private. The models list shows what you have pulled.",
   },
   lmstudio: {
@@ -147,7 +156,8 @@ export const PROVIDERS: Record<ProviderId, ProviderInfo> = {
     defaultModel: "",
     knownModels: [],
     local: true,
-    note: "Start the LM Studio server, then pick a loaded model.",
+    maxConcurrency: 4,
+    note: "Start the LM Studio server and load a model — the engine auto-picks it.",
   },
   custom: {
     id: "custom",
@@ -159,6 +169,8 @@ export const PROVIDERS: Record<ProviderId, ProviderInfo> = {
     maxTokensParam: "max_tokens",
     defaultModel: "",
     knownModels: [],
+    local: true,
+    maxConcurrency: 4,
     note: "Any OpenAI-compatible /chat/completions server (vLLM, llama.cpp, …).",
   },
 };

@@ -30,9 +30,10 @@ swarm code "<build task>" [--accept "<done when>"] [--depth prototype|standard|e
 8. **Engine green-gate + repair** — at quiescence the engine runs the real build→typecheck→test. On RED it spawns its *own* targeted fix task (bisected to the files changed since the last green commit, escalated to the strong tier on a repeat), rather than round-tripping the conductor.
 9. **Adversarial diff-review** — once green, a blind strong critic judges the actual `git diff` against the criteria and correctness/security/convention rubrics (what "green" hides); real findings reopen the loop.
 10. **Completeness / parity critic** — a strong-tier critic then judges the green tree against the **full mission** (not just the reduced criteria) and reopens the build with concrete missing-feature tasks — the net for "it compiles and passes its own tests, but isn't actually what was asked for". On by default for `exhaustive` builds.
-11. **Synthesis** — the deliverable is the **working tree** plus a PR-style `CHANGES.md` (files changed, how to build/run, verbatim green-gate evidence, each acceptance criterion mapped to evidence or marked UNMET).
+11. **Authoritative clean build** — the per-round gate builds *incrementally* for speed, which can both hide a real error behind a warm framework cache and leave a poisoned incremental cache (a stale `.next` / `tsconfig.tsbuildinfo`) on disk so the operator's very first build fails on correct code. Once the loops converge the engine clears the regenerable caches and re-runs build→typecheck→test **from cold**: a masked error is caught (with its own small fix budget), and the tree ships with a clean, reproducible cache. This cold result is the green the report quotes. On by default (`codeCleanGate`); `exhaustive` always runs it.
+12. **Synthesis** — the deliverable is the **working tree** plus a PR-style `CHANGES.md` (files changed, how to build/run, verbatim green-gate evidence, each acceptance criterion mapped to evidence or marked UNMET).
 
-The pipeline surfaces live in the UI's **Build Console** (`CodePanel`): the build-arc phase timeline, the acceptance checklist, the pinned plan as a wave graph with per-module live status, a verification timeline (parsed gate pass-counts + diff-review + parity findings), best-of-N comparisons, and a files-changed tree.
+The pipeline surfaces live in the UI's **Build Console** (`CodePanel`): the build-arc phase timeline, the acceptance checklist, the pinned plan as a wave graph with per-module live status, a verification timeline (parsed gate pass-counts + diff-review + parity findings, and the final cold build labeled "clean build"), best-of-N comparisons, and a files-changed tree.
 
 > **Model tiers.** The "strong" tier resolves to your configured strong model, falling back to the **conductor** model (not the cheap worker) — so the critics and integration always run on a capable model. An `exhaustive` build runs all craft there too. **Quality is independent of `--no-commit`:** sandbox/greenfield workspaces always snapshot a baseline, and a real repo with auto-commit off gets a read-only HEAD baseline, so the diff-review and best-of-N ensembles run either way.
 
@@ -60,6 +61,6 @@ The pipeline surfaces live in the UI's **Build Console** (`CodePanel`): the buil
 | `--no-ensemble` | Disallow best-of-N ensembles. |
 | `--no-repo-facts` | Skip cross-run repo memory. |
 
-All default ON (config: `codeTdd`, `codeDesign`, `codeRepoMap`, `codeReview`, `codeEnsemble`, `codeRepoFacts`, plus `codeGreenGate`, `codeAutoCommit`, `codeGateMaxRounds`, `codeReviewMaxRounds`, `codeEnsembleN`, `codeRepoMapMaxTokens`).
+All default ON (config: `codeTdd`, `codeDesign`, `codeRepoMap`, `codeReview`, `codeEnsemble`, `codeRepoFacts`, plus `codeGreenGate`, `codeCleanGate`, `codeAutoCommit`, `codeGateMaxRounds`, `codeReviewMaxRounds`, `codeEnsembleN`, `codeRepoMapMaxTokens`).
 
 See [`docs/code-mode-plan.md`](code-mode-plan.md) for the original design notes.

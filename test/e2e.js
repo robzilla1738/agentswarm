@@ -1022,6 +1022,13 @@ async function phaseCode() {
   if (!gate || gate.green !== true) fail(`green-gate should pass (got ${gate && gate.green})`);
   ok("engine green-gate passed on the real test command (code.gate)");
 
+  // The authoritative COLD build (caches cleared) seals the run: it must run, be
+  // green, and be the LAST gate — so the delivered tree carries a clean cache and
+  // the operator's first build matches what shipped.
+  if (gate.clean !== true) fail("the final gate must be the clean (cold-cache) build (code.gate clean=true)");
+  if (!evs.some((e) => e.type === "code.gate" && e.clean === true && e.green === true)) fail("a clean-build gate should run green before shipping");
+  ok("authoritative clean (cold-cache) build sealed the run green (code.gate clean=true)");
+
   const review = one("code.review");
   if (!review || review.clean !== true) fail("adversarial diff-review should run and pass clean (code.review)");
   ok("adversarial diff-review ran clean (code.review)");
@@ -1565,38 +1572,30 @@ async function phaseForecastMulti() {
 }
 
 async function main() {
-  await phaseHappy();
-  await phaseAuthFail();
-  await phaseResume();
-  await phaseDocker();
-  await phaseBudget();
-  await phaseVerifyRetry();
-  await phaseNoteCancel();
-  await phaseCompaction();
-  await phaseHubSmoke();
-  await phaseCheckpointResume();
-  await phaseConductorBreaker();
-  await phaseBlindVerifier();
-  await phaseSigterm();
-  await phaseRateLimit();
-  await phaseModelTiers();
-  await phaseTeam();
-  await phaseLongHorizon();
-  await phaseDepChain();
-  await phaseDiagnostics();
-  await phaseStrictVerify();
-  await phaseCitations();
-  await phaseForecast();
-  await phaseForecastMulti();
-  await phaseTournamentPreset();
-  await phaseCode();
-  await phaseCodeEnsemble();
-  await phaseCodeRepair();
-  await phaseCodeUnverified();
-  await phaseCodeEnsembleFallback();
-  await phaseCodeGreenfield();
+  // Each phase is named so a subset can be run in isolation during development:
+  // `E2E_ONLY=code node test/e2e.js` runs only phases whose name contains "code".
+  const phases = [
+    ["happy", phaseHappy], ["authFail", phaseAuthFail], ["resume", phaseResume], ["docker", phaseDocker],
+    ["budget", phaseBudget], ["verifyRetry", phaseVerifyRetry], ["noteCancel", phaseNoteCancel],
+    ["compaction", phaseCompaction], ["hubSmoke", phaseHubSmoke], ["checkpointResume", phaseCheckpointResume],
+    ["conductorBreaker", phaseConductorBreaker], ["blindVerifier", phaseBlindVerifier], ["sigterm", phaseSigterm],
+    ["rateLimit", phaseRateLimit], ["modelTiers", phaseModelTiers], ["team", phaseTeam],
+    ["longHorizon", phaseLongHorizon], ["depChain", phaseDepChain], ["diagnostics", phaseDiagnostics],
+    ["strictVerify", phaseStrictVerify], ["citations", phaseCitations], ["forecast", phaseForecast],
+    ["forecastMulti", phaseForecastMulti], ["tournamentPreset", phaseTournamentPreset],
+    ["code", phaseCode], ["codeEnsemble", phaseCodeEnsemble], ["codeRepair", phaseCodeRepair],
+    ["codeUnverified", phaseCodeUnverified], ["codeEnsembleFallback", phaseCodeEnsembleFallback],
+    ["codeGreenfield", phaseCodeGreenfield],
+  ];
+  const only = (process.env.E2E_ONLY || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  for (const [name, fn] of phases) {
+    if (only.length && !only.some((o) => name.toLowerCase().includes(o))) continue;
+    await fn();
+  }
   console.log(
-    "\n✅ E2E passed — pipeline, auth failure, resume (with ledger re-seed), budget cap, verify-retry, steering + cancel, compaction, hub API, checkpoint resume, conductor breaker, blind verification, SIGTERM safety, 429 limiter, model tiers, hierarchical teams, the living plan, cascade root causes, failure diagnostics, forecast mode (panel → mechanical aggregation → ledger → resolution → calibration), open-ended decomposition (one question → independent sub-forecasts), tournament imports (preset question, ledger origin, platform-resolution fallback), and code mode (engine-owned build plan, TDD spec oracle, green-gate, adversarial diff-review, cross-run repo memory) all work."
+    only.length
+      ? `\n✅ E2E subset passed (${only.join(", ")}).`
+      : "\n✅ E2E passed — pipeline, auth failure, resume (with ledger re-seed), budget cap, verify-retry, steering + cancel, compaction, hub API, checkpoint resume, conductor breaker, blind verification, SIGTERM safety, 429 limiter, model tiers, hierarchical teams, the living plan, cascade root causes, failure diagnostics, forecast mode (panel → mechanical aggregation → ledger → resolution → calibration), open-ended decomposition (one question → independent sub-forecasts), tournament imports (preset question, ledger origin, platform-resolution fallback), and code mode (engine-owned build plan, TDD spec oracle, green-gate, adversarial diff-review, cross-run repo memory) all work."
   );
 }
 

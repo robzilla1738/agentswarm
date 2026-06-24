@@ -72,6 +72,7 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
   const [budgetM, setBudgetM] = useState(12);
   const [verification, setVerification] = useState("normal");
   const [model, setModel] = useState("deepseek-v4-flash");
+  const [liveModels, setLiveModels] = useState<string[]>([]);
   const [effort, setEffort] = useState("high");
   const [workspace, setWorkspace] = useState<"sandbox" | "dir">("sandbox");
   const [cwd, setCwd] = useState("");
@@ -133,6 +134,21 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
   useEffect(() => {
     api.forecastModels().then((r) => setSavedModels(r.models)).catch(() => {});
   }, []);
+
+  // Live models for the active provider — so a local (LM Studio / Ollama) setup
+  // shows the models it actually has loaded, not just static suggestions.
+  // Re-fetch when the provider or key changes (mirrors the Settings page).
+  useEffect(() => {
+    api.models().then((r) => setLiveModels(r.models || [])).catch(() => setLiveModels([]));
+  }, [config?.provider, config?.apiKeySet]);
+
+  // When the active provider ships no default model (local providers auto-pick),
+  // pre-fill the first detected model so the field isn't blank — unless the
+  // operator has already chosen one.
+  useEffect(() => {
+    if (touched.current) return;
+    if (!model && liveModels.length) setModel(liveModels[0]);
+  }, [liveModels, model]);
 
   // Debounced domain detection while typing a forecast question (race-guarded).
   useEffect(() => {
@@ -280,7 +296,9 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
     }
   };
 
-  const models = config?.knownModels ?? [];
+  // Live models (local servers, or any provider's /models) win; fall back to the
+  // provider's static suggestions so the datalist is never empty.
+  const models = liveModels.length ? liveModels : config?.knownModels ?? [];
   const markTouched = () => {
     touched.current = true;
   };

@@ -572,6 +572,8 @@ export interface RunOptions {
   codeGreenfield?: boolean;
   /** Code mode: per-run override of the engine green-gate before synthesis. Undefined → cfg.codeGreenGate. */
   codeGreenGate?: boolean;
+  /** Code mode: per-run override of the final clean (cold-cache) build gate. Undefined → cfg.codeCleanGate (exhaustive always runs it). */
+  codeCleanGate?: boolean;
   /** Code mode: per-run override of engine commit-on-green. Undefined → cfg.codeAutoCommit. */
   codeAutoCommit?: boolean;
   /** Code mode: per-run override of TDD spec-test authoring + 0-test gate guard. Undefined → cfg.codeTdd. */
