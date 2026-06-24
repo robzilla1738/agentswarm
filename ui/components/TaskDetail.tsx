@@ -67,6 +67,10 @@ export function TaskDetail({
             <span>wave {task.wave}</span>
             {task.team && <span>⌬ sub-swarm</span>}
             {task.modelTier && task.modelTier !== "default" && <span>{task.modelTier} tier</span>}
+            {task.ensemble ? <span title="Built as a best-of-N ensemble (isolated attempts judged by the gate)">⎇ best-of-{task.ensemble}</span> : null}
+            {task.ownedFiles && task.ownedFiles.length > 0 && (
+              <span className="mono" title={`owns exclusively: ${task.ownedFiles.join(", ")}`}>⊟ owns {task.ownedFiles.length} file(s)</span>
+            )}
             {task.deps.length > 0 && <span className="mono">⇠ {task.deps.join(", ")}</span>}
             {task.verify && <span>⊛ adversarially verified</span>}
             {task.attempt > 1 && <span>attempt {task.attempt}</span>}

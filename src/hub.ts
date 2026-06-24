@@ -734,6 +734,14 @@ function sanitizeOptions(raw: unknown): Partial<RunOptions> {
   bool("codeGreenfield");
   bool("codeGreenGate");
   bool("codeAutoCommit");
+  bool("codeTdd");
+  bool("codeDesign");
+  bool("codeRepoMap");
+  bool("codeReview");
+  bool("codeEnsemble");
+  bool("codeRepoFacts");
+  if (o.codeDepth === "prototype" || o.codeDepth === "standard" || o.codeDepth === "exhaustive") out.codeDepth = o.codeDepth;
+  num("codeCompletenessRounds", 0, 4);
   if (typeof o.resolutionDate === "string" && ISO_DATE.test(o.resolutionDate) && Number.isFinite(Date.parse(o.resolutionDate))) {
     out.resolutionDate = o.resolutionDate;
   }

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.23.0
+
+Code (build) mode, tuned for **exhaustive, ambitious builds**. v0.22.0 gave code mode engine-owned structure and adversarial verification; this release fixes the failure mode where an ambitious mission ("a 1:1, beautiful clone of X, with skills + connectors") was quietly collapsed into a generic prototype and then graded against its own shrunken bar. Full feature doc: [`docs/code-mode.md`](docs/code-mode.md).
+
+### Don't shrink the ask — expand it
+- **Build depth.** A new `--depth prototype|standard|exhaustive` (and a "Build depth" picker in the composer) — auto-detected from the mission when unset (parity / clone / comprehensive / polish asks ⇒ exhaustive). Depth scales decomposition width, model tier, ensembles, and verification rounds.
+- **Scope expansion, not collapse.** On an exhaustive build the acceptance criteria are derived by the *capable* model with a prompt that **enumerates the real surface area and never drops a named capability** (skills, connectors, model picker, …), instead of a cheap model pruning a vague ask down to a handful of generic items. The build plan widens to match (up to ~24 modules).
+
+### Use the capable model, and actually verify the result
+- **The "strong" tier no longer collapses to the cheap worker.** It falls back to the configured conductor model — so integration, the diff-review critic, and (on exhaustive) all craft run on the capable model, not the cheapest one. Hard/UI modules get best-of-N by default.
+- **Quality is decoupled from `--no-commit`.** Previously turning off commit-on-green silently disabled *both* the diff-review critic and best-of-N (no baseline to diff/branch from). Now sandbox/greenfield workspaces always snapshot a baseline, and a real repo with auto-commit off gets a read-only HEAD baseline — review and ensembles run regardless.
+- **Completeness / parity critic.** Once the tree is green, a strong-tier critic judges the build against the **full mission** (not just the reduced criteria) — the net for "it compiles and passes its own tests, but isn't actually what was asked for" — and reopens the build with concrete missing-feature tasks. On by default for exhaustive builds.
+
+### Wider parallelism + a real Build Console
+- **The engine pre-creates the build plan** as dependency-ordered tasks across conflict-free waves, so the scheduler fans out the whole wave at once instead of waiting on the conductor to dribble 1–2 tasks per turn.
+- **Build Console UI.** `CodePanel` becomes a live console: the build-arc phase timeline, the acceptance checklist, the pinned plan as a wave graph with per-module live status, a verification timeline (parsed gate pass-counts + diff-review + parity findings), best-of-N comparisons, and a files-changed tree.
+
 ## 0.22.0
 
 Code (build) mode, overhauled so a cheap model produces far-above-its-weight results. The v0.21.0 code mode handed all structure to a cheap conductor and verified only "it compiles"; this release gives it the same discipline that makes forecast mode strong — engine-owned structure, independent executable oracles, and adversarial verification. Full feature doc: [`docs/code-mode.md`](docs/code-mode.md).

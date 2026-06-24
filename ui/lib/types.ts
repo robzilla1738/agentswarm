@@ -265,6 +265,10 @@ export interface Task {
   /** Client-derived: distinct source URLs this task has touched so far (live). */
   liveSourceCount?: number;
   modelTier?: "cheap" | "default" | "strong";
+  /** Code mode: files this task owns exclusively (from the pinned build plan). */
+  ownedFiles?: string[];
+  /** Code mode: run as a best-of-N ensemble of N isolated attempts. */
+  ensemble?: number;
   team?: boolean;
   createdAt: number;
   startedAt?: number;

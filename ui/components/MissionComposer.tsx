@@ -47,6 +47,18 @@ interface Knobs {
 const QUICK: Knobs = { workers: 4, tasks: 16, steps: 20, budgetM: 4, verification: "off" };
 const DEEP: Knobs = { workers: 20, tasks: 300, steps: 80, budgetM: 120, verification: "strict" };
 
+/**
+ * Code build-depth presets. "exhaustive" is the headline: it widens the run
+ * envelope and (server-side, via codeDepth) routes all craft + review to the
+ * capable model, decomposes broadly, runs best-of-N on hard modules, and adds
+ * multi-round review + the parity critic. "auto" leaves the knobs alone and lets
+ * the engine detect ambition from the mission.
+ */
+const CODE_DEPTH_KNOBS: Partial<Record<string, Knobs>> = {
+  prototype: { workers: 4, tasks: 24, steps: 30, budgetM: 6, verification: "normal" },
+  exhaustive: { workers: 12, tasks: 160, steps: 50, budgetM: 60, verification: "strict" },
+};
+
 export function MissionComposer({ config }: { config: PublicConfig | null }) {
   const router = useRouter();
   const [mission, setMission] = useState("");
@@ -71,6 +83,11 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
   const [acceptance, setAcceptance] = useState("");
   const [codeGate, setCodeGate] = useState(true);
   const [codeAutoCommit, setCodeAutoCommit] = useState(true);
+  const [codeDepth, setCodeDepth] = useState<"auto" | "prototype" | "standard" | "exhaustive">("auto");
+  const [codeTdd, setCodeTdd] = useState(true);
+  const [codeDesign, setCodeDesign] = useState(true);
+  const [codeReview, setCodeReview] = useState(true);
+  const [codeEnsemble, setCodeEnsemble] = useState(true);
 
   // Forecast intent + saved models + per-run tunables.
   const [savedModels, setSavedModels] = useState<ForecastModelView[]>([]);
@@ -191,6 +208,14 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
     setVerification(k.verification);
   };
 
+  // Picking a code build depth also sizes the run envelope (workers/tasks/budget)
+  // so an "exhaustive" build isn't starved; "auto"/"standard" leave knobs alone.
+  const pickDepth = (d: "auto" | "prototype" | "standard" | "exhaustive") => {
+    setCodeDepth(d);
+    const k = CODE_DEPTH_KNOBS[d];
+    if (k) applyPreset(k);
+  };
+
   // Rough worst-case spend at the selected model's list rates (80% input miss,
   // 20% output). Only a ceiling hint — caching usually lands far below it.
   const price = config?.pricing?.[model];
@@ -237,8 +262,13 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
           ...(mode === "code"
             ? {
                 ...(acceptance.trim() ? { acceptanceCriteria: acceptance.trim() } : {}),
+                ...(codeDepth !== "auto" ? { codeDepth } : {}),
                 ...(codeGate ? {} : { codeGreenGate: false }),
                 ...(codeAutoCommit ? {} : { codeAutoCommit: false }),
+                ...(codeTdd ? {} : { codeTdd: false }),
+                ...(codeDesign ? {} : { codeDesign: false }),
+                ...(codeReview ? {} : { codeReview: false }),
+                ...(codeEnsemble ? {} : { codeEnsemble: false }),
               }
             : {}),
         },
@@ -312,7 +342,22 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
       )}
 
       {mode === "code" && (
-        <div className="mt-3 space-y-2">
+        <div className="mt-3 space-y-2.5">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-2xs text-ink-faint mr-1">Build depth</span>
+            <PresetChip active={codeDepth === "auto"} onClick={() => pickDepth("auto")} title="Detect ambition from the mission (parity/clone/comprehensive → exhaustive).">
+              Auto
+            </PresetChip>
+            <PresetChip active={codeDepth === "prototype"} onClick={() => pickDepth("prototype")} title="Fast, minimal: cheap model, tight scope. A quick working cut.">
+              Prototype
+            </PresetChip>
+            <PresetChip active={codeDepth === "standard"} onClick={() => pickDepth("standard")} title="Balanced: capable model for architecture, review + green-gate before ship.">
+              Standard
+            </PresetChip>
+            <PresetChip active={codeDepth === "exhaustive"} onClick={() => pickDepth("exhaustive")} title="Max quality: capable model for ALL craft + review, broad decomposition, best-of-N on hard modules, multi-round review + a parity critic vs the full mission. Spends freely.">
+              Exhaustive
+            </PresetChip>
+          </div>
           <textarea
             className="input resize-none leading-relaxed text-sm"
             rows={2}
@@ -320,16 +365,31 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
             value={acceptance}
             onChange={(e) => setAcceptance(e.target.value)}
           />
-          <div className="flex flex-wrap items-center gap-3 text-2xs text-ink-faint">
-            <label className="flex items-center gap-1.5 cursor-pointer">
-              <input type="checkbox" checked={codeGate} onChange={(e) => setCodeGate(e.target.checked)} />
-              green-gate before ship
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-2xs text-ink-faint">
+            <label className="flex items-center gap-1.5 cursor-pointer" title="Author failing spec tests from the acceptance criteria before implementing (TDD).">
+              <input type="checkbox" checked={codeTdd} onChange={(e) => setCodeTdd(e.target.checked)} />
+              TDD spec
             </label>
-            <label className="flex items-center gap-1.5 cursor-pointer">
+            <label className="flex items-center gap-1.5 cursor-pointer" title="Pin an engine-owned build plan (module/file partition) the engine spawns in parallel waves.">
+              <input type="checkbox" checked={codeDesign} onChange={(e) => setCodeDesign(e.target.checked)} />
+              build plan
+            </label>
+            <label className="flex items-center gap-1.5 cursor-pointer" title="Adversarial diff-review + completeness/parity critic on the green tree.">
+              <input type="checkbox" checked={codeReview} onChange={(e) => setCodeReview(e.target.checked)} />
+              review
+            </label>
+            <label className="flex items-center gap-1.5 cursor-pointer" title="Allow best-of-N ensembles on hard modules (isolated attempts, judged by the gate).">
+              <input type="checkbox" checked={codeEnsemble} onChange={(e) => setCodeEnsemble(e.target.checked)} />
+              best-of-N
+            </label>
+            <label className="flex items-center gap-1.5 cursor-pointer" title="Run the build + tests before shipping.">
+              <input type="checkbox" checked={codeGate} onChange={(e) => setCodeGate(e.target.checked)} />
+              green-gate
+            </label>
+            <label className="flex items-center gap-1.5 cursor-pointer" title="Commit on green to an EXISTING repo (branches swarm/<id>). Off won't affect quality — sandbox/greenfield workspaces always snapshot for review + ensemble.">
               <input type="checkbox" checked={codeAutoCommit} onChange={(e) => setCodeAutoCommit(e.target.checked)} />
               commit on green
             </label>
-            <span>repo build/test commands are detected automatically</span>
           </div>
         </div>
       )}

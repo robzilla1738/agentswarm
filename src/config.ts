@@ -122,6 +122,8 @@ export interface SwarmConfig {
   codeReview: boolean;
   /** Code mode: max conductor rounds the diff-review critic will drive to close findings. */
   codeReviewMaxRounds: number;
+  /** Code mode: max rounds the completeness / parity critic will drive to build missing scope (judges the green tree against the FULL mission). Exhaustive builds scale this up automatically. */
+  codeCompletenessMaxRounds: number;
   /** Code mode: allow the conductor to request a best-of-N solution ensemble (isolated worktree attempts, judged by the gate) for hard tasks. */
   codeEnsemble: boolean;
   /** Code mode: max attempts in a best-of-N ensemble task. */
@@ -244,6 +246,9 @@ export const DEFAULTS: SwarmConfig = {
   codeRepoMapMaxTokens: 6000,
   codeReview: true,
   codeReviewMaxRounds: 1,
+  // 0 = the completeness/parity critic is off for standard/prototype builds; an
+  // "exhaustive" build auto-scales it to ≥2 rounds (codeCompletenessRounds()).
+  codeCompletenessMaxRounds: 0,
   codeEnsemble: true,
   codeEnsembleN: 3,
   codeRepoFacts: true,
@@ -475,6 +480,7 @@ export const SETTABLE_KEYS: (keyof SwarmConfig)[] = [
   "codeRepoMapMaxTokens",
   "codeReview",
   "codeReviewMaxRounds",
+  "codeCompletenessMaxRounds",
   "codeEnsemble",
   "codeEnsembleN",
   "codeRepoFacts",
@@ -510,6 +516,7 @@ const NUM_RANGES: Partial<Record<keyof SwarmConfig, [number, number]>> = {
   forecastMaxSubQuestions: [1, 8],
   codeGateMaxRounds: [1, 4],
   codeReviewMaxRounds: [0, 4],
+  codeCompletenessMaxRounds: [0, 4],
   codeEnsembleN: [2, 6],
   codeRepoMapMaxTokens: [1000, 40_000],
   hubPort: [0, 65535],

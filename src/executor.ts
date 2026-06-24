@@ -29,6 +29,7 @@ import {
   budgetLine,
   codeConductorAddendum,
   codeReviewPrompt,
+  codeParityPrompt,
   codeSynthAddendum,
   completenessPrompt,
   planBuildSpecPrompt,
@@ -115,7 +116,7 @@ import { SandboxRuntime, createSandbox } from "./sandbox";
 import { RunState } from "./state";
 import { buildRepoMap, coerceBuildModules, formatCheckResult, gitAddWorktree, gitCommitGreen, gitDiffSince, gitMergeWorktreeBranch, gitPrepare, gitRemoveWorktree, gitResetTo, parseCheckOutput, partitionWaves, reconRepo } from "./codeintel";
 import { appendRepoFacts, loadRepoFacts, manifestHash, mergeConfirmedCommands, repoKey } from "./codeledger";
-import { AcceptanceItem, AggregateForecast, BuildPlan, CodeCommands, CodeGateResult, DomainId, FittedParams, Forecast, ForecastQuestion, MarketAnchor, RepoMap, RepoProfile, RunMeta, RunStatus, SimDriver, SourceRef, Task, TaskSpec, Usage, usageCost } from "./types";
+import { AcceptanceItem, AggregateForecast, BuildPlan, CodeCommands, CodeDepth, CodeGateResult, DomainId, FittedParams, Forecast, ForecastQuestion, MarketAnchor, RepoMap, RepoProfile, RunMeta, RunStatus, SimDriver, SourceRef, Task, TaskSpec, Usage, usageCost } from "./types";
 import { canonicalArtifactRel, clip, ensureDir, errMsg, normalizeWorkdirRel, oneLine, parseJsonLoose, rid, sleep, truncateMiddle, validateArtifactFormat, withTimeout } from "./util";
 
 
@@ -244,6 +245,10 @@ export class Executor {
   private repoMap?: RepoMap;
   /** Code mode: the baseline commit the diff-review critic diffs against (set by gitPrepare). */
   private codeBaselineSha?: string;
+  /** Code mode: the engine-seeded TDD spec-author task id (so build-plan modules can dep on it). */
+  private specTaskId?: string;
+  /** Code mode: whether the engine pre-created the build-plan module tasks (so the conductor doesn't re-spawn them). */
+  private buildPlanSeeded = false;
   /** Code mode: manifest hash from the PRISTINE recon profile — the stable ledger key; load + persist must use the same value so the ledger converges. */
   private codeManifestHash?: string;
   /** Code mode: diff-review critic bookkeeping. */
@@ -520,7 +525,7 @@ export class Executor {
     // (appended AFTER conductorSystem, so it wins by recency).
     const codeDoctrine =
       this.codeMode() && this.repoProfile
-        ? `\n\n${codeConductorAddendum(this.repoProfile, this.meta.options.acceptanceCriteria, this.acceptanceItems, this.buildPlan, this.codeTddEnabled())}`
+        ? `\n\n${codeConductorAddendum(this.repoProfile, this.meta.options.acceptanceCriteria, this.acceptanceItems, this.buildPlan, this.codeTddEnabled(), this.buildPlanSeeded)}`
         : "";
 
     // Real-directory runs remember: prior missions in the same workspace feed
@@ -561,6 +566,10 @@ export class Executor {
     // green-gate has a real oracle. Created BEFORE the conductor's first turn so
     // it appears in the task table and the conductor deps implementers on it.
     this.seedSpecTask();
+    // Engine-spawn the validated build plan as concrete, dependency-ordered tasks
+    // BEFORE the conductor's first turn, so the scheduler fans out the whole wave
+    // at once instead of waiting on the cheap conductor to dribble tasks.
+    this.seedBuildPlanTasks();
 
     try {
       await this.conductorTurn();
@@ -579,6 +588,19 @@ export class Executor {
       while (await this.codeReviewPass()) {
         await this.mainLoop();
         while (await this.greenGate()) await this.mainLoop();
+      }
+      // Code mode: the completeness / parity critic judges the green tree against
+      // the FULL mission (not just the reduced criteria) — the net for "compiles
+      // and passes its own tests, but isn't actually what was asked for". Missing
+      // capabilities reopen the build; each addition is re-gated AND re-reviewed
+      // before shipping. Bounded by codeCompletenessRounds().
+      while (await this.codeCompletenessPass()) {
+        await this.mainLoop();
+        while (await this.greenGate()) await this.mainLoop();
+        while (await this.codeReviewPass()) {
+          await this.mainLoop();
+          while (await this.greenGate()) await this.mainLoop();
+        }
       }
     } catch (e) {
       if (!this.ac.signal.aborted) {
@@ -693,6 +715,29 @@ export class Executor {
   }
 
   /**
+   * Code mode build depth / ambition. An explicit per-run `codeDepth` wins;
+   * otherwise it is detected from the mission — parity/clone/comprehensive/
+   * polish asks scale up to "exhaustive" (more modules, capable model for craft,
+   * ensemble on hard/UI modules, multi-round review + parity critic) so an
+   * ambitious mission is not quietly collapsed into a prototype. Cached per run.
+   */
+  private _codeAmbition?: CodeDepth;
+  private codeAmbition(): CodeDepth {
+    if (this._codeAmbition) return this._codeAmbition;
+    const requested = this.meta.options.codeDepth;
+    if (requested) return (this._codeAmbition = requested);
+    const text = `${this.meta.mission}\n${this.meta.options.acceptanceCriteria ?? ""}`.toLowerCase();
+    const exhaustive =
+      /\b(1\s*[:\-]\s*1|one[\s-]to[\s-]one|parity|clones?|pixel[\s-]perfect|exhaustive|comprehensive|full[\s-]featured|fully[\s-]featured|production[\s-](grade|ready)|enterprise[\s-]grade|every (feature|detail|screen)|beautiful|polished)\b/;
+    return (this._codeAmbition = exhaustive.test(text) ? "exhaustive" : "standard");
+  }
+
+  /** Code mode: best-of-N ensemble runs by default on HARD (and, when exhaustive, UI-craft) modules — not only when the conductor opts in. */
+  private codeEnsembleByDefault(): boolean {
+    return this.codeEnsembleEnabled() && this.codeAmbition() === "exhaustive";
+  }
+
+  /**
    * Code mode pre-step (the planForecast analog): recon the repo deterministically
    * and decide commit-on-green, ALL before the conductor's first turn. No LLM call —
    * the build spec rides meta.options.acceptanceCriteria and the conductor's own
@@ -719,10 +764,22 @@ export class Executor {
     // working (detection wins where it found something; confirmed facts fill gaps).
     if (this.codeRepoFactsEnabled() && !this.repoProfile.greenfield) await this.loadRepoFactsInto(this.repoProfile);
 
-    // Commit-on-green, with the three-tier brownfield guardrail (gitPrepare
-    // refuses on a dirty real repo and never touches operator config).
+    // Git baseline + work branch. This is SEPARATE from the operator's commit-on-
+    // green toggle: the adversarial diff-review critic and best-of-N ensemble need
+    // a baseline SHA (and ensemble a branch the engine owns) even when auto-commit
+    // is OFF. Establishing it is safe and non-intrusive:
+    //   • sandbox / greenfield (a throwaway workspace we own) → always branch +
+    //     commit-on-green; there is no operator history to protect, and it makes
+    //     resume, diff-review, and ensemble all coherent. (The toggle governs
+    //     EXISTING repos — this is why unchecking it no longer kills quality.)
+    //   • existing real repo, auto-commit on → branch as before (gitPrepare
+    //     refuses a dirty tree and never touches operator config).
+    //   • existing real repo, auto-commit off → do NOT switch their branch;
+    //     capture HEAD read-only as the review baseline (the diff still picks up
+    //     new untracked files via intent-to-add at review time).
     const autoCommit = this.meta.options.codeAutoCommit ?? this.cfg.codeAutoCommit;
-    if (autoCommit) {
+    const ownWorkspace = this.meta.sandbox || this.repoProfile.greenfield;
+    if (autoCommit || ownWorkspace) {
       const prep = await gitPrepare(exec, this.sandbox.workdir, {
         isSandbox: this.meta.sandbox,
         runId: this.meta.id,
@@ -732,7 +789,9 @@ export class Executor {
       this.codeBranch = prep.branch;
       this.journal.append("log", {
         level: prep.ok ? "info" : "warn",
-        msg: prep.ok ? `code mode: commit-on-green to ${prep.branch}` : `commit-on-green disabled: ${prep.reason}`,
+        msg: prep.ok
+          ? `code mode: work branch ${prep.branch} (commit-on-green${autoCommit ? "" : " — throwaway workspace"})`
+          : `git baseline unavailable: ${prep.reason}`,
       });
       // Capture the pre-work HEAD as the diff-review baseline (all swarm changes
       // are diffed against it). Best-effort; absent → review falls back to skip.
@@ -743,6 +802,21 @@ export class Executor {
         } catch {
           /* no baseline — codeReviewPass will skip */
         }
+      }
+    } else {
+      // Real repo, auto-commit off: leave their branch untouched, but still give
+      // the review/parity critic a baseline so it isn't silently skipped.
+      try {
+        const repo = await exec("git rev-parse --is-inside-work-tree 2>/dev/null", { cwd: this.sandbox.workdir, timeoutSec: 15, signal: this.ac.signal });
+        if (/true/.test(repo.out ?? "")) {
+          const h = await exec("git rev-parse HEAD 2>/dev/null", { cwd: this.sandbox.workdir, timeoutSec: 15, signal: this.ac.signal });
+          this.codeBaselineSha = (h.out ?? "").trim().split("\n")[0] || undefined;
+          if (this.codeBaselineSha) {
+            this.journal.append("log", { level: "info", msg: "code mode: diff-review baseline = current HEAD (auto-commit off — no branch switch, no commits)" });
+          }
+        }
+      } catch {
+        /* not a git repo → review/ensemble skip; that's fine */
       }
     }
 
@@ -856,15 +930,21 @@ export class Executor {
     let modules = [] as ReturnType<typeof coerceBuildModules>;
     let scaffoldFirst = this.repoProfile?.greenfield ?? false;
     let integrationPerWave = true;
+    const ambition = this.codeAmbition();
+    // Decomposition width + tier scale with ambition: a cheap conductor holding a
+    // 20-module partition is the weak link, so the capable model owns the plan
+    // for ambitious builds and is allowed many more modules.
+    const maxModules = ambition === "exhaustive" ? 24 : ambition === "prototype" ? 6 : 8;
+    const tier = ambition === "prototype" ? "cheap" : "strong";
     try {
       const res = await chat(this.cfg, {
-        model: this.resolveModel("cheap"),
-        messages: [{ role: "user", content: planBuildSpecPrompt(this.meta.mission, this.repoProfile!, this.acceptanceItems) }],
-        thinking: false,
-        maxTokens: 2048,
+        model: this.resolveModel(tier),
+        messages: [{ role: "user", content: planBuildSpecPrompt(this.meta.mission, this.repoProfile!, this.acceptanceItems, { ambition, maxModules }) }],
+        thinking: ambition === "exhaustive",
+        maxTokens: ambition === "exhaustive" ? 6144 : 2048,
         signal: this.ac.signal,
       });
-      this.onUsage(this.resolveModel("cheap"), res.usage);
+      this.onUsage(this.resolveModel(tier), res.usage);
       const parsed = parseJsonLoose<{ modules?: unknown; scaffoldFirst?: unknown; integrationPerWave?: unknown }>(res.content || "{}");
       if (parsed && typeof parsed === "object") {
         modules = coerceBuildModules(parsed.modules);
@@ -934,9 +1014,135 @@ export class Executor {
     this.tasks.set(id, task);
     this.taskOrder.push(id);
     this.specAuthored = true;
+    this.specTaskId = id;
     this.journal.append("task.created", { task });
     this.journal.append("code.spec", { testFiles: [], criteria: this.acceptanceItems.map((it) => it.text), initiallyRed: true, taskId: id });
     this.journal.append("log", { level: "info", msg: `TDD: seeded spec-test author ${id} for ${this.acceptanceItems.length} acceptance criteria` });
+  }
+
+  /**
+   * Engine-spawn the validated BuildPlan as concrete tasks, wave by wave, BEFORE
+   * the conductor's first turn — the parallelism fix. The scheduler runs every
+   * dependency-satisfied task up to maxWorkers at once, so pre-creating a full
+   * disjoint wave gives genuinely wide fan-out instead of a cheap conductor
+   * dribbling 1–2 tasks per turn (the failure mode where 10 workers collapsed to
+   * a near-sequential 2,2,1,1). Each module task owns exactly its files (the
+   * write-lock enforces disjointness), deps on the modules it lists as "after"
+   * (plus scaffold + the TDD spec), and — when exhaustive — runs on the capable
+   * tier with a best-of-N ensemble for HARD modules. The conductor is told these
+   * are pre-created so it monitors/fills gaps instead of re-spawning them.
+   */
+  private seedBuildPlanTasks(): void {
+    if (this.resumed || this.buildPlanSeeded) return;
+    if (!this.codeMode() || !this.codeDesignEnabled()) return;
+    const plan = this.buildPlan;
+    if (!plan || !plan.waves || !plan.waves.length) return; // no validated partition → conductor free-forms
+    // Pre-creation only pays off when there's real parallelism to unlock. A
+    // single-module plan gains nothing and would just race the conductor, so
+    // leave trivial plans to the normal free-form flow.
+    if (plan.modules.length < 2) return;
+    const ambition = this.codeAmbition();
+    const greenfield = this.repoProfile?.greenfield ?? false;
+    const ensembleN = Math.max(2, this.cfg.codeEnsembleN ?? 3);
+    const tddOn = this.codeTddEnabled() && this.acceptanceItems.length > 0;
+    const byId = new Map(plan.modules.map((m) => [m.id, m]));
+    const criteriaBlock = this.acceptanceItems.length
+      ? this.acceptanceItems.map((it) => `  [${it.id}] ${it.text}`).join("\n")
+      : "";
+    const register = (task: Task): void => {
+      this.tasks.set(task.id, task);
+      this.taskOrder.push(task.id);
+      this.journal.append("task.created", { task });
+    };
+
+    // Module tasks dep on the TDD spec (brownfield seedSpecTask) when present.
+    let rootDeps: string[] = this.specTaskId ? [this.specTaskId] : [];
+    // Greenfield (or an explicit scaffoldFirst) needs ONE recon+scaffold task that
+    // establishes the stack, build/test commands, and — greenfield, where
+    // seedSpecTask was skipped — the failing spec tests. Everything deps on it.
+    let scaffoldWaveOffset = 0;
+    if (plan.scaffoldFirst || greenfield) {
+      const sid = this.allocId();
+      const cmds = this.repoProfile?.commands ?? {};
+      const scaffoldTask: Task = {
+        id: sid,
+        title: "Recon + scaffold the project",
+        objective:
+          (greenfield
+            ? `Scaffold this greenfield build: choose and lay down the stack, install dependencies, and establish the build + test commands as the foundation every module builds on.\n\n`
+            : `Recon the repo and prepare the build: confirm it builds with the detected commands (install deps if missing) before any module work fans out.\n\n`) +
+          (cmds.build || cmds.test ? `Detected commands — build: ${cmds.build ?? "(establish one)"} · test: ${cmds.test ?? "(establish one)"}.\n\n` : ``) +
+          (tddOn && greenfield
+            ? `TEST-FIRST (TDD): after the tree compiles, author an INITIALLY-FAILING spec test for EACH acceptance criterion (reference its id in the test name). Do not implement features here — the modules make these tests pass.\n\nACCEPTANCE CRITERIA:\n${criteriaBlock}\n\n`
+            : ``) +
+          `Run \`run_check\` to confirm the tree builds (tests may fail — that is expected under TDD). report() with files_touched and the exact build/test commands in key_facts.`,
+        role: "coder",
+        deps: rootDeps,
+        verify: this.cfg.verification !== "off",
+        status: "pending",
+        attempt: 1,
+        wave: 1,
+        modelTier: "strong",
+        artifacts: [],
+        createdAt: Date.now(),
+        agentIds: [],
+      };
+      register(scaffoldTask);
+      rootDeps = [sid];
+      scaffoldWaveOffset = 1;
+    }
+
+    // Pre-allocate every module's task id so module-to-module deps resolve.
+    const idByModule = new Map<string, string>();
+    for (const m of plan.modules) idByModule.set(m.id, this.allocId());
+
+    let moduleCount = 0;
+    for (let w = 0; w < plan.waves.length; w++) {
+      for (const mid of plan.waves[w]) {
+        const m = byId.get(mid);
+        if (!m) continue;
+        const id = idByModule.get(mid)!;
+        const deps = [
+          ...rootDeps,
+          ...m.deps.map((d) => idByModule.get(d)).filter((x): x is string => Boolean(x)),
+        ];
+        // Capable tier for HARD modules always, and for everything when exhaustive
+        // (craft must not be single-shot on the cheapest model). Best-of-N on HARD
+        // modules when ensembles are on by default (exhaustive).
+        const tier: Task["modelTier"] = m.hard || ambition === "exhaustive" ? "strong" : undefined;
+        const ensemble = this.codeEnsembleByDefault() && m.hard ? ensembleN : undefined;
+        const task: Task = {
+          id,
+          title: clip(`${m.id}: ${m.purpose || "module"}`, 120),
+          objective:
+            `Implement the "${m.id}" module of the build.\n\n` +
+            `PURPOSE: ${m.purpose || "(see mission)"}\n` +
+            (m.interface ? `INTERFACE other modules import: ${m.interface}\n` : ``) +
+            `\nFILES YOU OWN (write ONLY these — the engine blocks writes to files another task owns):\n${(m.files.length ? m.files : ["(decide within this module's scope)"]).map((f) => `  - ${f}`).join("\n")}\n\n` +
+            (criteriaBlock ? `RELEVANT ACCEPTANCE CRITERIA (satisfy the ones this module covers; reference ids):\n${criteriaBlock}\n\n` : ``) +
+            `Read before editing; match the codebase conventions. Build it FOR REAL — no stubs, TODOs, or hard-coded fakes standing in for real behavior. Run \`run_check\` after changes and leave your files compiling. report() with files_touched and which criteria you satisfied in key_facts.`,
+          role: "coder",
+          deps,
+          verify: this.cfg.verification !== "off",
+          modelTier: tier,
+          ownedFiles: m.files.length ? m.files : undefined,
+          ensemble,
+          status: "pending",
+          attempt: 1,
+          wave: w + 1 + scaffoldWaveOffset,
+          artifacts: [],
+          createdAt: Date.now(),
+          agentIds: [],
+        };
+        register(task);
+        moduleCount++;
+      }
+    }
+    this.buildPlanSeeded = true;
+    this.journal.append("log", {
+      level: "info",
+      msg: `code mode: engine pre-created ${moduleCount} module task(s)${scaffoldWaveOffset ? " + scaffold" : ""} across ${plan.waves.length} wave(s) — workers fan out wide instead of waiting on the conductor`,
+    });
   }
 
   /** A human-readable DESIGN.md from the pinned build plan (run artifact). */
@@ -964,24 +1170,35 @@ export class Executor {
    * the run. No-op when there are no criteria or they were already restored on resume.
    */
   private async splitAcceptanceCriteria(): Promise<void> {
+    if (this.acceptanceItems.length) return; // restored on resume
     const raw = (this.meta.options.acceptanceCriteria ?? "").trim();
-    if (!raw || this.acceptanceItems.length) return;
+    const ambition = this.codeAmbition();
+    // Exhaustive missions get a derived feature checklist even with no explicit
+    // criteria (so the surface area is enumerated, not left vague). Otherwise we
+    // only split when the operator actually supplied criteria.
+    if (!raw && ambition !== "exhaustive") return;
+    // Scale the cap with ambition — the old flat 12 collapsed broad product asks
+    // into a generic subset. Use the capable tier to derive an ambitious scope.
+    const cap = ambition === "exhaustive" ? 40 : ambition === "prototype" ? 10 : 18;
+    const tier = ambition === "prototype" ? "cheap" : "strong";
+    const greenfield = this.repoProfile?.greenfield ?? false;
     let items: string[] = [];
     try {
       const res = await chat(this.cfg, {
-        model: this.resolveModel("cheap"),
-        messages: [{ role: "user", content: acceptanceCriteriaSplitPrompt(this.meta.mission, raw) }],
-        thinking: false,
-        maxTokens: 1024,
+        model: this.resolveModel(tier),
+        messages: [{ role: "user", content: acceptanceCriteriaSplitPrompt(this.meta.mission, raw, { ambition, cap, greenfield }) }],
+        thinking: ambition === "exhaustive",
+        maxTokens: ambition === "exhaustive" ? 4096 : 1024,
         signal: this.ac.signal,
       });
-      this.onUsage(this.resolveModel("cheap"), res.usage);
+      this.onUsage(this.resolveModel(tier), res.usage);
       const parsed = parseJsonLoose<unknown>(res.content || "[]");
-      if (Array.isArray(parsed)) items = parsed.map((x) => String(x).trim()).filter(Boolean).slice(0, 12);
+      if (Array.isArray(parsed)) items = parsed.map((x) => String(x).trim()).filter(Boolean).slice(0, cap);
     } catch {
       /* degrade below */
     }
-    if (!items.length) items = [raw]; // never lose the criteria — track the whole blob as one item
+    if (!items.length) items = raw ? [raw] : []; // never lose explicit criteria — track the whole blob as one item
+    if (!items.length) return; // no criteria and the model gave nothing — skip
     this.acceptanceItems = items.map((text, i) => ({ id: `AC${i + 1}`, text, met: false }));
     this.journal.append("code.criteria", { items: this.acceptanceItems });
   }
@@ -2553,6 +2770,28 @@ PROTOCOL
   }
 
   /**
+   * The unified diff of all swarm changes vs the run's baseline SHA — the ground
+   * truth for the diff-review + completeness/parity critics. `git add -AN`
+   * (intent-to-add: .gitignore-aware, non-destructive) makes NEW untracked files
+   * show up in the diff, which is essential when auto-commit is off and a
+   * greenfield tree was never committed. Returns null on failure / no baseline.
+   */
+  private async codeBaselineDiff(): Promise<string | null> {
+    if (!this.codeBaselineSha) return null;
+    try {
+      await this.sandbox.exec("git add -AN 2>/dev/null", { cwd: this.sandbox.workdir, timeoutSec: 30, signal: this.ac.signal });
+    } catch {
+      /* intent-to-add is best-effort — a committed tree diffs fine without it */
+    }
+    try {
+      const r = await this.sandbox.exec(`git diff ${this.codeBaselineSha} 2>/dev/null`, { cwd: this.sandbox.workdir, timeoutSec: 60, signal: this.ac.signal });
+      return r.out ?? "";
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Code mode: adversarial diff-review / spec-conformance critic. Runs after the
    * tree is green (the gate already proved it compiles + tests pass) and judges
    * the actual diff against the acceptance criteria + correctness/security/
@@ -2565,18 +2804,16 @@ PROTOCOL
     if (this.fatal || this.ac.signal.aborted || this.budgetExceeded()) return false;
     if (this.finishReason.includes("cancel") || this.finishReason.includes("conductor unavailable")) return false;
     if (!this.lastGateGreen) return false; // only review a green tree
-    const maxRounds = this.cfg.codeReviewMaxRounds ?? 1;
+    // Exhaustive builds get multiple review passes to drive findings to closure
+    // rather than shipping after a single look.
+    const base = this.cfg.codeReviewMaxRounds ?? 1;
+    const maxRounds = this.codeAmbition() === "exhaustive" ? Math.max(2, base) : base;
     if (maxRounds < 1 || this.reviewRounds >= maxRounds) return false;
     if (!this.codeBaselineSha) return false; // no baseline to diff against
     if (this.inflight.size) await Promise.allSettled([...this.inflight.values()]);
 
-    let diff = "";
-    try {
-      const r = await this.sandbox.exec(`git diff ${this.codeBaselineSha} 2>/dev/null`, { cwd: this.sandbox.workdir, timeoutSec: 60, signal: this.ac.signal });
-      diff = r.out ?? "";
-    } catch {
-      return false; // can't diff → skip review rather than block the ship
-    }
+    const diff = await this.codeBaselineDiff();
+    if (diff === null) return false; // can't diff → skip review rather than block the ship
     if (!diff.trim()) {
       this.journal.append("code.review", { clean: true, issues: [], round: this.reviewRounds, note: "no diff against baseline" });
       return false;
@@ -2619,6 +2856,95 @@ PROTOCOL
     this.appendConductorUpdate(
       `ADVERSARIAL CODE REVIEW found issues before synthesis (round ${this.reviewRounds}/${maxRounds}). The tree builds, but the diff has real defects:\n${clip(verdict, 2000)}\n` +
         "Spawn focused fix tasks (verify:true) on the named files to close the REAL issues, then keep the gate green. Skip any you judge immaterial and say why."
+    );
+    await this.conductorTurn();
+    return this.lastConductorAction === "spawn";
+  }
+
+  private completenessRounds = 0;
+  /**
+   * Effective parity-critic round budget. An explicit per-run/cfg value wins;
+   * otherwise it scales with ambition — exhaustive builds get multiple passes to
+   * drive missing scope to closure, prototypes get none.
+   */
+  private codeCompletenessRounds(): number {
+    const opt = this.meta.options.codeCompletenessRounds;
+    if (typeof opt === "number") return Math.max(0, opt);
+    const a = this.codeAmbition();
+    if (a === "exhaustive") return Math.max(2, this.cfg.codeCompletenessMaxRounds ?? 2);
+    if (a === "prototype") return 0;
+    return this.cfg.codeCompletenessMaxRounds ?? 1;
+  }
+
+  /**
+   * Code mode: completeness / PARITY critic. Where codeReviewPass judges the diff
+   * for defects, this judges whether the green tree TRULY delivers the full
+   * mission surface area — the net for "it compiles and passes its own tests but
+   * isn't actually what was asked for" (named capabilities stubbed/missing, a
+   * thin skeleton of a '1:1 clone', faked data flow). Real gaps reopen the build
+   * with concrete missing-feature tasks. Bounded by codeCompletenessRounds().
+   * Returns true when it reopened the loop.
+   */
+  private async codeCompletenessPass(): Promise<boolean> {
+    if (!this.codeMode()) return false;
+    if (this.cfg.verification === "off") return false;
+    if (this.fatal || this.ac.signal.aborted || this.budgetExceeded()) return false;
+    if (this.finishReason.includes("cancel") || this.finishReason.includes("conductor unavailable")) return false;
+    if (!this.lastGateGreen) return false; // only judge a green tree
+    const maxRounds = this.codeCompletenessRounds();
+    if (maxRounds < 1 || this.completenessRounds >= maxRounds) return false;
+    if (this.inflight.size) await Promise.allSettled([...this.inflight.values()]);
+    this.completenessRounds++;
+    const diff = (await this.codeBaselineDiff()) ?? "";
+    let verdict = "";
+    try {
+      const res = await chat(this.cfg, {
+        model: this.resolveModel("strong"),
+        messages: [
+          {
+            role: "user",
+            content: codeParityPrompt(
+              this.meta.mission,
+              this.acceptanceItems,
+              taskTable(this.taskList()),
+              truncateMiddle(this.taskList().map(reportBlock).join("\n\n"), 40_000, "chars"),
+              truncateMiddle(diff, 60_000, "chars")
+            ),
+          },
+        ],
+        thinking: this.codeAmbition() === "exhaustive",
+        maxTokens: 2048,
+        signal: this.ac.signal,
+      });
+      this.onUsage(this.resolveModel("strong"), res.usage);
+      verdict = (res.content || "").trim();
+    } catch (e) {
+      this.journal.append("log", { level: "warn", msg: `parity critic failed: ${errMsg(e)}` });
+      return false;
+    }
+    const complete = !verdict || /^(COMPLETE|PARITY-OK)\b/i.test(verdict);
+    const gaps = complete
+      ? []
+      : verdict
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((l) => /^\d+[.)]/.test(l))
+          .map((l) => clip(l, 300))
+          .slice(0, 8);
+    this.journal.append("code.completeness", { complete, gaps: gaps.length ? gaps : complete ? [] : [clip(verdict, 300)], round: this.completenessRounds });
+    if (complete) {
+      this.journal.append("log", { level: "info", msg: "parity critic: mission surface covered" });
+      return false;
+    }
+    this.journal.append("log", { level: "info", msg: `parity critic found missing scope:\n${clip(verdict, 1500)}` });
+    this.finishing = false;
+    this.lastGateGreen = false; // new features will dirty the tree → re-gate before ship
+    this.gatePassDone = false;
+    this.gateRounds = 0;
+    this.reviewRounds = 0; // freshly-added features deserve their own review budget
+    this.appendConductorUpdate(
+      `COMPLETENESS / PARITY REVIEW (round ${this.completenessRounds}/${maxRounds}) — the tree builds and passes its tests, but it does NOT yet fully deliver the mission. Missing or under-built:\n${clip(verdict, 2000)}\n` +
+        "Spawn focused tasks (verify:true, on disjoint files) to BUILD the missing capabilities for real — do not stub or fake them — then keep the gate green. Skip any you judge genuinely out of scope and say why."
     );
     await this.conductorTurn();
     return this.lastConductorAction === "spawn";
@@ -2673,7 +2999,8 @@ PROTOCOL
       await this.commitGreen("green-gate passed");
       return false;
     }
-    const maxRounds = this.cfg.codeGateMaxRounds ?? 2;
+    const gateBase = this.cfg.codeGateMaxRounds ?? 2;
+    const maxRounds = this.codeAmbition() === "exhaustive" ? Math.max(3, gateBase) : gateBase;
     if (this.gateRounds >= maxRounds) {
       this.gatePassDone = true; // out of rounds — ship with an honest red note in the report
       this.journal.append("log", { level: "warn", msg: "green-gate still red after max fix rounds — shipping with known failures" });
@@ -3486,7 +3813,18 @@ PROTOCOL
 
   private resolveModel(tier?: Task["modelTier"]): string {
     if (tier === "cheap") return this.cfg.cheapModel || this.meta.options.model;
-    if (tier === "strong") return this.cfg.strongModel || this.meta.options.model;
+    // Strong tier falls back to the conductor model (the more capable model the
+    // operator already configured), NOT the cheap worker model. Without this, an
+    // unset cfg.strongModel silently collapsed "strong" to the flash worker — so
+    // integration tasks, the diff-review critic, and gate-fix escalation all ran
+    // on the cheapest model. The conductor model is the right "capable" default.
+    if (tier === "strong") return this.cfg.strongModel || this.meta.options.conductorModel || this.meta.options.model;
+    // Code mode, max-quality: craft should not be single-shot on the cheapest
+    // model. When the run is "exhaustive" the default worker tier is the capable
+    // model too; cheap stays reserved for tasks explicitly tagged mechanical.
+    if (this.codeMode() && this.codeAmbition() === "exhaustive") {
+      return this.cfg.strongModel || this.meta.options.conductorModel || this.meta.options.model;
+    }
     return this.meta.options.model;
   }
 
@@ -3519,6 +3857,13 @@ PROTOCOL
     const n = Math.min(task.ensemble ?? 2, Math.max(2, this.cfg.codeEnsembleN ?? 3));
     const exec = this.sandbox.exec.bind(this.sandbox);
     this.journal.append("log", { level: "info", msg: `best-of-${n}: ${task.id} — ${n} isolated worktree attempts, judged by the gate` });
+    // The attempts branch from HEAD, so HEAD must include the work of earlier
+    // waves this module depends on. With wide engine-seeded waves, commit-on-green
+    // is deferred (it only fires when ≤1 task is in flight), so the dependency
+    // work can be sitting uncommitted in the live tree. Snapshot it onto the
+    // branch first (mutex-guarded) so each attempt builds against the FULL tree
+    // rather than an empty/stale base. Best-effort; a no-op when already clean.
+    await this.withGit(() => gitCommitGreen(exec, this.sandbox.workdir, `ensemble ${task.id} base snapshot`, this.ac.signal)).catch(() => null);
     // All attempts branch from the live HEAD; diff each attempt against THAT exact
     // base (not HEAD~1, which is wrong for a no-commit attempt and undefined at root).
     const baseSha = ((await exec("git rev-parse HEAD 2>/dev/null", { cwd: this.sandbox.workdir, timeoutSec: 15, signal: this.ac.signal })).out ?? "").trim().split("\n")[0] || "HEAD";

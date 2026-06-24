@@ -230,6 +230,12 @@ export function optionOverrides(flags: Args["flags"], cfg: SwarmConfig): Partial
   }
   // Code mode tunables.
   if (typeof flags.accept === "string") o.acceptanceCriteria = flags.accept;
+  if (typeof flags.depth === "string") {
+    if (!["prototype", "standard", "exhaustive"].includes(flags.depth)) {
+      throw new Error("--depth must be one of: prototype | standard | exhaustive");
+    }
+    o.codeDepth = flags.depth as RunOptions["codeDepth"];
+  }
   if (flags.greenfield === true) o.codeGreenfield = true;
   if (flags.gate === false) o.codeGreenGate = false;
   if (flags.commit === false) o.codeAutoCommit = false;
@@ -1341,14 +1347,18 @@ ${b("USAGE")}
                                       into several resolvable sub-forecasts; --single forces one.
                                       --simulate runs a grounded scenario Monte Carlo (auto on
                                       decomposed questions): ranked scenarios + a driver tornado
-  swarm code "<build task>" [--accept "<done when>"] [--greenfield] [--no-gate] [--no-commit]
+  swarm code "<build task>" [--accept "<done when>"] [--depth exhaustive] [--greenfield] [--no-gate] [--no-commit]
                             [--no-tdd] [--no-design] [--no-repo-map] [--no-review] [--no-ensemble] [--no-repo-facts]
                                       build software: recon + an engine-owned build plan, author a
                                       failing spec test-suite from the acceptance criteria (TDD),
                                       fan out on disjoint files, run the detected build/test after
                                       every change, commit on green (interrupts resume compiling),
-                                      best-of-N on hard tasks, then a green-gate + blind diff-review
-                                      before shipping. Deliverable is a working tree + change summary.
+                                      best-of-N on hard tasks, then a green-gate + blind diff-review +
+                                      a completeness/parity critic before shipping. Deliverable is a
+                                      working tree + change summary. --depth prototype|standard|
+                                      exhaustive (default: auto-detected; exhaustive maxes quality —
+                                      capable model for all craft, wider decomposition, ensembles,
+                                      multi-round review). Deliverable is a working tree + summary.
   swarm serve [--port 7777] [--open]  start the mission-control web UI + API
   swarm watch <id>                    attach a live dashboard to a run
   swarm resume <id> [--fg]            resume an interrupted run (done tasks keep their results)

@@ -63,13 +63,17 @@ export interface CodeState {
   buildPlan: { modules: { id: string; files: string[]; purpose: string; deps?: string[]; hard?: boolean }[]; waves: string[][] | null } | null;
   map: { fileCount: number; symbolCount: number; truncated: boolean } | null;
   specSeeded: boolean;
+  /** The build arc (recon → build → integrate → harden …) as the engine sets each phase. */
+  phases: { name: string; goal?: string; exit?: string; t: number }[];
   gates: { green: boolean; skipped: boolean; summary: string }[];
   reviews: { clean: boolean; issues: string[]; round: number }[];
+  /** Completeness / parity critic verdicts: whether the green tree delivers the FULL mission. */
+  completeness: { complete: boolean; gaps: string[]; round: number }[];
   ensembles: { taskId: string; n: number; winner: number; merged: boolean; scores: { i: number; score: number; green: boolean }[] }[];
 }
 
 function emptyCode(): CodeState {
-  return { criteria: [], buildPlan: null, map: null, specSeeded: false, gates: [], reviews: [], ensembles: [] };
+  return { criteria: [], buildPlan: null, map: null, specSeeded: false, phases: [], gates: [], reviews: [], completeness: [], ensembles: [] };
 }
 
 const PRICING: Record<string, { inMiss: number; inHit: number; out: number }> = {
@@ -375,6 +379,18 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
     case "plan.updated":
       s.planUpdatedAt = ev.t;
       break;
+    case "phase.set":
+      // The build arc is only surfaced for code runs (the Build Console timeline).
+      if (s.meta?.options?.mode === "code") {
+        const c = (s.code ??= emptyCode());
+        c.phases.push({
+          name: String(ev.name ?? ""),
+          goal: ev.goal ? String(ev.goal) : undefined,
+          exit: ev.exit_criteria ? String(ev.exit_criteria) : undefined,
+          t: ev.t,
+        });
+      }
+      break;
     case "forecast.plan":
       if (Array.isArray(ev.questions)) s.questions = ev.questions as ForecastQuestion[];
       if (typeof ev.brief === "string") s.forecastBrief = ev.brief;
@@ -470,6 +486,11 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
     case "code.review": {
       const c = (s.code ??= emptyCode());
       c.reviews.push({ clean: Boolean(ev.clean), issues: Array.isArray(ev.issues) ? (ev.issues as string[]) : [], round: Number(ev.round) || 0 });
+      break;
+    }
+    case "code.completeness": {
+      const c = (s.code ??= emptyCode());
+      c.completeness.push({ complete: Boolean(ev.complete), gaps: Array.isArray(ev.gaps) ? (ev.gaps as string[]) : [], round: Number(ev.round) || 0 });
       break;
     }
     case "code.ensemble": {

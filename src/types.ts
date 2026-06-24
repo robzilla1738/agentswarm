@@ -23,6 +23,14 @@ export type Verification = "off" | "normal" | "strict";
 export type RunMode = "research" | "forecast" | "code";
 
 /**
+ * Code mode build depth / ambition. Drives decomposition width, model tier,
+ * best-of-N defaults, and verification rounds. "exhaustive" maxes quality
+ * (capable model for all craft + review, ensemble on hard/UI modules, multi-
+ * round review + parity critic). Undefined → detected from the mission text.
+ */
+export type CodeDepth = "prototype" | "standard" | "exhaustive";
+
+/**
  * Binary questions resolve YES/NO; numeric to a value; mc to one of a fixed
  * option list; date to the day an event first occurs (or "never" by the
  * horizon). Date questions ride the numeric quantile machinery in epoch-days.
@@ -578,6 +586,10 @@ export interface RunOptions {
   codeEnsemble?: boolean;
   /** Code mode: per-run override of the cross-run repo-facts ledger. Undefined → cfg.codeRepoFacts. */
   codeRepoFacts?: boolean;
+  /** Code mode: build depth / ambition. Undefined → detected from the mission ("exhaustive" on parity/clone/comprehensive asks, else "standard"). */
+  codeDepth?: CodeDepth;
+  /** Code mode: per-run override of completeness/parity critic rounds. Undefined → scales with codeDepth (exhaustive ≥2). */
+  codeCompletenessRounds?: number;
   /** Forecast mode: operator-supplied resolution date (ISO) for the question. */
   resolutionDate?: string;
   /** Forecast mode: independent forecaster panel size (3–11). */

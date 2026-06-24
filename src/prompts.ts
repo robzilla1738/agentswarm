@@ -1,6 +1,6 @@
 import * as os from "os";
 import { daysToIso } from "./forecast";
-import { AcceptanceItem, AggregateForecast, BuildPlan, ForecastQuestion, RepoMap, RepoProfile, RunMeta, SimDriver, SimulationResult, Task } from "./types";
+import { AcceptanceItem, AggregateForecast, BuildPlan, CodeDepth, ForecastQuestion, RepoMap, RepoProfile, RunMeta, SimDriver, SimulationResult, Task } from "./types";
 import { clip, fmtTokens } from "./util";
 
 // ============================================================ conductor
@@ -773,7 +773,8 @@ export function codeConductorAddendum(
   acceptance?: string,
   items?: AcceptanceItem[],
   buildPlan?: BuildPlan,
-  tdd?: boolean
+  tdd?: boolean,
+  preseeded?: boolean
 ): string {
   const planBlock = buildPlan && buildPlan.waves && buildPlan.waves.length ? buildPlanBlock(buildPlan) : "";
   const tddBlock =
@@ -794,17 +795,29 @@ export function codeConductorAddendum(
 - Stack: ${profile.primaryLanguage ?? "unknown"}${profile.framework ? ` (${profile.framework})` : ""}${profile.packageManager ? ` · ${profile.packageManager}` : ""}${profile.git.isRepo ? ` · git branch ${profile.git.branch ?? "?"}${profile.git.dirty ? " (dirty)" : ""}` : " · not a git repo"}
 ${commandsBlock(profile)}${profile.conventions.length ? `\n- Conventions: ${profile.conventions.join("; ")}` : ""}`;
 
+  // When the engine has already pre-created the build-plan tasks, the conductor's
+  // job shifts from "spawn the partition" to "monitor + fill gaps" — otherwise it
+  // would duplicate the engine's tasks (the second writer is blocked by the lock,
+  // wasting a worker). Without a pinned plan it still drives the pipeline itself.
+  const pipeline = preseeded
+    ? `BUILD PIPELINE — the engine has ALREADY created the build-plan tasks for you (a recon/scaffold task if needed, then one task per module across the conflict-free waves shown above, each owning its files and dep-ordered). DO NOT re-spawn them — that just collides on the file locks.
+Your job now:
+1. MONITOR the pre-created tasks as they run and report. Keep mission-plan.md current with update_plan and use set_phase for the arc (recon → build → integrate → harden).
+2. Spawn NEW tasks ONLY for: gaps the engine's reviews surface, fixes the green-gate returns, or genuinely missing work the pinned plan didn't cover. Keep any new task on STRICTLY DISJOINT files (the engine enforces this).
+3. The engine runs the green-gate, the diff-review critic, and a completeness/parity critic before synthesis; respond to what they ask for. finish only when the tree is green and the acceptance criteria are met.`
+    : `BUILD PIPELINE — structure the run exactly like this:
+1. WAVE 1 = ONE task only — recon + scaffold. Read the relevant code, confirm the tree builds with the command above (and if dependencies aren't installed, install them); if greenfield, choose the stack and establish the test command. Do NOT fan out before you understand the code.
+2. IMPLEMENT WAVES — parallel tasks on STRICTLY DISJOINT files/modules. If a build plan is pinned above, spawn ONE task per module, set that task's files:[...] to the module's files, and dep it on the modules it lists as "after". Otherwise partition the work yourself so NO two tasks ever write the same file. Each task: read before editing, match conventions, run run_check after every change, leave its files compiling.
+3. Every implement wave ENDS with an INTEGRATION task (verify:true, model:"strong") that deps on all of that wave's implementers, runs the FULL build + typecheck + test, and reports done ONLY when green. The verifier runs the commands itself and fails it back on red — and on a passing verify the engine commits the tree, so an interrupted run resumes from a compiling commit.
+4. Before final synthesis the engine runs ONE green-gate. If the integrated tree is red it returns to you with the exact failures — spawn a focused fix task on the failing files (do not re-run the failed approach verbatim).
+5. finish only when the tree is green and the acceptance criteria are met. Use set_phase for the arc (recon → build → integrate → harden) and keep mission-plan.md current with update_plan.`;
+
   return `
 THIS IS A CODE (BUILD) MISSION. The deliverable is a WORKING TREE that builds and passes its tests — not a report. The generic "PARALLELIZE AGGRESSIVELY / go WIDE with 10+ scouts" research doctrine DOES NOT APPLY here; follow this build doctrine instead.
 
 ${repo}
 ${criteriaBlock}${planBlock}${tddBlock}
-BUILD PIPELINE — structure the run exactly like this:
-1. WAVE 1 = ONE task only — recon + scaffold. Read the relevant code, confirm the tree builds with the command above (and if dependencies aren't installed, install them); if greenfield, choose the stack and establish the test command. Do NOT fan out before you understand the code.
-2. IMPLEMENT WAVES — parallel tasks on STRICTLY DISJOINT files/modules. If a build plan is pinned above, spawn ONE task per module, set that task's files:[...] to the module's files, and dep it on the modules it lists as "after". Otherwise partition the work yourself so NO two tasks ever write the same file. Each task: read before editing, match conventions, run run_check after every change, leave its files compiling.
-3. Every implement wave ENDS with an INTEGRATION task (verify:true, model:"strong") that deps on all of that wave's implementers, runs the FULL build + typecheck + test, and reports done ONLY when green. The verifier runs the commands itself and fails it back on red — and on a passing verify the engine commits the tree, so an interrupted run resumes from a compiling commit.
-4. Before final synthesis the engine runs ONE green-gate. If the integrated tree is red it returns to you with the exact failures — spawn a focused fix task on the failing files (do not re-run the failed approach verbatim).
-5. finish only when the tree is green and the acceptance criteria are met. Use set_phase for the arc (recon → build → integrate → harden) and keep mission-plan.md current with update_plan.
+${pipeline}
 
 CODE RULES
 - Disjoint-file ownership is the convergence guarantee: two writers on one file corrupt it. Pre-partition files across tasks and pass each task its files:[...] — the engine ENFORCES this and blocks a task from writing a file another live task owns.
@@ -821,11 +834,23 @@ CODE RULES
  * cycle) and pins it; a cheap conductor is bad at holding this invariant across
  * many spawn batches, so removing the decision is the leverage. JSON only.
  */
-export function planBuildSpecPrompt(mission: string, profile: RepoProfile, items: AcceptanceItem[]): string {
+export function planBuildSpecPrompt(
+  mission: string,
+  profile: RepoProfile,
+  items: AcceptanceItem[],
+  opts: { ambition: CodeDepth; maxModules: number }
+): string {
   const repo = profile.greenfield
     ? "GREENFIELD — the working directory is empty; choose a stack and lay out the new files."
     : `EXISTING REPO — ${profile.primaryLanguage ?? "unknown stack"}${profile.framework ? ` (${profile.framework})` : ""}${profile.packageManager ? ` · ${profile.packageManager}` : ""}. Edit existing files where appropriate; list the real paths you expect to touch.`;
   const crit = items.length ? items.map((it) => `  [${it.id}] ${it.text}`).join("\n") : "  (none specified — infer from the mission)";
+  // Module-count guidance scales with ambition. The old flat "2–8 modules"
+  // under-decomposed broad products into a handful of giant modules; an
+  // exhaustive build should be MANY well-bounded modules covering every feature.
+  const countRule =
+    opts.ambition === "exhaustive"
+      ? `- Decompose for BREADTH: roughly ONE module per coherent feature/subsystem (every named capability — e.g. each distinct surface, panel, or connector — earns its own module). Use as many modules as the work honestly needs, up to ${opts.maxModules}. An ambitious product is many modules; do NOT collapse it into a few giant ones.`
+      : `- Keep it tight: 2–${opts.maxModules} modules. Prefer fewer, well-bounded modules over many tiny ones.`;
   return `You are the architect for a software build. Decompose it into a MODULE/FILE PARTITION that parallel implementers can build without ever touching each other's files.
 
 MISSION
@@ -839,8 +864,9 @@ ${crit}
 Rules for the partition:
 - Each module owns a DISJOINT set of files — no file may appear under two modules. This is the hard constraint; if two pieces of work need the same file, they are ONE module.
 - Give each module a short id, the exact files it owns, a one-line purpose, an optional interface/contract other modules import, and deps (module ids it must build after).
-- Mark a module "hard": true if it is the algorithmically tricky / high-risk core (those get a best-of-N ensemble).
-- Keep it tight: 2–8 modules. Prefer fewer, well-bounded modules over many tiny ones.
+- Mark a module "hard": true if it is the algorithmically tricky / high-risk core OR a quality-critical surface (it gets a best-of-N ensemble — use this for the parts that most need to be excellent).
+- COVER EVERY ACCEPTANCE CRITERION: each criterion above must be owned by at least one module. Do not leave a named capability unassigned.
+${countRule}
 
 Reply with ONLY this JSON (no prose, no fences):
 {"scaffoldFirst": <bool: true if a recon+scaffold step must run before any module>,
@@ -876,14 +902,38 @@ ${waveLines}
  * the spec-test author, the diff-review critic, and the synthesizer reason over
  * the same checklist. Output is a JSON array of strings — nothing else.
  */
-export function acceptanceCriteriaSplitPrompt(mission: string, criteria: string): string {
-  return `Split this build's acceptance criteria into a flat list of atomic, independently-verifiable requirements. Each item must be a single concrete, testable condition ("done when X"). Merge duplicates; drop vague aspirational filler. Keep 1–12 items.
+export function acceptanceCriteriaSplitPrompt(
+  mission: string,
+  criteria: string,
+  opts: { ambition: CodeDepth; cap: number; greenfield: boolean }
+): string {
+  const { ambition, cap, greenfield } = opts;
+  // Exhaustive builds get a SCOPE-EXPANSION prompt: enumerate the real surface
+  // area instead of collapsing a vague ask into a handful of generic items. This
+  // is the fix for the failure where "a 1:1 Claude.ai clone with skills +
+  // connectors" became 12 generic chat criteria that dropped the named features.
+  if (ambition === "exhaustive") {
+    return `You are the product architect for an AMBITIOUS software build. Produce a COMPLETE acceptance checklist — the full surface area a demanding reviewer would require before calling this a true match for the request. Breadth is the point; do NOT reduce it to a minimal subset.
+
+MISSION
+${mission}
+${criteria ? `\nOPERATOR ACCEPTANCE NOTES (free text — fold these in; they are notes, NOT the full scope)\n${criteria}\n` : ""}
+Rules:
+- ENUMERATE THE REAL SURFACE AREA. If the mission names capabilities (e.g. "skills", "connectors", "model picker", "file upload", specific screens or flows), EACH becomes one or more concrete items. NEVER silently drop a named capability — that is the most important rule.
+- Expand vague quality bars into concrete, checkable sub-features. "1:1 parity / looks like X / beautiful / polished" ⇒ itemize the actual UI surfaces, components, states and interactions parity requires: layout & navigation, every key screen, empty/loading/error/streaming states, responsive behavior, theming/typography, keyboard and interaction details.
+- ${greenfield ? "Greenfield: include the foundational items (stack choice, scaffold, build+test commands) AND the full feature set." : "Brownfield: cover the new behavior end-to-end, including integration points with existing code."}
+- Each item is a single concrete, testable "done when X" condition. Prefer specific over generic; merge only exact duplicates.
+- Be THOROUGH: roughly 15–${cap} items for a broad product. Do not pad with filler, but do not under-scope an ambitious ask.
+
+Reply with ONLY a JSON array of strings (the atomic criteria). No prose, no markdown fences.`;
+  }
+  return `Split this build's acceptance criteria into a flat list of atomic, independently-verifiable requirements. Each item must be a single concrete, testable condition ("done when X"). Merge duplicates; drop vague aspirational filler. Keep 1–${cap} items.
 
 MISSION
 ${mission}
 
 ACCEPTANCE CRITERIA (free text)
-${criteria}
+${criteria || "(none specified — infer the essential criteria from the mission)"}
 
 Reply with ONLY a JSON array of strings (the atomic criteria), e.g. ["the CLI accepts a --json flag", "invalid input exits non-zero with a clear message"]. No prose, no markdown fences.`;
 }
@@ -954,6 +1004,47 @@ Review for, in priority order:
 5. Conventions & dead code — does it match the codebase's style; any duplicated or unused code?
 
 Reply with EXACTLY "REVIEW-CLEAN" if the change genuinely satisfies the criteria with no material defect. Otherwise reply with a short numbered list (max 6) of CONCRETE, real defects — each one specific enough to become a fix task (name the file/symbol and what's wrong). Do not invent nice-to-haves; only real problems against the stated criteria and basic correctness/security.`;
+}
+
+/**
+ * Completeness / parity critic. Where codeReviewPrompt judges the DIFF for
+ * defects, this judges whether the build TRULY delivers the full mission surface
+ * area — the net for "it compiles and passes its own tests, but it isn't what
+ * was asked for" (named capabilities stubbed or missing, a thin skeleton of a
+ * "1:1 clone", faked data flow). Drives ADDING missing work, not fixing defects.
+ */
+export function codeParityPrompt(
+  mission: string,
+  items: AcceptanceItem[],
+  taskTableStr: string,
+  reports: string,
+  diff: string
+): string {
+  const crit = items.length ? items.map((it) => `  [${it.id}] ${it.text}`).join("\n") : "  (none specified — judge against the mission)";
+  return `You are a demanding product reviewer deciding whether a build TRULY delivers what was asked. Do NOT re-check that it compiles or that its tests pass — both are already true. Judge COMPLETENESS and PARITY against the full mission.
+
+MISSION (the real bar — read it literally; every capability it names must actually exist)
+${mission}
+
+ACCEPTANCE CHECKLIST
+${crit}
+
+WHAT WAS BUILT (tasks)
+${taskTableStr}
+
+TASK REPORTS
+${reports}
+
+THE DIFF (ground truth — what actually exists in the tree)
+${diff}
+
+Check, in priority order:
+1. Named capabilities — does EVERY feature/surface the mission names actually exist in the code (not stubbed, not a "TODO", not a placeholder)? If it asked for "skills, connectors, a model picker", each must be really implemented.
+2. Breadth & parity — for a "clone / 1:1 / looks like X / beautiful" ask, are the key screens, components, states (empty/loading/error/streaming) and interactions present, or is it a thin skeleton?
+3. Wired, not faked — is it functional end-to-end (real data flow / integration), or are hard-coded values and fake endpoints standing in for real behavior?
+4. Polish — obvious gaps a user would notice immediately on first use.
+
+Reply with EXACTLY "COMPLETE" if the build genuinely delivers the mission's full surface area. Otherwise reply with a short numbered list (max 8) of CONCRETE missing or under-built capabilities — each specific enough to become a build task (name the feature and what is absent). Only real gaps against the stated mission; do not invent nice-to-haves.`;
 }
 
 export function synthCheckPrompt(mission: string, reports: string, finalReport: string, sources?: string): string {

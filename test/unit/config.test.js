@@ -52,18 +52,23 @@ test("code-mode quality flags round-trip and coerce/clamp correctly", () => {
     assert.equal(def.codeEnsemble, true);
     assert.equal(def.codeRepoFacts, true);
     assert.equal(def.codeEnsembleN, 3);
+    // The completeness/parity critic is off by default (0) — exhaustive builds
+    // scale it up at run time; standard/prototype skip it.
+    assert.equal(def.codeCompletenessMaxRounds, 0);
     // Round-trip toggles + numeric clamping.
     saveConfig({
       codeTdd: coerceConfigValue("codeTdd", "false"),
       codeReview: coerceConfigValue("codeReview", "false"),
       codeEnsembleN: coerceConfigValue("codeEnsembleN", "99"), // clamped to max 6
       codeReviewMaxRounds: coerceConfigValue("codeReviewMaxRounds", "0"), // min 0 allowed
+      codeCompletenessMaxRounds: coerceConfigValue("codeCompletenessMaxRounds", "9"), // clamped to max 4
     });
     const cfg = loadConfig();
     assert.equal(cfg.codeTdd, false);
     assert.equal(cfg.codeReview, false);
     assert.equal(cfg.codeEnsembleN, 6, "ensemble N clamped to its max");
     assert.equal(cfg.codeReviewMaxRounds, 0);
+    assert.equal(cfg.codeCompletenessMaxRounds, 4, "completeness rounds clamped to its max");
   } finally {
     if (prevHome) process.env.AGENTSWARM_HOME = prevHome;
     else delete process.env.AGENTSWARM_HOME;

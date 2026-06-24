@@ -189,7 +189,7 @@ function RunView() {
             </>
           ))}
 
-        {data.code && <CodePanel code={data.code} />}
+        {data.code && <CodePanel code={data.code} tasks={data.tasks} status={data.status} now={now} />}
 
         {/* Header */}
         <div className="panel p-5 mb-5">
