@@ -1,4 +1,4 @@
-import type { CalibrationStats, LedgerEntry, RunSnapshot, RunSummary, SwarmEvent } from "./types";
+import type { CalibrationStats, LedgerEntry, RunSnapshot, RunSummary, SessionSnapshot, SessionSummary, SwarmEvent } from "./types";
 
 /**
  * Resolve the hub base URL. When the UI is served by the hub itself, the API
@@ -183,6 +183,22 @@ export const api = {
     return hubBase() + `/api/runs/${id}/report.html${qs ? `?${qs}` : ""}`;
   },
   streamUrl: (id: string) => hubBase() + `/api/runs/${id}/stream`,
+  // ---- code-chat sessions ----
+  listSessions: () => jget<{ sessions: SessionSummary[] }>("/api/sessions"),
+  createSession: (body: { title?: string; message?: string; workspace?: string; options?: Record<string, unknown> }) =>
+    jpost<{ id: string; firstTurnId?: string }>("/api/sessions", body),
+  getSession: (id: string) => jget<SessionSnapshot>(`/api/sessions/${id}`),
+  sessionMessage: (id: string, message: string) =>
+    jpost<{ turnId: string }>(`/api/sessions/${id}/message`, { message }),
+  deleteSession: async (id: string): Promise<void> => {
+    const res = await fetch(hubBase() + `/api/sessions/${id}`, { method: "DELETE" });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      let msg = txt;
+      try { msg = JSON.parse(txt).error || txt; } catch { /* keep txt */ }
+      throw new Error(msg || `${res.status}`);
+    }
+  },
   forecasts: () => jget<{ forecasts: LedgerEntry[]; calibration: CalibrationStats }>("/api/forecasts"),
   resolveForecasts: (ids?: string[]) =>
     jpost<{

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.25.0
+
+Code mode grows up: it builds **exhaustively by default**, refuses to ship dead buttons, and gets a **chat UI** where every follow-up iterates on the same codebase. Full feature doc: [`docs/code-mode.md`](docs/code-mode.md).
+
+### Exhaustive by default — stop half-building the ask
+
+- A code build with no flags now runs **`exhaustive`**: the acceptance criteria are *expanded* into the full feature surface (never dropping a named capability), the build plan widens, all craft runs on the capable model, hard/UI modules get best-of-N, and the completeness/parity critic is on. Previously the depth was sniffed from the mission text with a brittle keyword regex — so "build Notion 1:1 parity" came out fully built, but a slightly different phrasing quietly collapsed to a thin prototype graded against its own shrunken bar. `--depth prototype|standard` (or the composer's Build-depth picker) are the explicit opt-outs for a quick cut.
+- The adversarial diff-review and the parity critic now run with real round budgets even on a `standard` build (review 2×, parity ≥1×; `exhaustive` scales higher), instead of shipping after a single look.
+
+### No dead buttons
+
+- A deterministic **stub scanner** reads the actual `git diff` for code that *compiles but does nothing* — empty click handlers (`onClick={() => {}}`), **console-only and alert-only handlers**, `href="#"`, `TODO`/`FIXME`, `throw new Error("not implemented")`, "coming soon" placeholders, and bare `return null` in route/handler files. The green-gate can't catch these — a dead button compiles cleanly — so the findings are fed to the **parity critic**, which verifies each against the diff and spawns a real fix task. The worker, critic, and verifier prompts now all treat "a control that renders but does nothing" as a hard fail.
+
+### Code chat — follow-ups that build on the same codebase
+
+- A new **`/code` chat surface** (top-nav "Code"). Each message is a turn that builds on the **same persistent workspace**, remembers the prior turns, and streams its full build console inline; finished turns collapse to a result card linking to the full run. Ask for a Notion clone, watch it build, then send "make the sidebar collapsible" — it iterates on the tree it already built instead of starting over.
+- Point a chat at a **fresh managed project** the app keeps and persists, or at an **existing folder** on your machine (an existing repo is never committed to unless you opt in). One turn runs at a time per chat — the workspace and its git index are shared, so concurrent turns can't corrupt them. Deleting a chat removes its turns; a managed project's files go with it, your own folder never does.
+- Under the hood a turn is an ordinary non-sandbox code run pinned to the session workspace, so it inherits commit-on-green, per-turn diff baselines, and cross-run memory for free; the prior turns are folded into the conductor as an ordered "what we've built so far" brief, on a stable per-session git branch.
+
 ## 0.24.0
 
 Two things: local models that just work, and code builds you can trust.

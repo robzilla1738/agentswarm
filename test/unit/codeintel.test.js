@@ -208,3 +208,87 @@ test("gitDiffSince: parses changed files; a bogus ref degrades to [] (never thro
   const bad = await gitDiffSince(async () => { throw new Error("bad revision"); }, "/x", "nope", sig);
   assert.deepEqual(bad, [], "an unresolvable ref yields [] rather than throwing");
 });
+
+const { scanStubs, formatStubFindings } = require("../../dist/codeintel.js");
+
+/** Build a minimal unified-diff hunk that ADDS the given lines to `file`. */
+function addedDiff(file, lines) {
+  const body = lines.map((l) => `+${l}`).join("\n");
+  return `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -0,0 +1,${lines.length} @@\n${body}\n`;
+}
+
+test("scanStubs: flags empty click handlers, href=#, TODO, not-implemented", () => {
+  const diff = addedDiff("src/App.tsx", [
+    `      <button onClick={() => {}}>New Page</button>`,
+    `      <a href="#">Settings</a>`,
+    `      // TODO: wire this up`,
+    `      throw new Error("not implemented");`,
+    `      <div>Real content {count}</div>`,
+  ]);
+  const kinds = scanStubs(diff).map((f) => f.kind);
+  assert.ok(kinds.includes("dead-handler"), "empty onClick is a dead-handler");
+  assert.ok(kinds.includes("dead-link"), 'href="#" is a dead-link');
+  assert.ok(kinds.includes("todo-marker"), "TODO is flagged");
+  assert.ok(kinds.includes("not-implemented"), "throw new Error('not implemented') is flagged");
+});
+
+test("scanStubs: flags console-only handlers but not real handlers that also log", () => {
+  const stubs = addedDiff("src/App.tsx", [
+    `      <button onClick={() => console.log("clicked")}>Save</button>`,
+    `      <button onClick={() => { console.error("nope"); }}>Delete</button>`,
+  ]);
+  const kinds = scanStubs(stubs).map((f) => f.kind);
+  assert.equal(kinds.filter((k) => k === "stub-console").length, 2, "both console-only handlers are flagged");
+  const real = addedDiff("src/App.tsx", [
+    `      <button onClick={() => { console.log("saving"); save(); }}>Save</button>`,
+    `      <button onClick={handleClick}>Go</button>`,
+  ]);
+  assert.deepEqual(scanStubs(real), [], "a handler that logs AND does real work is not flagged");
+});
+
+test("scanStubs: wired controls and real code are NOT flagged", () => {
+  const diff = addedDiff("src/App.tsx", [
+    `      <button onClick={handleNewPage}>New Page</button>`,
+    `      <a href="/settings">Settings</a>`,
+    `      const total = items.reduce((a, b) => a + b.n, 0);`,
+    `      return <div>{total}</div>;`,
+  ]);
+  assert.deepEqual(scanStubs(diff), [], "fully-wired UI produces no findings");
+});
+
+test("scanStubs: bare empty return only flagged in handler/route files", () => {
+  const handler = addedDiff("src/api/userRoute.ts", ["export function handler() {", "  return null;", "}"]);
+  assert.ok(scanStubs(handler).some((f) => f.kind === "empty-return"), "return null in a route file is suspect");
+  const ui = addedDiff("src/components/Avatar.tsx", ["function Avatar() {", "  return null;", "}"]);
+  assert.deepEqual(scanStubs(ui), [], "return null in a normal component is fine (conditional render)");
+});
+
+test("scanStubs: ignores removed lines, tests, generated paths, and markdown", () => {
+  // removed line containing a stub marker must not count
+  const removed = `diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1,1 +1,1 @@\n-  // TODO old\n+  const y = realWork();\n`;
+  assert.deepEqual(scanStubs(removed), [], "a removed TODO is not a finding");
+  assert.deepEqual(scanStubs(addedDiff("src/x.test.ts", ["  onClick={() => {}}"])), [], "test files are skipped");
+  assert.deepEqual(scanStubs(addedDiff("dist/bundle.js", ["  onClick={() => {}}"])), [], "generated paths are skipped");
+  assert.deepEqual(scanStubs(addedDiff("README.md", ["TODO: docs"])), [], "markdown is skipped");
+});
+
+test("scanStubs: line numbers track the hunk; never throws on junk", () => {
+  const diff = `diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -10,2 +10,3 @@\n context line\n+  onClick={() => {}}\n+  ok();\n`;
+  const f = scanStubs(diff);
+  assert.equal(f.length, 1);
+  assert.equal(f[0].line, 11, "added stub is on new-file line 11 (10 = context)");
+  assert.doesNotThrow(() => scanStubs("not a diff at all\n@@ garbage\n+++ "));
+  assert.deepEqual(scanStubs(""), []);
+});
+
+test("formatStubFindings: groups by kind; empty in, empty out", () => {
+  assert.equal(formatStubFindings([]), "");
+  const out = formatStubFindings([
+    { file: "a.tsx", line: 1, kind: "dead-handler", snippet: "onClick={() => {}}" },
+    { file: "b.tsx", line: 2, kind: "dead-handler", snippet: "onClick={undefined}" },
+    { file: "c.tsx", line: 3, kind: "dead-link", snippet: 'href="#"' },
+  ]);
+  assert.match(out, /dead-handler \(2\)/);
+  assert.match(out, /dead-link \(1\)/);
+  assert.match(out, /a\.tsx:1/);
+});

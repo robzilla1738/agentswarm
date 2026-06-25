@@ -241,6 +241,86 @@ export function useRuns(intervalMs = 2500): { runs: RunSummary[]; loading: boole
   return { runs, loading, error, refresh: () => setNonce((n) => n + 1) };
 }
 
+/**
+ * Poll a code-chat session's snapshot (meta + ordered turns). Polls faster while
+ * a turn is live so the transcript stays fresh; the LIVE turn's fine-grained
+ * build events are streamed separately by useRun(liveTurnId) in the page.
+ */
+export function useSession(id: string | null): {
+  session: import("./types").SessionSnapshot | null;
+  error: string | null;
+  refresh: () => void;
+} {
+  const [session, setSession] = useState<import("./types").SessionSnapshot | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [nonce, setNonce] = useState(0);
+
+  useEffect(() => {
+    if (!id) return;
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const load = async () => {
+      try {
+        const snap = await api.getSession(id);
+        if (!alive) return;
+        setSession(snap);
+        setError(null);
+        // Tighter cadence while a turn is building; relaxed when idle.
+        timer = setTimeout(load, snap.live ? 1500 : 4000);
+      } catch (e: any) {
+        if (!alive) return;
+        setError(e?.message || "session unreachable");
+        timer = setTimeout(load, 4000);
+      }
+    };
+    load();
+    return () => {
+      alive = false;
+      if (timer) clearTimeout(timer);
+    };
+  }, [id, nonce]);
+
+  return { session, error, refresh: () => setNonce((n) => n + 1) };
+}
+
+/** Poll the session list for the code dashboard. */
+export function useSessions(intervalMs = 3000): {
+  sessions: import("./types").SessionSummary[];
+  loading: boolean;
+  error: string | null;
+  refresh: () => void;
+} {
+  const [sessions, setSessions] = useState<import("./types").SessionSummary[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [nonce, setNonce] = useState(0);
+
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const { sessions } = await api.listSessions();
+        if (alive) {
+          setSessions(sessions);
+          setError(null);
+        }
+      } catch (e: any) {
+        if (alive) setError(e?.message || "hub unreachable");
+      } finally {
+        if (alive) setLoading(false);
+      }
+    };
+    load();
+    const t = setInterval(load, intervalMs);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [intervalMs, nonce]);
+
+  return { sessions, loading, error, refresh: () => setNonce((n) => n + 1) };
+}
+
 /** A ticking clock for relative timestamps. */
 export function useNow(intervalMs = 1000): number {
   const [now, setNow] = useState(() => Date.now());

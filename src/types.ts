@@ -679,6 +679,54 @@ export interface RunMeta {
   cwd: string;
   sandbox: boolean;
   options: RunOptions;
+  /** Set when this run is one TURN of a code-chat session. Absent on one-shot runs. */
+  sessionId?: string;
+  /** The prior turn's run id (context inheritance + diff-baseline lineage). Absent on the first turn. */
+  parentRunId?: string;
+}
+
+/**
+ * A code-chat SESSION: a durable, multi-turn conversation that builds software.
+ * Each user message is a TURN — an ordinary code-mode run pointed at the session's
+ * persistent workspace and tagged with sessionId. The session owns the workspace
+ * (managed) or points at the user's own directory (existing).
+ */
+export interface SessionMeta {
+  id: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  /** Absolute path to the persistent project tree every turn builds in. */
+  workspace: string;
+  /** "managed" → app created & owns sessionDir/workspace (delete removes it); "existing" → user's own dir (never deleted). */
+  workspaceKind: "managed" | "existing";
+  /** Frozen at creation so every turn launches reproducibly. */
+  options: RunOptions;
+  /** Existing-dir case: was it already a git repo at creation (governs commit + delete safety)? */
+  preexistingGit?: boolean;
+}
+
+/** One turn of a session — appended to turns.jsonl in order. */
+export interface TurnRecord {
+  t: number;
+  turnId: string;
+  message: string;
+  parentRunId?: string;
+}
+
+/** Dashboard view of a session: meta + turn rollup. */
+export interface SessionSummary {
+  id: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  workspace: string;
+  workspaceKind: "managed" | "existing";
+  turns: number;
+  /** Status of the latest turn's run (so the list can show live/failed/done). */
+  lastStatus?: RunStatus;
+  lastTurnId?: string;
+  live: boolean;
 }
 
 /** A web source a worker's findings rest on — flows into the final report's bibliography. */
@@ -787,6 +835,8 @@ export interface RunSummary {
   cost: number;
   /** Distinct web sources touched so far (searches, fetches, cited sources). */
   sourceCount?: number;
+  /** Set when this run is a turn of a code-chat session (lets the flat runs list hide turn-runs). */
+  sessionId?: string;
   finalSummary?: string;
   /** Forecast runs: the headline aggregate once computed. */
   forecast?: { p?: number; p50?: number; unit?: string; kind?: ForecastKind; n: number; resolutionDate: string; count?: number };

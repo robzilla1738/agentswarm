@@ -110,11 +110,12 @@ import { detectDomain, packById } from "./domains/registry";
 import type { DomainCtx, IntentMatch } from "./domains/pack";
 import { getModel } from "./models";
 import { appendMemory, memoryBlock } from "./memory";
+import { loadSessionMeta, sessionContextBlock } from "./session";
 import { canonicalizeUrl } from "./searchcore";
 import { aggregateSources, renderFinalHtml, sourcesBlock } from "./report";
 import { SandboxRuntime, createSandbox } from "./sandbox";
 import { RunState } from "./state";
-import { buildRepoMap, codeCacheCleanCommand, coerceBuildModules, formatCheckResult, gitAddWorktree, gitCommitGreen, gitDiffSince, gitMergeWorktreeBranch, gitPrepare, gitRemoveWorktree, gitResetTo, parseCheckOutput, partitionWaves, reconRepo } from "./codeintel";
+import { buildRepoMap, codeCacheCleanCommand, coerceBuildModules, formatCheckResult, formatStubFindings, gitAddWorktree, gitCommitGreen, gitDiffSince, gitMergeWorktreeBranch, gitPrepare, gitRemoveWorktree, gitResetTo, parseCheckOutput, partitionWaves, reconRepo, scanStubs } from "./codeintel";
 import { appendRepoFacts, loadRepoFacts, manifestHash, mergeConfirmedCommands, repoKey } from "./codeledger";
 import { AcceptanceItem, AggregateForecast, BuildPlan, CodeCommands, CodeDepth, CodeGateResult, DomainId, FittedParams, Forecast, ForecastQuestion, MarketAnchor, RepoMap, RepoProfile, RunMeta, RunStatus, SimDriver, SourceRef, Task, TaskSpec, Usage, usageCost } from "./types";
 import { canonicalArtifactRel, clip, ensureDir, errMsg, normalizeWorkdirRel, oneLine, parseJsonLoose, rid, sleep, truncateMiddle, validateArtifactFormat, withTimeout } from "./util";
@@ -530,9 +531,17 @@ export class Executor {
 
     // Real-directory runs remember: prior missions in the same workspace feed
     // the conductor so it builds on settled decisions instead of starting cold.
-    const memory = this.mode === "root" && !this.meta.sandbox ? memoryBlock(this.meta.cwd) : "";
+    // A code-chat TURN gets an ORDERED account of its own prior turns instead
+    // (sessionContextBlock) — scoped to this chat, so unrelated runs that touched
+    // the same dir don't bleed in. Session turns are non-sandbox, so memoryBlock
+    // would also fire; we prefer the ordered, session-scoped block for them.
+    const sessionCtx =
+      this.mode === "root" && this.meta.sessionId ? sessionContextBlock(this.meta.sessionId, this.meta.cwd) : "";
+    const memory =
+      this.mode === "root" && !this.meta.sessionId && !this.meta.sandbox ? memoryBlock(this.meta.cwd) : "";
+    const priorContext = sessionCtx || memory;
     this.conductorMessages = [
-      { role: "system", content: conductorSystem(this.meta) + forecastDoctrine + codeDoctrine + (memory ? `\n\n${memory}` : "") },
+      { role: "system", content: conductorSystem(this.meta) + forecastDoctrine + codeDoctrine + (priorContext ? `\n\n${priorContext}` : "") },
       {
         role: "user",
         content: this.resumed
@@ -734,12 +743,17 @@ export class Executor {
   private _codeAmbition?: CodeDepth;
   private codeAmbition(): CodeDepth {
     if (this._codeAmbition) return this._codeAmbition;
+    // An explicit --depth (prototype|standard|exhaustive) always wins.
     const requested = this.meta.options.codeDepth;
     if (requested) return (this._codeAmbition = requested);
-    const text = `${this.meta.mission}\n${this.meta.options.acceptanceCriteria ?? ""}`.toLowerCase();
-    const exhaustive =
-      /\b(1\s*[:\-]\s*1|one[\s-]to[\s-]one|parity|clones?|pixel[\s-]perfect|exhaustive|comprehensive|full[\s-]featured|fully[\s-]featured|production[\s-](grade|ready)|enterprise[\s-]grade|every (feature|detail|screen)|beautiful|polished)\b/;
-    return (this._codeAmbition = exhaustive.test(text) ? "exhaustive" : "standard");
+    // Default for code mode is EXHAUSTIVE: a build with no flags should deliver
+    // the full mission surface (parity critic on, scope-EXPANSION acceptance
+    // split, strong-tier craft, best-of-N on hard modules) instead of quietly
+    // collapsing an ambitious ask into a thin prototype. Prototype/Standard are
+    // explicit opt-ins for a quick cut. (Was: regex-sniff the mission and default
+    // to "standard" — that left "build Notion 1:1 parity" half-built whenever the
+    // phrasing missed the keyword list.)
+    return (this._codeAmbition = "exhaustive");
   }
 
   /** Code mode: best-of-N ensemble runs by default on HARD (and, when exhaustive, UI-craft) modules — not only when the conductor opts in. */
@@ -788,12 +802,21 @@ export class Executor {
     //     capture HEAD read-only as the review baseline (the diff still picks up
     //     new untracked files via intent-to-add at review time).
     const autoCommit = this.meta.options.codeAutoCommit ?? this.cfg.codeAutoCommit;
-    const ownWorkspace = this.meta.sandbox || this.repoProfile.greenfield;
+    // A code-chat session pins ONE stable branch across turns (every turn commits
+    // on top of the prior turn). A MANAGED session workspace is engine-owned, so
+    // it commits-on-green freely even with auto-commit off; an EXISTING user repo
+    // keeps the dirty-tree protection (ownTree stays false there).
+    const sessMeta = this.meta.sessionId ? loadSessionMeta(this.meta.sessionId) : null;
+    const isManagedSession = sessMeta?.workspaceKind === "managed";
+    const sessionBranch = this.meta.sessionId ? `swarm/session-${this.meta.sessionId}` : undefined;
+    const ownWorkspace = this.meta.sandbox || this.repoProfile.greenfield || isManagedSession;
     if (autoCommit || ownWorkspace) {
       const prep = await gitPrepare(exec, this.sandbox.workdir, {
         isSandbox: this.meta.sandbox,
         runId: this.meta.id,
         signal: this.ac.signal,
+        branch: sessionBranch,
+        ownTree: ownWorkspace,
       });
       this.codeCommit = prep.ok;
       this.codeBranch = prep.branch;
@@ -1189,7 +1212,7 @@ export class Executor {
     if (!raw && ambition !== "exhaustive") return;
     // Scale the cap with ambition — the old flat 12 collapsed broad product asks
     // into a generic subset. Use the capable tier to derive an ambitious scope.
-    const cap = ambition === "exhaustive" ? 40 : ambition === "prototype" ? 10 : 18;
+    const cap = ambition === "exhaustive" ? 40 : ambition === "prototype" ? 10 : 28;
     const tier = ambition === "prototype" ? "cheap" : "strong";
     const greenfield = this.repoProfile?.greenfield ?? false;
     let items: string[] = [];
@@ -2906,6 +2929,13 @@ PROTOCOL
     if (this.inflight.size) await Promise.allSettled([...this.inflight.values()]);
     this.completenessRounds++;
     const diff = (await this.codeBaselineDiff()) ?? "";
+    // Deterministic stub/dead-button signals the build tool already found in the
+    // diff (empty/console-only/alert-only handlers, href="#", TODO, "not
+    // implemented", placeholders). The green-gate can't see these — a dead button
+    // that just logs to the console compiles cleanly. Hand them to the critic
+    // to verify and drive a real fix instead of relying on it to notice them.
+    const stubs = scanStubs(diff);
+    const stubBlock = formatStubFindings(stubs);
     let verdict = "";
     try {
       const res = await chat(this.cfg, {
@@ -2918,7 +2948,8 @@ PROTOCOL
               this.acceptanceItems,
               taskTable(this.taskList()),
               truncateMiddle(this.taskList().map(reportBlock).join("\n\n"), 40_000, "chars"),
-              truncateMiddle(diff, 60_000, "chars")
+              truncateMiddle(diff, 60_000, "chars"),
+              stubBlock
             ),
           },
         ],
@@ -2941,7 +2972,12 @@ PROTOCOL
           .filter((l) => /^\d+[.)]/.test(l))
           .map((l) => clip(l, 300))
           .slice(0, 8);
-    this.journal.append("code.completeness", { complete, gaps: gaps.length ? gaps : complete ? [] : [clip(verdict, 300)], round: this.completenessRounds });
+    this.journal.append("code.completeness", {
+      complete,
+      gaps: gaps.length ? gaps : complete ? [] : [clip(verdict, 300)],
+      round: this.completenessRounds,
+      stubs: stubs.slice(0, 12).map((s) => `${s.kind} ${s.file}:${s.line}`),
+    });
     if (complete) {
       this.journal.append("log", { level: "info", msg: "parity critic: mission surface covered" });
       return false;

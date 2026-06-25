@@ -52,9 +52,11 @@ test("code-mode quality flags round-trip and coerce/clamp correctly", () => {
     assert.equal(def.codeEnsemble, true);
     assert.equal(def.codeRepoFacts, true);
     assert.equal(def.codeEnsembleN, 3);
-    // The completeness/parity critic is off by default (0) — exhaustive builds
-    // scale it up at run time; standard/prototype skip it.
-    assert.equal(def.codeCompletenessMaxRounds, 0);
+    // Code mode now defaults to "exhaustive", so the completeness/parity critic
+    // runs by default; standard builds get this budget, exhaustive scales it ≥2,
+    // prototype skips it.
+    assert.equal(def.codeCompletenessMaxRounds, 2);
+    assert.equal(def.codeReviewMaxRounds, 2);
     // Round-trip toggles + numeric clamping.
     saveConfig({
       codeTdd: coerceConfigValue("codeTdd", "false"),

@@ -363,7 +363,7 @@ export function MissionComposer({ config }: { config: PublicConfig | null }) {
         <div className="mt-3 space-y-2.5">
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="text-2xs text-ink-faint mr-1">Build depth</span>
-            <PresetChip active={codeDepth === "auto"} onClick={() => pickDepth("auto")} title="Detect ambition from the mission (parity/clone/comprehensive → exhaustive).">
+            <PresetChip active={codeDepth === "auto"} onClick={() => pickDepth("auto")} title="Defaults to Exhaustive — full mission surface, parity critic, no dead buttons. Pick Prototype/Standard for a faster, smaller cut.">
               Auto
             </PresetChip>
             <PresetChip active={codeDepth === "prototype"} onClick={() => pickDepth("prototype")} title="Fast, minimal: cheap model, tight scope. A quick working cut.">

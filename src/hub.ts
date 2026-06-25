@@ -13,6 +13,18 @@ import {
   saveConfig,
 } from "./config";
 import { appendControl } from "./control";
+import {
+  appendTurn,
+  createSession,
+  deleteSession,
+  isEmptyDir,
+  listSessions,
+  loadSessionMeta,
+  readTurns,
+  sessionLiveTurn,
+  sessionSnapshot,
+  touchSession,
+} from "./session";
 import { ISO_DATE, calibrationStats, isoToDays, loadLedger, resolveLedgerEntry, snapshotFittedParams } from "./forecast";
 import { resolveDue } from "./resolve";
 import { deleteModel, loadModels, modelTrackRecord, upsertModel } from "./models";
@@ -105,6 +117,37 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse, opts:
 }
 
 // ---------------------------------------------------------------- api
+
+/** Shared key + auth preflight for run/session creation. Returns an error string, or null when OK. */
+async function authPreflight(cfg: SwarmConfig): Promise<string | null> {
+  const provider = PROVIDERS[cfg.provider];
+  if (!cfg.apiKey && provider.keyRequired) return `No ${provider.label} API key configured. Set it in Settings first.`;
+  const auth = await validateAuth(cfg);
+  if (auth.status === "invalid") {
+    return `${provider.label} key rejected: ${auth.message || "invalid"}. Open Settings and paste a valid key.`;
+  }
+  return null;
+}
+
+/**
+ * Launch one TURN of a code-chat session: a non-sandbox code run pinned to the
+ * session's persistent workspace, tagged with sessionId + the prior turn's id.
+ * codeGreenfield is computed PER TURN from the live emptiness of the workspace —
+ * never copied from the session options — so turn 1 scaffolds from scratch while
+ * turn 2+ recons the tree the prior turns built. Returns the new turn's run id.
+ */
+function launchTurn(sessionId: string, message: string, binPath: string): string {
+  const sess = loadSessionMeta(sessionId);
+  if (!sess) throw new Error("session not found");
+  const turns = readTurns(sessionId);
+  const parentRunId = turns[turns.length - 1]?.turnId;
+  const options: RunOptions = { ...sess.options, mode: "code", codeGreenfield: isEmptyDir(sess.workspace) };
+  const meta = createRun({ mission: message, cwd: sess.workspace, sandbox: false, options, sessionId, parentRunId });
+  appendTurn(sessionId, { turnId: meta.id, message, parentRunId });
+  touchSession(sessionId);
+  launchDetached(meta.id, binPath);
+  return meta.id;
+}
 
 async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL, opts: HubOptions): Promise<void> {
   const cfg = loadConfig();
@@ -339,16 +382,8 @@ async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL
     if (!body.mission || typeof body.mission !== "string") {
       return sendJson(res, 400, { error: "mission is required" });
     }
-    const provider = PROVIDERS[cfg.provider];
-    if (!cfg.apiKey && provider.keyRequired) {
-      return sendJson(res, 400, { error: `No ${provider.label} API key configured. Set it in Settings first.` });
-    }
-    const auth = await validateAuth(cfg);
-    if (auth.status === "invalid") {
-      return sendJson(res, 400, {
-        error: `${provider.label} key rejected: ${auth.message || "invalid"}. Open Settings and paste a valid key.`,
-      });
-    }
+    const authErr = await authPreflight(cfg);
+    if (authErr) return sendJson(res, 400, { error: authErr });
     const overrides = sanitizeOptions(body.options);
     const sandbox = body.sandbox !== false; // default to sandbox for UI-created runs
     const cwd = sandbox ? process.cwd() : String(body.cwd || process.cwd());
@@ -368,6 +403,72 @@ async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL
     });
     launchDetached(meta.id, opts.binPath);
     return sendJson(res, 200, { id: meta.id });
+  }
+
+  // ---------------------------------------------------------------- code-chat sessions
+  if (p === "/api/sessions" && method === "GET") {
+    return sendJson(res, 200, { sessions: listSessions(cfg.pricing) });
+  }
+
+  if (p === "/api/sessions" && method === "POST") {
+    const body = await readBody(req);
+    const authErr = await authPreflight(cfg);
+    if (authErr) return sendJson(res, 400, { error: authErr });
+    const overrides = sanitizeOptions(body.options);
+    overrides.mode = "code";
+    let workspace: string | undefined;
+    if (body.workspace != null && String(body.workspace).trim()) {
+      workspace = path.resolve(String(body.workspace).trim());
+      if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) {
+        return sendJson(res, 400, { error: `directory not found: ${workspace}` });
+      }
+      // A user's own directory: don't commit onto their branch unless they ask.
+      if (overrides.codeAutoCommit === undefined) overrides.codeAutoCommit = false;
+    }
+    const title = typeof body.title === "string" && body.title.trim() ? body.title : typeof body.message === "string" ? body.message : "";
+    const sess = createSession({ title, workspace, options: await resolvedOptions(cfg, overrides) });
+    const message = typeof body.message === "string" ? body.message.trim() : "";
+    const firstTurnId = message ? launchTurn(sess.id, message, opts.binPath) : undefined;
+    return sendJson(res, 200, { id: sess.id, firstTurnId });
+  }
+
+  const sm = p.match(/^\/api\/sessions\/([^/]+)(\/.*)?$/);
+  if (sm) {
+    const id = sm[1];
+    const sub = sm[2] || "";
+    const sess = loadSessionMeta(id);
+    if (!sess) return sendJson(res, 404, { error: "session not found" });
+
+    if (sub === "" && method === "GET") {
+      return sendJson(res, 200, sessionSnapshot(id, cfg.pricing));
+    }
+    if (sub === "" && method === "DELETE") {
+      try {
+        deleteSession(id);
+      } catch (e) {
+        return sendJson(res, 409, { error: errMsg(e) });
+      }
+      return sendJson(res, 200, { ok: true });
+    }
+    if (sub === "/message" && method === "POST") {
+      const body = await readBody(req);
+      const message = typeof body.message === "string" ? body.message.trim() : "";
+      if (!message) return sendJson(res, 400, { error: "message required" });
+      // One live turn per session — concurrent turns would corrupt the shared
+      // workspace and collide on .git/index.lock.
+      if (sessionLiveTurn(id)) return sendJson(res, 409, { error: "a turn is already running — wait for it to finish" });
+      const authErr = await authPreflight(cfg);
+      if (authErr) return sendJson(res, 400, { error: authErr });
+      const turnId = launchTurn(id, message, opts.binPath);
+      return sendJson(res, 200, { turnId });
+    }
+    // Convenience: stream the live (or most recent) turn's events.
+    if (sub === "/stream" && method === "GET") {
+      const turns = readTurns(id);
+      const target = sessionLiveTurn(id) || turns[turns.length - 1]?.turnId;
+      if (!target) return sendJson(res, 404, { error: "no turn yet" });
+      return streamEvents(res, target, url.searchParams.get("quiet") === "1");
+    }
   }
 
   const m = p.match(/^\/api\/runs\/([^/]+)(\/.*)?$/);

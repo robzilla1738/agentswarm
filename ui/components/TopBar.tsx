@@ -78,6 +78,9 @@ export function TopBar({ right, hideLogo }: { right?: React.ReactNode; hideLogo?
           </Link>
         )}
         {right}
+        <Link href="/code" className="btn btn-ghost btn-sm">
+          Code
+        </Link>
         <Link href="/forecasts" className="btn btn-ghost btn-sm">
           Forecasts
         </Link>

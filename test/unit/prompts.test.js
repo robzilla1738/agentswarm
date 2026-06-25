@@ -108,4 +108,14 @@ test("codeParityPrompt judges completeness vs the full mission (not just compile
   assert.ok(/COMPLETENESS and PARITY/i.test(p));
   assert.ok(/Named capabilities/.test(p));
   assert.ok(/EXACTLY "COMPLETE"/.test(p), "has a clean COMPLETE sentinel");
+  assert.ok(/Wired, not dead/i.test(p), "demands every interactive control be wired");
+});
+
+test("codeParityPrompt injects deterministic stub signals when provided", () => {
+  const stubs = "- dead-handler (1):\n    src/App.tsx:5  onClick={() => {}}";
+  const withStubs = codeParityPrompt("Clone X", [], "T1", "report", "diff", stubs);
+  assert.ok(/DETERMINISTIC STUB SIGNALS/.test(withStubs));
+  assert.ok(withStubs.includes("onClick={() => {}}"));
+  const without = codeParityPrompt("Clone X", [], "T1", "report", "diff");
+  assert.ok(!/DETERMINISTIC STUB SIGNALS/.test(without), "no stub block when none passed");
 });

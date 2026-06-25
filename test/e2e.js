@@ -1259,6 +1259,82 @@ async function phaseCodeGreenfield() {
   fs.rmSync(repo, { recursive: true, force: true });
 }
 
+async function phaseCodeSession() {
+  console.log("\n▶ Phase 32: code-chat session — managed workspace persists across turns (build → follow-up)");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
+  const { proc, port } = await startMock({ MOCK_SCENARIO: "code-green" });
+  ok(`mock model server on :${port} (code-green script)`);
+  writeConfig(home, port);
+  const env = { ...process.env, AGENTSWARM_HOME: home, NO_COLOR: "1" };
+  const runEvents = (turnId) => events(path.join(home, "runs", turnId));
+  const oneOf = (turnId, type) => runEvents(turnId).find((e) => e.type === type);
+  const statusOf = (turnId) => (runEvents(turnId).filter((e) => e.type === "run.status").pop() || {}).status;
+
+  const hub = spawn(process.execPath, [SWARM, "serve", "--port", "0"], { env, stdio: ["ignore", "pipe", "inherit"] });
+  let hubOut = "";
+  hub.stdout.on("data", (b) => (hubOut += b.toString()));
+  try {
+    const base = await waitFor(() => (/(http:\/\/localhost:\d+)/.exec(hubOut) || [])[1], 15000, "hub to print its URL");
+
+    // --- Turn 1: create a MANAGED session with a first message. ---
+    const created = await (await fetch(`${base}/api/sessions`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "Build a greet module" }),
+    })).json();
+    if (!created.id || !created.firstTurnId) fail(`session create failed: ${JSON.stringify(created)}`);
+    ok(`hub created a managed session + launched turn 1: ${created.id}`);
+
+    const turn1 = created.firstTurnId;
+    await waitFor(() => (["done", "failed", "cancelled"].includes(statusOf(turn1)) ? true : null), 90000, "turn 1 to finish");
+    if (statusOf(turn1) !== "done") fail(`turn 1 ended ${statusOf(turn1)}`);
+    ok("turn 1 finished done");
+
+    // The turn is a NON-sandbox run pinned to the managed workspace, tagged with the session.
+    const meta1 = JSON.parse(fs.readFileSync(path.join(home, "runs", turn1, "meta.json"), "utf8"));
+    if (meta1.sandbox !== false) fail("a session turn must be a non-sandbox run");
+    if (meta1.sessionId !== created.id) fail("turn run must be tagged with its sessionId");
+    const ws = path.join(home, "sessions", created.id, "workspace");
+    if (path.resolve(meta1.cwd) !== path.resolve(ws)) fail(`turn cwd must be the session workspace (got ${meta1.cwd})`);
+    if (!fs.existsSync(path.join(ws, "greet.js"))) fail("turn 1 should have built greet.js into the persistent workspace");
+    ok("turn 1 built into the persistent managed workspace (non-sandbox, sessionId-tagged)");
+    if (oneOf(turn1, "code.plan").profile.greenfield !== true) fail("turn 1 (empty workspace) should recon as greenfield");
+    ok("turn 1 reconned the empty workspace as greenfield");
+
+    // --- Turn 2: a follow-up message must iterate on the SAME tree, not wipe it. ---
+    const second = await (await fetch(`${base}/api/sessions/${created.id}/message`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "Add a farewell helper too" }),
+    })).json();
+    if (!second.turnId) fail(`follow-up message failed: ${JSON.stringify(second)}`);
+    ok(`follow-up message launched turn 2: ${second.turnId}`);
+
+    await waitFor(() => (["done", "failed", "cancelled"].includes(statusOf(second.turnId)) ? true : null), 90000, "turn 2 to finish");
+    // The workspace from turn 1 must still be intact (persistence, no per-turn wipe).
+    if (!fs.existsSync(path.join(ws, "greet.js"))) fail("turn 2 must NOT wipe the workspace — greet.js from turn 1 should persist");
+    ok("turn 2 preserved the prior turn's workspace (greet.js survived)");
+    // Turn 2 sees a NON-empty tree → it recons (not greenfield), proving it builds on prior work.
+    const plan2 = oneOf(second.turnId, "code.plan");
+    if (!plan2 || plan2.profile.greenfield !== false) fail("turn 2 must recon the persisted tree (greenfield=false), not rebuild from scratch");
+    ok("turn 2 reconned the persisted tree (greenfield=false) — builds on prior work");
+
+    // The snapshot exposes both turns in order.
+    const snap = await (await fetch(`${base}/api/sessions/${created.id}`)).json();
+    if (!snap.turns || snap.turns.length !== 2) fail(`session snapshot should list 2 turns, got ${snap.turns && snap.turns.length}`);
+    if (snap.turns[0].turnId !== turn1 || snap.turns[1].turnId !== second.turnId) fail("snapshot turns out of order");
+    ok("session snapshot lists both turns in order");
+
+    // Delete removes the managed workspace.
+    const del = await fetch(`${base}/api/sessions/${created.id}`, { method: "DELETE" });
+    if (!del.ok) fail(`session delete failed: ${del.status}`);
+    if (fs.existsSync(ws)) fail("deleting a managed session must remove its workspace");
+    ok("deleting the managed session removed its persistent workspace");
+  } finally {
+    hub.kill("SIGKILL");
+    proc.kill();
+  }
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
 async function phaseForecast() {
   console.log("\n▶ Phase 22: forecast mode — panel, mechanical aggregation, ledger, resolution");
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentswarm-e2e-"));
@@ -1585,7 +1661,7 @@ async function main() {
     ["forecastMulti", phaseForecastMulti], ["tournamentPreset", phaseTournamentPreset],
     ["code", phaseCode], ["codeEnsemble", phaseCodeEnsemble], ["codeRepair", phaseCodeRepair],
     ["codeUnverified", phaseCodeUnverified], ["codeEnsembleFallback", phaseCodeEnsembleFallback],
-    ["codeGreenfield", phaseCodeGreenfield],
+    ["codeGreenfield", phaseCodeGreenfield], ["codeSession", phaseCodeSession],
   ];
   const only = (process.env.E2E_ONLY || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
   for (const [name, fn] of phases) {
@@ -1595,7 +1671,7 @@ async function main() {
   console.log(
     only.length
       ? `\n✅ E2E subset passed (${only.join(", ")}).`
-      : "\n✅ E2E passed — pipeline, auth failure, resume (with ledger re-seed), budget cap, verify-retry, steering + cancel, compaction, hub API, checkpoint resume, conductor breaker, blind verification, SIGTERM safety, 429 limiter, model tiers, hierarchical teams, the living plan, cascade root causes, failure diagnostics, forecast mode (panel → mechanical aggregation → ledger → resolution → calibration), open-ended decomposition (one question → independent sub-forecasts), tournament imports (preset question, ledger origin, platform-resolution fallback), and code mode (engine-owned build plan, TDD spec oracle, green-gate, adversarial diff-review, cross-run repo memory) all work."
+      : "\n✅ E2E passed — pipeline, auth failure, resume (with ledger re-seed), budget cap, verify-retry, steering + cancel, compaction, hub API, checkpoint resume, conductor breaker, blind verification, SIGTERM safety, 429 limiter, model tiers, hierarchical teams, the living plan, cascade root causes, failure diagnostics, forecast mode (panel → mechanical aggregation → ledger → resolution → calibration), open-ended decomposition (one question → independent sub-forecasts), tournament imports (preset question, ledger origin, platform-resolution fallback), code mode (engine-owned build plan, TDD spec oracle, green-gate, adversarial diff-review, cross-run repo memory), and code-chat sessions (managed workspace persisting across build → follow-up turns) all work."
   );
 }
 

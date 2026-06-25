@@ -255,10 +255,12 @@ export const DEFAULTS: SwarmConfig = {
   codeRepoMap: true,
   codeRepoMapMaxTokens: 6000,
   codeReview: true,
-  codeReviewMaxRounds: 1,
-  // 0 = the completeness/parity critic is off for standard/prototype builds; an
-  // "exhaustive" build auto-scales it to ≥2 rounds (codeCompletenessRounds()).
-  codeCompletenessMaxRounds: 0,
+  codeReviewMaxRounds: 2,
+  // The completeness/parity critic round budget for standard builds. Code mode
+  // now defaults to "exhaustive" (codeAmbition()), which auto-scales this to ≥2
+  // rounds regardless; an explicit --depth standard run still gets real parity
+  // passes off this value. Prototype gets 0 (codeCompletenessRounds()).
+  codeCompletenessMaxRounds: 2,
   codeEnsemble: true,
   codeEnsembleN: 3,
   codeRepoFacts: true,
@@ -329,6 +331,14 @@ export function runsDir(): string {
 
 export function runDir(id: string): string {
   return path.join(runsDir(), id);
+}
+
+export function sessionsDir(): string {
+  return path.join(home(), "sessions");
+}
+
+export function sessionDir(id: string): string {
+  return path.join(sessionsDir(), id);
 }
 
 export function configPath(): string {

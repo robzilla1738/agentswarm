@@ -498,6 +498,129 @@ export function formatCheckResult(
   return r.firstFailures.length ? `${head}\n${r.firstFailures.map((f) => `  ${f}`).join("\n")}` : head;
 }
 
+// ---------------------------------------------------------------- stub scan
+
+/** A deterministic "this looks like dead/unfinished code" signal found in a diff. */
+export interface StubFinding {
+  file: string;
+  line: number;
+  kind: string;
+  snippet: string;
+}
+
+/** Source files worth scanning; skip generated/lockfiles/tests/markdown noise. */
+function scannablePath(p: string): boolean {
+  const f = p.toLowerCase();
+  if (/(^|\/)(node_modules|dist|build|out|\.next|vendor|target|__snapshots__)\//.test(f)) return false;
+  if (/\.(lock|md|mdx|txt|json|lockb|snap|map|svg|png|jpe?g|gif|ico|woff2?|ttf)$/.test(f)) return false;
+  if (/\.(test|spec)\.[tj]sx?$/.test(f) || /(^|\/)(tests?|__tests__|e2e|fixtures?)\//.test(f)) return false;
+  return /\.(tsx?|jsx?|vue|svelte|py|rs|go|rb|java|kt|swift|php|cs|c|cc|cpp|h|hpp)$/.test(f);
+}
+
+/** Path looks like server/route/handler code where a bare `return null` is a likely stub. */
+function isHandlerPath(p: string): boolean {
+  return /(route|router|controller|handler|service|api|endpoint|action|resolver|usecase|use-case)/i.test(p);
+}
+
+const STUB_RULES: { kind: string; re: RegExp }[] = [
+  // explicit unfinished markers
+  { kind: "todo-marker", re: /\b(TODO|FIXME|XXX|HACK)\b/ },
+  // not-implemented across languages
+  { kind: "not-implemented", re: /not[\s_-]?implemented|NotImplementedError|unimplemented!|todo!\s*\(|panic!?\s*\(\s*["'`](todo|not implemented)/i },
+  { kind: "not-implemented", re: /throw\s+new\s+Error\s*\(\s*["'`][^"'`]*\b(not\s+implemented|unimplemented|stub|todo)\b/i },
+  // dead/empty event handlers — renders but does nothing
+  { kind: "dead-handler", re: /\bon[A-Z]\w*\s*=\s*\{\s*(?:\(\s*[^)]*\)\s*=>\s*(?:\{\s*\}|undefined|null|void 0)|undefined|null)\s*\}/ },
+  // console-only event handler — a button/menu that just logs is the classic
+  // small-model dead control: it "responds" but does no real work. Matches only
+  // when the ENTIRE handler is one console.* call (single-expression or a lone
+  // braced statement), so a real handler that also logs is never flagged.
+  { kind: "stub-console", re: /\bon[A-Z]\w*\s*=\s*\{\s*\(\s*[^)]*\)\s*=>\s*(?:console\.\w+\s*\([^{};]*\)|\{\s*console\.\w+\s*\([^{};]*\)\s*;?\s*\})\s*\}/ },
+  // placeholder dead links / buttons
+  { kind: "dead-link", re: /href\s*=\s*\{?\s*["'`]#["'`]\s*\}?/ },
+  // generic placeholder language in code (not prose) — "coming soon", "stub", "placeholder for"
+  { kind: "placeholder", re: /\b(coming soon|placeholder for|stubbed out|not yet (implemented|wired|hooked)|fake (data|response|impl)|hard[\s-]?coded for now)\b/i },
+  // alert-only handler standing in for real behavior
+  { kind: "stub-alert", re: /=>\s*alert\s*\(/ },
+];
+
+/**
+ * Pure, deterministic scan of a unified git diff for ADDED lines that look like
+ * dead or unfinished code — empty click handlers, `href="#"`, TODO/FIXME,
+ * `throw new Error("not implemented")`, "coming soon" placeholders, alert-only
+ * handlers, and (in route/handler files) a bare `return null`. The green-gate
+ * only proves build/typecheck/test pass; a button with no onClick compiles
+ * cleanly, so this catches the "renders but does nothing" class the gate can't.
+ * Findings are advisory — they're fed to the parity critic to VERIFY and drive a
+ * fix, never used to hard-block a ship (heuristics false-positive). Never throws.
+ */
+export function scanStubs(diff: string, opts: { max?: number } = {}): StubFinding[] {
+  const max = opts.max ?? 50;
+  const out: StubFinding[] = [];
+  if (!diff) return out;
+  const seen = new Set<string>();
+  let file = "";
+  let scan = false;
+  let newLine = 0;
+  const push = (kind: string, snippet: string) => {
+    const key = `${file}:${kind}:${snippet.trim()}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ file, line: newLine, kind, snippet: snippet.trim().slice(0, 160) });
+  };
+  for (const raw of diff.split("\n")) {
+    if (raw.startsWith("+++ ")) {
+      const m = /^\+\+\+ (?:b\/)?(.+?)\s*$/.exec(raw);
+      file = m ? m[1] : "";
+      scan = file !== "" && file !== "/dev/null" && scannablePath(file);
+      newLine = 0;
+      continue;
+    }
+    if (raw.startsWith("--- ") || raw.startsWith("diff ") || raw.startsWith("index ")) continue;
+    if (raw.startsWith("@@")) {
+      const m = /@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
+      newLine = m ? Number(m[1]) : newLine;
+      continue;
+    }
+    if (!scan) continue;
+    if (raw.startsWith("-")) continue; // removed line — doesn't advance new-file counter
+    if (!raw.startsWith("+")) {
+      newLine++; // context line
+      continue;
+    }
+    const content = raw.slice(1);
+    for (const rule of STUB_RULES) {
+      if (rule.re.test(content)) {
+        push(rule.kind, content);
+        break;
+      }
+    }
+    // bare placeholder return only in server/handler-ish files (too noisy elsewhere)
+    if (isHandlerPath(file) && /^\s*return\s*(null|\[\s*\]|\{\s*\}|""|''|``)\s*;?\s*$/.test(content)) {
+      push("empty-return", content);
+    }
+    if (out.length >= max) break;
+    newLine++;
+  }
+  return out.slice(0, max);
+}
+
+/** Group stub findings into a compact block for the parity critic prompt. */
+export function formatStubFindings(findings: StubFinding[]): string {
+  if (!findings.length) return "";
+  const byKind = new Map<string, StubFinding[]>();
+  for (const f of findings) {
+    const arr = byKind.get(f.kind) ?? [];
+    arr.push(f);
+    byKind.set(f.kind, arr);
+  }
+  const lines: string[] = [];
+  for (const [kind, fs] of byKind) {
+    lines.push(`- ${kind} (${fs.length}):`);
+    for (const f of fs.slice(0, 8)) lines.push(`    ${f.file}:${f.line}  ${f.snippet}`);
+  }
+  return lines.join("\n");
+}
+
 /**
  * Best-effort shell command to wipe an ecosystem's REGENERABLE build/incremental
  * caches before an authoritative cold build — or `null` when there's nothing safe
@@ -551,17 +674,20 @@ function shArg(s: string): string {
 export async function gitPrepare(
   exec: Exec,
   workdir: string,
-  opts: { isSandbox: boolean; runId: string; signal: AbortSignal }
+  opts: { isSandbox: boolean; runId: string; signal: AbortSignal; branch?: string; ownTree?: boolean }
 ): Promise<{ ok: boolean; branch: string | null; reason?: string }> {
   const run = (cmd: string) => exec(cmd, { cwd: workdir, timeoutSec: 30, signal: opts.signal });
+  // A tree the engine owns (sandbox workspace, greenfield, or a managed code-chat
+  // session) is treated like a sandbox: auto-init/commit freely, no dirty refusal.
+  const owns = opts.isSandbox || opts.ownTree === true;
   try {
     const repo = await run("git rev-parse --is-inside-work-tree 2>/dev/null");
     const isRepo = /true/.test(repo.out ?? "");
     if (!isRepo) {
       // Never silently turn the operator's non-git directory into a repo and
-      // commit their whole tree. Auto-init only a sandbox workspace or a
+      // commit their whole tree. Auto-init only an owned workspace or a
       // genuinely empty host directory; otherwise refuse (the run still proceeds).
-      if (!opts.isSandbox) {
+      if (!owns) {
         const lsr = await run("ls -A 2>/dev/null");
         const entries = (lsr.out ?? "").split("\n").map((l) => l.trim()).filter(Boolean);
         if (!looksGreenfield(entries)) {
@@ -570,17 +696,26 @@ export async function gitPrepare(
       }
       const init = await run(`git ${GIT_ID} init -q && git ${GIT_ID} add -A && git ${GIT_ID} commit -q -m "agentswarm: baseline" --allow-empty`);
       if (init.code !== 0) return { ok: false, branch: null, reason: `git init failed: ${oneLine(init.out)}` };
+      // A session pins a stable branch even on a fresh init so every turn commits
+      // onto the same lineage.
+      if (opts.branch) {
+        const co = await run(`git ${GIT_ID} checkout -B ${shArg(opts.branch)} 2>&1`);
+        if (co.code === 0) return { ok: true, branch: opts.branch };
+      }
       const br = await run("git rev-parse --abbrev-ref HEAD 2>/dev/null");
       return { ok: true, branch: lines(br.out)[0] || null };
     }
     // Existing repo. On the operator's real directory, never touch a dirty tree.
-    if (!opts.isSandbox) {
+    if (!owns) {
       const dirty = await run("git status --porcelain 2>/dev/null | head -1");
       if ((dirty.out ?? "").trim()) {
         return { ok: false, branch: null, reason: "working tree has uncommitted changes — auto-commit disabled (commit or stash to enable)" };
       }
     }
-    const branch = `swarm/${opts.runId}`;
+    // A session reuses ONE stable branch across turns; a one-shot run gets a
+    // fresh per-run branch. `checkout -B` re-points it at the current tip so each
+    // turn continues on top of the prior turn's commits.
+    const branch = opts.branch ?? `swarm/${opts.runId}`;
     const co = await run(`git ${GIT_ID} checkout -B ${shArg(branch)} 2>&1`);
     if (co.code !== 0) return { ok: false, branch: null, reason: `could not create work branch: ${oneLine(co.out)}` };
     return { ok: true, branch };

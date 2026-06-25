@@ -360,9 +360,45 @@ export interface RunSummary {
   cost: number;
   sourceCount?: number;
   pid: number | null;
+  /** Set when this run is a turn of a code-chat session — hidden from the flat run list. */
+  sessionId?: string;
   finalSummary?: string;
   /** Forecast runs: the headline aggregate once computed. */
   forecast?: { p?: number; p50?: number; unit?: string; kind?: "binary" | "numeric" | "mc" | "date"; n: number; resolutionDate: string };
+}
+
+export interface SessionSummary {
+  id: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  workspace: string;
+  workspaceKind: "managed" | "existing";
+  turns: number;
+  lastStatus?: RunStatus;
+  lastTurnId?: string;
+  live: boolean;
+}
+
+export interface SessionTurn {
+  turnId: string;
+  message: string;
+  at: number;
+  run: RunSummary | null;
+}
+
+export interface SessionSnapshot {
+  meta: {
+    id: string;
+    title: string;
+    createdAt: number;
+    updatedAt: number;
+    workspace: string;
+    workspaceKind: "managed" | "existing";
+    preexistingGit?: boolean;
+  };
+  live: string | null;
+  turns: SessionTurn[];
 }
 
 export interface RunSnapshot {

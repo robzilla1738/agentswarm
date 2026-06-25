@@ -14,9 +14,11 @@ export default function Dashboard() {
   const now = useNow(2000);
 
   const { live, past, totals } = useMemo(() => {
-    const live = runs.filter((r) => r.pid || ["planning", "running", "synthesizing"].includes(r.status));
-    const past = runs.filter((r) => !live.includes(r));
-    const totals = runs.reduce(
+    // Code-chat turn-runs live under their session (/code), not the flat list.
+    const standalone = runs.filter((r) => !r.sessionId);
+    const live = standalone.filter((r) => r.pid || ["planning", "running", "synthesizing"].includes(r.status));
+    const past = standalone.filter((r) => !live.includes(r));
+    const totals = standalone.reduce(
       (acc, r) => {
         acc.cost += r.cost;
         acc.tokens += r.usage.promptTokens + r.usage.completionTokens;

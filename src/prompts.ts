@@ -305,7 +305,8 @@ PROTOCOL
   1. Completeness: every part of the objective and its "Done when" criteria is addressed${depReports ? " (including everything the upstream inputs handed over)" : ""}.
   2. Evidence: each substantive claim in the report is backed by something you verified yourself.
   3. Deliverables: claimed files/artifacts exist, are non-trivial (not stubs/placeholders), and match what the report says about them.
-  4. Correctness: commands/builds/tests the task implies actually succeed when you run them.
+  4. Wired, not dead: any UI control the task added (button, link, menu, form, toggle) must call real behavior — an empty/no-op handler, an alert() stand-in, or href="#" where action was expected is a FAIL.
+  5. Correctness: commands/builds/tests the task implies actually succeed when you run them.
 - Spot-check depth over exhaustive breadth; ~5-12 tool steps.
 - Then call verdict(pass, feedback, issues). On fail, ALSO fill issues — one entry per concrete problem with the evidence you gathered and the exact change needed; the worker's retry sees them verbatim. On pass, feedback is one line citing the evidence you checked.`;
 }
@@ -1018,7 +1019,8 @@ export function codeParityPrompt(
   items: AcceptanceItem[],
   taskTableStr: string,
   reports: string,
-  diff: string
+  diff: string,
+  stubSignals = ""
 ): string {
   const crit = items.length ? items.map((it) => `  [${it.id}] ${it.text}`).join("\n") : "  (none specified — judge against the mission)";
   return `You are a demanding product reviewer deciding whether a build TRULY delivers what was asked. Do NOT re-check that it compiles or that its tests pass — both are already true. Judge COMPLETENESS and PARITY against the full mission.
@@ -1037,14 +1039,15 @@ ${reports}
 
 THE DIFF (ground truth — what actually exists in the tree)
 ${diff}
-
+${stubSignals ? `\nDETERMINISTIC STUB SIGNALS — the build tool scanned the diff and flagged these lines as likely dead/unfinished code (empty click handlers, console-only or alert-only handlers, href="#", TODO/FIXME, "not implemented", placeholders). Treat each as a SUSPECT to verify against the diff: if it is genuinely a dead control or fake behavior, it is a FAIL and must become a fix task. Ignore any that are legitimately complete.\n${stubSignals}\n` : ""}
 Check, in priority order:
 1. Named capabilities — does EVERY feature/surface the mission names actually exist in the code (not stubbed, not a "TODO", not a placeholder)? If it asked for "skills, connectors, a model picker", each must be really implemented.
-2. Breadth & parity — for a "clone / 1:1 / looks like X / beautiful" ask, are the key screens, components, states (empty/loading/error/streaming) and interactions present, or is it a thin skeleton?
-3. Wired, not faked — is it functional end-to-end (real data flow / integration), or are hard-coded values and fake endpoints standing in for real behavior?
-4. Polish — obvious gaps a user would notice immediately on first use.
+2. Wired, not dead — EVERY interactive control must do real work. A button, menu item, link, form, toggle, or tab that renders but has no handler (or an empty/no-op handler, an alert(), or href="#") is a FAIL — the user clicks it and nothing happens. Cross-check the stub signals above.
+3. Breadth & parity — for a "clone / 1:1 / looks like X / beautiful" ask, are the key screens, components, states (empty/loading/error/streaming) and interactions present, or is it a thin skeleton?
+4. Faked vs real — is it functional end-to-end (real data flow / persistence / integration), or are hard-coded values and fake endpoints standing in for real behavior?
+5. Polish — obvious gaps a user would notice immediately on first use.
 
-Reply with EXACTLY "COMPLETE" if the build genuinely delivers the mission's full surface area. Otherwise reply with a short numbered list (max 8) of CONCRETE missing or under-built capabilities — each specific enough to become a build task (name the feature and what is absent). Only real gaps against the stated mission; do not invent nice-to-haves.`;
+Reply with EXACTLY "COMPLETE" if the build genuinely delivers the mission's full surface area AND every interactive control is wired. Otherwise reply with a short numbered list (max 8) of CONCRETE missing, under-built, or dead capabilities — each specific enough to become a build task (name the feature/control and what is absent or non-functional). Only real gaps against the stated mission; do not invent nice-to-haves.`;
 }
 
 export function synthCheckPrompt(mission: string, reports: string, finalReport: string, sources?: string): string {

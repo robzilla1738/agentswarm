@@ -15,6 +15,10 @@ export interface CreateRunInput {
   cwd: string;
   sandbox: boolean;
   options: RunOptions;
+  /** Set when this run is a turn of a code-chat session. */
+  sessionId?: string;
+  /** The prior turn's run id (for context inheritance). */
+  parentRunId?: string;
 }
 
 export function optionsFromConfig(cfg: SwarmConfig, overrides: Partial<RunOptions> = {}): RunOptions {
@@ -101,6 +105,8 @@ export function createRun(input: CreateRunInput): RunMeta {
     cwd,
     sandbox: input.sandbox,
     options: input.options,
+    ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+    ...(input.parentRunId ? { parentRunId: input.parentRunId } : {}),
   };
   ensureDir(dir);
   ensureDir(path.join(dir, "artifacts"));
@@ -199,6 +205,7 @@ export function listRuns(pricing: SwarmConfig["pricing"]): RunSummary[] {
       pure.mission = meta.mission;
       pure.model = meta.options.model;
       pure.createdAt = meta.createdAt;
+      if (meta.sessionId) pure.sessionId = meta.sessionId;
       if (stat) summaryCache.set(id, { size: stat.size, mtimeMs: stat.mtimeMs, summary: pure });
       // Terminal runs never change again — the frozen summary suffices.
       if (TERMINAL_STATUSES.includes(pure.status)) liveCache.delete(id);
