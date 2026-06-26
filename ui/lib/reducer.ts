@@ -58,11 +58,32 @@ export interface ClientState {
   lastT: number;
 }
 
+export interface ProductSpecView {
+  productName: string;
+  oneLiner: string;
+  features: { name: string; description: string; priority: "core" | "secondary" }[];
+  screens: { name: string; purpose: string; elements: string[] }[];
+  dataModel: { entity: string; fields: string[]; relations?: string }[];
+  recommendedStack: { frontend?: string; backend?: string; database?: string; auth?: string; styling?: string; testing?: string; other?: string[]; rationale: string };
+  uxDetails: string[];
+  nonGoals: string[];
+  sources: string[];
+  grounded: boolean;
+}
+
 export interface CodeState {
   criteria: { id: string; text: string; met: boolean }[];
+  /** The grounded product spec from the research phase (null when the build wasn't grounded). */
+  productSpec: ProductSpecView | null;
+  /** Scored best-of-N plan candidates (the winner is flagged). */
+  planCandidates: { perspective: string; score: number; validPartition: boolean; coverage: number; moduleCount: number; winner: boolean }[];
   buildPlan: { modules: { id: string; files: string[]; purpose: string; deps?: string[]; hard?: boolean }[]; waves: string[][] | null } | null;
   map: { fileCount: number; symbolCount: number; truncated: boolean } | null;
   specSeeded: boolean;
+  /** Conversational narration bubbles (plan / progress / result), derived from build events. */
+  narration: { kind: "plan" | "progress" | "result"; text: string; phase?: string; t: number }[];
+  /** The plan surfaced for operator approval (present while status is awaiting-approval). */
+  proposed: { stack: string | null; criteria: { id: string; text: string }[]; modules: { id: string; purpose: string }[]; waves: string[][] | null } | null;
   /** The build arc (recon → build → integrate → harden …) as the engine sets each phase. */
   phases: { name: string; goal?: string; exit?: string; t: number }[];
   gates: { green: boolean; skipped: boolean; clean: boolean; summary: string }[];
@@ -70,10 +91,14 @@ export interface CodeState {
   /** Completeness / parity critic verdicts: whether the green tree delivers the FULL mission. */
   completeness: { complete: boolean; gaps: string[]; round: number }[];
   ensembles: { taskId: string; n: number; winner: number; merged: boolean; scores: { i: number; score: number; green: boolean }[] }[];
+  /** Render/visual/functional parity pass outcomes (Phase 2). */
+  visual: { clean: boolean; findings: string[]; deadControls: string[]; round: number; skipped?: string; screenshots: string[] }[];
+  /** The design target ingested for a UI build (Phase 2), or null. */
+  designSpec: { source: string; screens: number; hasReference: boolean } | null;
 }
 
 function emptyCode(): CodeState {
-  return { criteria: [], buildPlan: null, map: null, specSeeded: false, phases: [], gates: [], reviews: [], completeness: [], ensembles: [] };
+  return { criteria: [], productSpec: null, planCandidates: [], buildPlan: null, map: null, specSeeded: false, narration: [], proposed: null, phases: [], gates: [], reviews: [], completeness: [], ensembles: [], visual: [], designSpec: null };
 }
 
 const PRICING: Record<string, { inMiss: number; inHit: number; out: number }> = {
@@ -461,6 +486,49 @@ export function applyEvent(s: ClientState, ev: SwarmEvent): ClientState {
     case "code.criteria": {
       const c = (s.code ??= emptyCode());
       if (Array.isArray(ev.items)) c.criteria = ev.items as CodeState["criteria"];
+      break;
+    }
+    case "code.research": {
+      const c = (s.code ??= emptyCode());
+      if (ev.spec) c.productSpec = ev.spec as ProductSpecView;
+      break;
+    }
+    case "code.design.candidates": {
+      const c = (s.code ??= emptyCode());
+      if (Array.isArray(ev.scores)) c.planCandidates = ev.scores as CodeState["planCandidates"];
+      break;
+    }
+    case "code.plan.proposed": {
+      const c = (s.code ??= emptyCode());
+      c.proposed = {
+        stack: (ev.stack as string | null) ?? null,
+        criteria: Array.isArray(ev.criteria) ? (ev.criteria as { id: string; text: string }[]).map((x) => ({ id: x.id, text: x.text })) : [],
+        modules: Array.isArray(ev.modules) ? (ev.modules as { id: string; purpose: string }[]).map((m) => ({ id: m.id, purpose: m.purpose })) : [],
+        waves: (ev.waves as string[][] | null) ?? null,
+      };
+      break;
+    }
+    case "code.narrate": {
+      const c = (s.code ??= emptyCode());
+      const kind = ev.kind === "plan" || ev.kind === "result" ? ev.kind : "progress";
+      c.narration.push({ kind, text: String(ev.text ?? ""), phase: ev.phase ? String(ev.phase) : undefined, t: Number(ev.t) || 0 });
+      break;
+    }
+    case "code.visual": {
+      const c = (s.code ??= emptyCode());
+      c.visual.push({
+        clean: Boolean(ev.clean),
+        findings: Array.isArray(ev.findings) ? (ev.findings as string[]) : [],
+        deadControls: Array.isArray(ev.deadControls) ? (ev.deadControls as string[]) : [],
+        round: Number(ev.round) || 0,
+        skipped: ev.skipped ? String(ev.skipped) : undefined,
+        screenshots: Array.isArray(ev.screenshots) ? (ev.screenshots as string[]) : [],
+      });
+      break;
+    }
+    case "code.design.spec": {
+      const c = (s.code ??= emptyCode());
+      c.designSpec = { source: String(ev.source ?? ""), screens: Number(ev.screens) || 0, hasReference: Boolean(ev.hasReference) };
       break;
     }
     case "code.design": {

@@ -119,6 +119,7 @@ export const STATUS_COLOR: Record<string, string> = {
   failed: "var(--ink-hi)",
   blocked: "var(--status-cool)",
   planning: "var(--ink-hi)",
+  "awaiting-approval": "var(--status-warm)",
   synthesizing: "var(--status-warm)",
   cancelled: "var(--color-ink-dim)",
 };

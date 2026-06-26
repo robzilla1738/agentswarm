@@ -140,6 +140,34 @@ export interface SwarmConfig {
   /** Code mode: persist confirmed commands / conventions / flaky tests per repo across runs and reuse them to bootstrap the next run. */
   codeRepoFacts: boolean;
   /**
+   * Code mode: before scoping a build, RESEARCH the real target (web search +
+   * crawl the named product/domain) and distill a grounded ProductSpec, then
+   * derive the acceptance checklist + BuildPlan from researched facts instead of
+   * the model's memory. The single biggest lever against "missing details / not
+   * close" on clone/parity asks. Self-contained utilities skip it via triage.
+   */
+  codeResearch: boolean;
+  /** Code mode: max web queries the research phase fans out (deep search each). */
+  codeResearchMaxQueries: number;
+  /** Code mode: max pages crawled per canonical reference URL during research. */
+  codeResearchMaxPages: number;
+  /** Code mode: max spec-critique refinement rounds (find what the spec is missing, re-distill). */
+  codeResearchCritiqueRounds: number;
+  /**
+   * Code mode: for web/UI builds, after the tree is green, render the built app in
+   * a headless browser, compare it to the design reference (visually when a vision
+   * model is configured, else structurally), and drive the primary controls to
+   * catch dead/broken ones. Degrades gracefully (skips when no browser / non-UI /
+   * remote sandbox). The fix for "UI not close" and dead buttons.
+   */
+  codeVisual: boolean;
+  /** Code mode: vision-capable model for visual comparison, as "provider:model" or a bare model on the active provider. Empty → structural+functional only. */
+  visionModel: string;
+  /** Code mode: wall-clock cap (ms) for one visual pass (server start + render + compare), so a stuck dev server can't hang the run. */
+  codeVisualTimeoutMs: number;
+  /** Code mode: max rounds the visual/functional parity pass will drive fixes (exhaustive scales up automatically). */
+  codeVisualMaxRounds: number;
+  /**
    * Where isolated runs execute. Default "host": the run's private workspace
    * directory on this machine — works out of the box, no Docker or cloud
    * account needed. "auto" opts into auto-detection: configured cloud
@@ -264,6 +292,14 @@ export const DEFAULTS: SwarmConfig = {
   codeEnsemble: true,
   codeEnsembleN: 3,
   codeRepoFacts: true,
+  codeResearch: true,
+  codeResearchMaxQueries: 6,
+  codeResearchMaxPages: 8,
+  codeResearchCritiqueRounds: 1,
+  codeVisual: true,
+  visionModel: "",
+  codeVisualTimeoutMs: 120_000,
+  codeVisualMaxRounds: 1,
   sandboxRuntime: "host",
   sandboxImage: "node:22-bookworm",
   e2bApiKey: "",
@@ -509,6 +545,14 @@ export const SETTABLE_KEYS: (keyof SwarmConfig)[] = [
   "codeEnsemble",
   "codeEnsembleN",
   "codeRepoFacts",
+  "codeResearch",
+  "codeResearchMaxQueries",
+  "codeResearchMaxPages",
+  "codeResearchCritiqueRounds",
+  "codeVisual",
+  "visionModel",
+  "codeVisualTimeoutMs",
+  "codeVisualMaxRounds",
   "maxToolResultChars",
   "sandboxRuntime",
   "sandboxImage",
@@ -543,6 +587,11 @@ const NUM_RANGES: Partial<Record<keyof SwarmConfig, [number, number]>> = {
   codeReviewMaxRounds: [0, 4],
   codeCompletenessMaxRounds: [0, 4],
   codeEnsembleN: [2, 6],
+  codeResearchMaxQueries: [0, 12],
+  codeResearchMaxPages: [0, 20],
+  codeResearchCritiqueRounds: [0, 3],
+  codeVisualTimeoutMs: [30_000, 600_000],
+  codeVisualMaxRounds: [0, 3],
   codeRepoMapMaxTokens: [1000, 40_000],
   hubPort: [0, 65535],
   uiPort: [0, 65535],
@@ -596,7 +645,9 @@ export function coerceConfigValue(key: keyof SwarmConfig, raw: unknown): unknown
     key === "codeRepoMap" ||
     key === "codeReview" ||
     key === "codeEnsemble" ||
-    key === "codeRepoFacts"
+    key === "codeRepoFacts" ||
+    key === "codeResearch" ||
+    key === "codeVisual"
   ) {
     if (typeof raw === "boolean") return raw;
     return raw === "true" || raw === "1" || raw === "on";
@@ -609,4 +660,35 @@ export function coerceConfigValue(key: keyof SwarmConfig, raw: unknown): unknown
   }
   // Secrets, URLs, model names: strip stray whitespace/newlines from pastes.
   return String(raw).trim();
+}
+
+/**
+ * Resolve the configured vision model into a usable {cfg, model}, or null when
+ * unset/unresolvable (the caller then degrades to structural + functional
+ * checking — never an error). `visionModel` is "provider:model" (use that
+ * provider's stored creds + base URL) or a bare model id (use the ACTIVE
+ * provider, only if it is vision-capable). A keyless local VLM must use the
+ * explicit "lmstudio:llava" / "ollama:llava" form.
+ */
+export function resolveVisionModel(cfg: SwarmConfig): { cfg: SwarmConfig; model: string } | null {
+  const raw = (cfg.visionModel || "").trim();
+  if (!raw) return null;
+  const colon = raw.indexOf(":");
+  if (colon < 0) {
+    // Bare model on the active provider — only if that provider can see.
+    const info = PROVIDERS[cfg.provider];
+    if (!info?.vision) return null;
+    if (info.keyRequired && !cfg.apiKey) return null;
+    return { cfg: { ...cfg, model: raw }, model: raw };
+  }
+  const provider = raw.slice(0, colon).trim();
+  const model = raw.slice(colon + 1).trim();
+  if (!isProviderId(provider) || !model) return null;
+  const info = PROVIDERS[provider];
+  const cred = cfg.providers[provider] || {};
+  const envKey = info.keyEnv ? process.env[info.keyEnv] : undefined;
+  const apiKey = cred.apiKey || envKey || "";
+  if (info.keyRequired && !apiKey) return null;
+  const baseUrl = cred.baseUrl || info.baseUrl;
+  return { cfg: { ...cfg, provider, apiKey, baseUrl, model }, model };
 }

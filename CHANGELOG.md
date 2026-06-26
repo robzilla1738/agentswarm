@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.26.0
+
+Code mode stops building **blind**. It now **researches the real target before it scopes**, **renders and clicks the app it built** to catch the UI being off and dead buttons, and **shows you the plan first** in a conversational chat. Full feature doc: [`docs/code-mode.md`](docs/code-mode.md).
+
+### Grounded research — scope from facts, not the model's memory
+
+- Before scoping, a build now **researches the real product**. A cheap triage decides whether the ask needs external grounding (clones / parity / named products / ambitious apps); if so the engine fans out **deep web search + crawl** of the actual product, distills a grounded **product spec** (real features, key screens + on-screen elements, data model, UX states, recommended stack) on the capable model, then runs a short **critique loop** ("what does a real X have that this spec is missing?"). Self-contained utilities ("a CLI that parses CSV") skip it via the triage — no tax. The spec is written to `SPEC.md`.
+- The acceptance checklist and the build plan are now **derived from that researched spec** instead of the model's parametric guess — the fix for "Notion clone: missing details, not the real surface area". For a greenfield build the stack is **decided once from research** and pinned into the scaffold + plan. Disable with `--no-research`.
+- The architect is now **best-of-N**: the build plan is proposed from several architectural lenses in parallel and the engine keeps the one that validates conflict-free with the best acceptance coverage (an objective selector, like the code ensemble) — surfaced as a "plan · best of N" chip.
+
+### Visual + functional parity — render it, then click it
+
+- For a web/UI build, after the tree is green the engine **starts the dev server, opens the app in a headless browser it owns, screenshots it, and judges it against the design target** — *visually* with a vision model when one is configured (`visionModel`, e.g. `anthropic:claude-sonnet-4-6` / `openai:gpt-5.1`), else *structurally* (rendered DOM + computed styles). Findings reopen the build loop with concrete fix tasks, then re-gate and re-review before shipping.
+- It also **drives the primary controls** — clicking every button / link / tab and watching for a real effect — so a control that renders but does nothing (or throws) is caught at **runtime**, the complement to the static stub scan. Dead and broken controls become fix tasks.
+- Fully graceful: skips honestly (and says why) when there's no browser, no dev server, a non-UI build, or a remote sandbox; `--no-visual` turns it off; `--design-ref <url|image>` pins a reference. The engine spawns its **own isolated headless Chrome** — it never touches your running browser.
+
+### Show the plan first — and a real chat
+
+- Code-chat turns now **pause to show you the grounded scope + plan** ("Here's the plan") and wait for **Approve & build** — or send a note to tweak the plan first, or Stop. On by default for sessions; `--plan` opts a one-shot CLI build into it.
+- The chat got the Claude-Code-web touches: streaming **plan / progress / result narration** alongside the build console, **Stop** + mid-build **steering notes** without ending the turn, and a **per-turn diff view + "Revert turn"** (each turn is a discrete commit on the session branch).
+
+### Compounding the small model
+
+- The strong tier now drives the research distill, the spec critique, the best-of-N plan, the design spec, and the visual critic — the cheap worker stays for mechanical work. Everything is additive and best-effort: `--no-research --no-visual` reproduces the previous pipeline exactly, and any failure (no network, no browser, no vision model) degrades to prior behavior rather than failing the run.
+
 ## 0.25.0
 
 Code mode grows up: it builds **exhaustively by default**, refuses to ship dead buttons, and gets a **chat UI** where every follow-up iterates on the same codebase. Full feature doc: [`docs/code-mode.md`](docs/code-mode.md).

@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as http from "http";
 import * as os from "os";
 import * as path from "path";
+import { spawnSync } from "child_process";
 import { URL } from "url";
 import {
   SwarmConfig,
@@ -13,6 +14,7 @@ import {
   saveConfig,
 } from "./config";
 import { appendControl } from "./control";
+import { GIT_IDENTITY_ARGS } from "./codeintel";
 import {
   appendTurn,
   createSession,
@@ -141,12 +143,30 @@ function launchTurn(sessionId: string, message: string, binPath: string): string
   if (!sess) throw new Error("session not found");
   const turns = readTurns(sessionId);
   const parentRunId = turns[turns.length - 1]?.turnId;
-  const options: RunOptions = { ...sess.options, mode: "code", codeGreenfield: isEmptyDir(sess.workspace) };
+  // Sessions "show the plan first" by default — every turn surfaces the grounded
+  // scope + plan for approval before workers run (the Claude-Code-web beat).
+  const options: RunOptions = {
+    ...sess.options,
+    mode: "code",
+    codeGreenfield: isEmptyDir(sess.workspace),
+    codePlanApproval: sess.options.codePlanApproval ?? true,
+  };
   const meta = createRun({ mission: message, cwd: sess.workspace, sandbox: false, options, sessionId, parentRunId });
   appendTurn(sessionId, { turnId: meta.id, message, parentRunId });
   touchSession(sessionId);
   launchDetached(meta.id, binPath);
   return meta.id;
+}
+
+/** A session turn's git range: the pre-work baseline (code.plan) and its final commit (code.commit). */
+function turnRange(turnId: string): { base?: string; head?: string } {
+  let base: string | undefined;
+  let head: string | undefined;
+  for (const e of readEvents(runDir(turnId))) {
+    if (e.type === "code.plan" && typeof e.baseline === "string") base = e.baseline;
+    if (e.type === "code.commit" && typeof e.sha === "string") head = e.sha;
+  }
+  return { base, head };
 }
 
 async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL, opts: HubOptions): Promise<void> {
@@ -469,6 +489,70 @@ async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL
       if (!target) return sendJson(res, 404, { error: "no turn yet" });
       return streamEvents(res, target, url.searchParams.get("quiet") === "1");
     }
+    // Steer / stop / approve the live turn. Resolve the live turn server-side
+    // (avoids a stale-live race in the UI) and delegate to the proven run-level
+    // control channel — the engine already handles note→queue, cancel→graceful
+    // abort, approve→release the plan-approval wait.
+    if ((sub === "/note" || sub === "/cancel" || sub === "/approve") && method === "POST") {
+      const live = sessionLiveTurn(id);
+      if (!live) return sendJson(res, 409, { error: "no live turn to control" });
+      if (sub === "/note") {
+        const body = await readBody(req);
+        if (!body.text) return sendJson(res, 400, { error: "text required" });
+        appendControl(runDir(live), { kind: "note", text: String(body.text) });
+        return sendJson(res, 200, { ok: true });
+      }
+      if (sub === "/approve") {
+        appendControl(runDir(live), { kind: "approve" });
+        return sendJson(res, 200, { ok: true });
+      }
+      // cancel
+      appendControl(runDir(live), { kind: "cancel" });
+      const pid = readPid(live);
+      if (pid) {
+        try {
+          process.kill(pid, "SIGINT");
+        } catch {
+          /* already gone — the control line covers it */
+        }
+      }
+      return sendJson(res, 200, { ok: true });
+    }
+    // Per-turn unified diff (read-only): what this turn changed on the session branch.
+    const diffM = sub.match(/^\/turns\/([^/]+)\/diff$/);
+    if (diffM && method === "GET") {
+      const turnId = diffM[1];
+      // Authorize: the turn must belong to THIS session before we diff in its workspace.
+      if (!readTurns(id).some((t) => t.turnId === turnId)) return sendJson(res, 404, { error: "turn not in this session" });
+      const { base, head } = turnRange(turnId);
+      // Require BOTH the pre-work baseline and this turn's own commit. Falling back
+      // to HEAD would misattribute every later turn's change to this one.
+      if (!base || !head) return sendJson(res, 404, { error: "no committed diff range for this turn" });
+      const r = spawnSync("git", ["-C", sess.workspace, "diff", base, head], { encoding: "utf8", maxBuffer: 20 * 1024 * 1024 });
+      if (r.status !== 0 && !r.stdout) return sendJson(res, 409, { error: (r.stderr || "git diff failed").slice(0, 300) });
+      res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+      res.end(r.stdout || "");
+      return;
+    }
+    // Per-turn revert: undo this turn's commits on the session branch (history-preserving).
+    const revM = sub.match(/^\/turns\/([^/]+)\/revert$/);
+    if (revM && method === "POST") {
+      const turnId = revM[1];
+      // Authorize: the turn must belong to THIS session before we mutate its workspace.
+      if (!readTurns(id).some((t) => t.turnId === turnId)) return sendJson(res, 404, { error: "turn not in this session" });
+      if (sessionLiveTurn(id)) return sendJson(res, 409, { error: "finish the live turn before reverting" });
+      const { base, head } = turnRange(turnId);
+      if (!base || !head) return sendJson(res, 409, { error: "this turn has no committed range to revert" });
+      // Commit the revert under the ENGINE's identity (as every other engine
+      // commit does) — never the operator's, and never fail on an identity-less host.
+      const r = spawnSync("git", ["-C", sess.workspace, ...GIT_IDENTITY_ARGS, "revert", "--no-edit", `${base}..${head}`], { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
+      if (r.status !== 0) {
+        // Leave the tree clean if the revert half-applied.
+        spawnSync("git", ["-C", sess.workspace, "revert", "--abort"], { encoding: "utf8" });
+        return sendJson(res, 409, { error: (r.stderr || "git revert failed").slice(0, 400) });
+      }
+      return sendJson(res, 200, { ok: true });
+    }
   }
 
   const m = p.match(/^\/api\/runs\/([^/]+)(\/.*)?$/);
@@ -523,6 +607,13 @@ async function api(req: http.IncomingMessage, res: http.ServerResponse, url: URL
           /* already gone — the control line covers it */
         }
       }
+      return sendJson(res, 200, { ok: true });
+    }
+
+    if (sub === "/approve" && method === "POST") {
+      // Release a `--plan` build waiting at awaiting-approval (run-level analog of
+      // the session approve; also what `swarm approve <id>` writes).
+      appendControl(runDir(id), { kind: "approve" });
       return sendJson(res, 200, { ok: true });
     }
 

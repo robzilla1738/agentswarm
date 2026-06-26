@@ -92,7 +92,7 @@ export function Logo({ small }: { small?: boolean }) {
 
 export function StatusDot({ status, size = 8, pulse }: { status: string; size?: number; pulse?: boolean }) {
   const color = statusColor(status);
-  const live = pulse ?? ["running", "planning", "synthesizing", "verifying"].includes(status);
+  const live = pulse ?? ["running", "planning", "synthesizing", "verifying", "awaiting-approval"].includes(status);
   return (
     <span className="relative inline-flex" style={{ width: size, height: size }}>
       {live && (

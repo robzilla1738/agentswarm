@@ -1,5 +1,5 @@
 import type { SandboxRuntime } from "./sandbox";
-import { BuildModule, BuildPlan, CodeCommands, RepoMap, RepoProfile } from "./types";
+import { BuildModule, BuildPlan, CodeCommands, ProductSpec, RepoMap, RepoProfile } from "./types";
 
 /**
  * Code mode's deterministic repo intelligence: detect how a working directory
@@ -208,6 +208,65 @@ export function detectCommands(m: RepoManifests): CodeCommands {
   return cmds;
 }
 
+/** Scripts that start a long-running web/dev server (the inverse of NON_TERMINATING — here we WANT the server). */
+const SERVER_SCRIPT = /\b(next\s+(?:dev|start)|vite(?:\s+preview)?|react-scripts\s+start|serve\b|http-server|nuxt\s+dev|astro\s+dev|remix\s+(?:vite:)?dev|ng\s+serve|webpack(?:\s+serve|-dev-server)|gatsby\s+develop)\b/i;
+
+/**
+ * Recover the dev/serve command (the one detectCommands deliberately DROPS as
+ * non-terminating) so the visual-parity pass can render the built app, with a
+ * DETERMINISTIC port injected per framework. Prefers a no-build dev server
+ * (dev → start → serve → preview). `needsBuild` is set for `preview` (Vite
+ * preview serves the production build, so the engine builds first). Null when
+ * the repo has no recognizable web server. Pure.
+ */
+export function detectServeCommand(m: RepoManifests, port: number): { cmd: string; port: number; needsBuild: boolean } | null {
+  const pkg = parsePackageJson(m.packageJson);
+  if (!pkg) return null;
+  const pm = detectPackageManager(m) ?? "npm";
+  let script: string | undefined;
+  let val = "";
+  for (const name of ["dev", "start", "serve", "preview"]) {
+    const v = pkg.scripts[name];
+    if (v && SERVER_SCRIPT.test(v)) {
+      script = name;
+      val = v;
+      break;
+    }
+  }
+  if (!script) return null;
+  const fw = detectFramework(m);
+  const run = `${pm} run ${script}`;
+  // Scripts that serve a PRODUCTION build (not a dev server) need `build` to run
+  // first: vite preview, `next start` (serves .next), and static `serve`/
+  // `http-server` (serve a built output dir). `react-scripts start` is a dev
+  // server, so it is NOT included.
+  const needsBuild = script === "preview" || /vite\s+preview|next\s+start|\bserve\b|http-server/.test(val);
+  // `npm run <script> -- <args>` forwards args to the underlying server.
+  if (/vite/.test(val) || fw === "Vue" || fw === "Svelte") return { cmd: `${run} -- --port ${port} --strictPort --host 127.0.0.1`, port, needsBuild };
+  if (fw === "Next.js" || /next\s+(?:dev|start)/.test(val)) return { cmd: `PORT=${port} ${run} -- -p ${port}`, port, needsBuild };
+  if (/react-scripts/.test(val)) return { cmd: `PORT=${port} BROWSER=none ${run}`, port, needsBuild };
+  if (/\bserve\b/.test(val)) return { cmd: `${run} -- -l ${port}`, port, needsBuild };
+  if (/http-server/.test(val)) return { cmd: `${run} -- -p ${port} -a 127.0.0.1`, port, needsBuild };
+  // Generic best effort: PORT env + a --port arg.
+  return { cmd: `PORT=${port} ${run} -- --port ${port}`, port, needsBuild };
+}
+
+/** True when this repo is a renderable web/UI app (a JS UI framework, or a detected serve script). */
+export function isWebApp(profile: RepoProfile): boolean {
+  return ["Next.js", "React", "Vue", "Svelte"].includes(profile.framework ?? "");
+}
+
+/**
+ * The detached-launch shell command for a serve command. CRITICAL: the serve
+ * command is run through `sh -c` so a `PORT=<p> …` env prefix (Next.js / CRA /
+ * generic) is parsed as an environment ASSIGNMENT. A naive `nohup PORT=<p> npm …`
+ * would make `nohup` treat `PORT=<p>` as its program operand (ENOENT) and the
+ * server would never bind. nohup + `</dev/null` daemonizes it past the exec call.
+ */
+export function serveDaemonCommand(serveCmd: string, logFile: string, pidFile: string): string {
+  return `nohup sh -c ${JSON.stringify(serveCmd)} > ${JSON.stringify(logFile)} 2>&1 < /dev/null & echo $! > ${JSON.stringify(pidFile)}`;
+}
+
 function detectLanguage(m: RepoManifests): string | null {
   if (m.packageJson) return /"typescript"/.test(m.packageJson) ? "TypeScript" : "JavaScript";
   if (m.cargo) return "Rust";
@@ -397,6 +456,66 @@ export function moduleFileOwner(plan: Pick<BuildPlan, "modules">): Map<string, s
     }
   }
   return owner;
+}
+
+/**
+ * Coerce arbitrary LLM JSON into a typed ProductSpec, dropping malformed fields.
+ * Returns null when the result has no real substance (no features AND no screens)
+ * so the caller treats research as "thin → skip" rather than shipping an empty
+ * spec. `sources` is the URL list the corpus was built from; `grounded` is only
+ * true when the model claimed it AND real sources backed it. Never throws.
+ */
+export function coerceProductSpec(raw: unknown, sources: string[]): ProductSpec | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  const str = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
+  const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+  const strList = (v: unknown): string[] => arr(v).map(str).filter(Boolean);
+  const features = arr(o.features)
+    .map((f) => {
+      const r = (f ?? {}) as Record<string, unknown>;
+      return { name: str(r.name), description: str(r.description), priority: r.priority === "secondary" ? ("secondary" as const) : ("core" as const) };
+    })
+    .filter((f) => f.name);
+  const screens = arr(o.screens)
+    .map((s) => {
+      const r = (s ?? {}) as Record<string, unknown>;
+      return { name: str(r.name), purpose: str(r.purpose), elements: strList(r.elements) };
+    })
+    .filter((s) => s.name);
+  const dataModel = arr(o.dataModel)
+    .map((d) => {
+      const r = (d ?? {}) as Record<string, unknown>;
+      const relations = str(r.relations);
+      return { entity: str(r.entity), fields: strList(r.fields), relations: relations || undefined };
+    })
+    .filter((d) => d.entity);
+  const st = (o.recommendedStack && typeof o.recommendedStack === "object" ? o.recommendedStack : {}) as Record<string, unknown>;
+  const recommendedStack = {
+    frontend: str(st.frontend) || undefined,
+    backend: str(st.backend) || undefined,
+    database: str(st.database) || undefined,
+    auth: str(st.auth) || undefined,
+    styling: str(st.styling) || undefined,
+    testing: str(st.testing) || undefined,
+    other: strList(st.other),
+    rationale: str(st.rationale),
+  };
+  const specSources = strList(o.sources).length ? strList(o.sources) : sources;
+  const spec: ProductSpec = {
+    productName: str(o.productName) || "the product",
+    oneLiner: str(o.oneLiner),
+    features,
+    screens,
+    dataModel,
+    recommendedStack,
+    uxDetails: strList(o.uxDetails),
+    nonGoals: strList(o.nonGoals),
+    sources: specSources,
+    grounded: o.grounded === true && sources.length > 0,
+  };
+  if (!spec.features.length && !spec.screens.length) return null;
+  return spec;
 }
 
 /** Coerce arbitrary LLM JSON into a typed BuildModule[], dropping malformed entries. Never throws. */
@@ -658,6 +777,8 @@ export function codeCacheCleanCommand(profile: RepoProfile): string | null {
 // ---------------------------------------------------------------- git
 
 const GIT_ID = `-c user.name=agentswarm -c user.email=swarm@agentswarm.local -c commit.gpgsign=false`;
+/** The same engine git identity as `GIT_ID`, but as argv tokens for `spawnSync("git", [...])` callers (e.g. the hub's per-turn revert). */
+export const GIT_IDENTITY_ARGS: string[] = ["-c", "user.name=agentswarm", "-c", "user.email=swarm@agentswarm.local", "-c", "commit.gpgsign=false"];
 
 function shArg(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;

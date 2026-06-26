@@ -1,5 +1,6 @@
 export type RunStatus =
   | "planning"
+  | "awaiting-approval"
   | "running"
   | "synthesizing"
   | "done"

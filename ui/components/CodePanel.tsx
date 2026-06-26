@@ -37,7 +37,28 @@ export function CodePanel({
           Build pipeline
         </h2>
         <div className="flex items-center gap-2 flex-wrap">
+          {code.productSpec && (
+            <span
+              className="chip"
+              title={`Scope was grounded by researching the real ${code.productSpec.productName}: ${code.productSpec.features.length} features, ${code.productSpec.screens.length} screens${code.productSpec.sources.length ? `, ${code.productSpec.sources.length} source(s)` : ""}.${code.productSpec.grounded ? "" : " (inferred — thin sources)"}`}
+            >
+              {code.productSpec.grounded ? "researched spec" : "inferred spec"}
+            </span>
+          )}
+          {code.planCandidates.length > 1 && (
+            <span
+              className="chip"
+              title={code.planCandidates.map((c) => `${c.winner ? "★ " : ""}${c.perspective}: score ${c.score}, ${c.moduleCount} modules, coverage ${Math.round(c.coverage * 100)}%`).join("\n")}
+            >
+              {`plan · best of ${code.planCandidates.length}`}
+            </span>
+          )}
           {code.specSeeded && <span className="chip" title="A failing spec test-suite was authored from the acceptance criteria before implementation (TDD).">TDD spec</span>}
+          {code.designSpec && (
+            <span className="chip" title={`A design target was set (${code.designSpec.source}${code.designSpec.screens ? `, ${code.designSpec.screens} screens` : ""}${code.designSpec.hasReference ? ", reference image" : ""}) and the built UI is rendered + compared against it.`}>
+              design target
+            </span>
+          )}
           {code.map && <span className="chip" title="A deterministic symbol-map of the repo was injected into every worker.">{`repo map · ${code.map.fileCount} files`}</span>}
           {lastGate && (
             <span className={`chip ${lastGate.green ? "chip-solid" : ""}`} title={lastGate.summary}>
@@ -148,7 +169,7 @@ function BuildPlanGraph({ code, tasks }: { code: CodeState; tasks: Task[] }) {
 
 /** Green-gate attempts + adversarial review + parity-critic findings, chronologically. */
 function VerificationTimeline({ code }: { code: CodeState }) {
-  if (!code.gates.length && !code.reviews.length && !code.completeness.length) return null;
+  if (!code.gates.length && !code.reviews.length && !code.completeness.length && !code.visual.length) return null;
   return (
     <div className="mb-4">
       <div className="text-xs uppercase tracking-wide mb-2" style={{ color: "var(--color-ink-faint)" }}>Verification</div>
@@ -173,6 +194,20 @@ function VerificationTimeline({ code }: { code: CodeState }) {
         {code.completeness.filter((c) => !c.complete).map((c, i) => (
           <FindingsBlock key={`c${i}`} label={`parity critic round ${c.round}`} items={c.gaps} />
         ))}
+        {code.visual.map((v, i) => {
+          if (v.skipped) return (
+            <div key={`v${i}`} className="tile px-2.5 py-2">
+              <span className="mono text-2xs" style={{ color: "var(--color-ink-faint)" }}>visual parity · skipped ({v.skipped})</span>
+            </div>
+          );
+          if (v.clean) return (
+            <div key={`v${i}`} className="tile px-2.5 py-2">
+              <span className="mono text-2xs" style={{ color: "var(--color-ink-faint)" }}>visual parity round {v.round}</span>{" "}
+              <span className="chip" title="The rendered UI matches the design target and every control is wired.">UI matches · controls wired</span>
+            </div>
+          );
+          return <FindingsBlock key={`v${i}`} label={`visual parity round ${v.round}`} items={[...v.findings, ...v.deadControls.map((d) => `⛒ ${d}`)]} />;
+        })}
       </div>
     </div>
   );

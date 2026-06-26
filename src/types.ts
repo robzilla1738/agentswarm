@@ -2,6 +2,7 @@
 
 export type RunStatus =
   | "planning"
+  | "awaiting-approval"
   | "running"
   | "synthesizing"
   | "done"
@@ -554,6 +555,67 @@ export interface RepoMap {
   truncated: boolean;
 }
 
+/** Code mode: one feature in a researched ProductSpec. "core" features MUST appear in the acceptance checklist. */
+export interface SpecFeature {
+  name: string;
+  description: string;
+  priority: "core" | "secondary";
+}
+
+/** Code mode: one key screen/flow of the target product, with the concrete on-screen elements a faithful clone needs. */
+export interface SpecScreen {
+  name: string;
+  purpose: string;
+  elements: string[];
+}
+
+/** Code mode: the deliberate, researched stack choice for a greenfield build — decided once, pinned into the plan + scaffold. */
+export interface RecommendedStack {
+  frontend?: string;
+  backend?: string;
+  database?: string;
+  auth?: string;
+  styling?: string;
+  testing?: string;
+  other?: string[];
+  /** One-paragraph rationale grounded in how this class of app is built today. */
+  rationale: string;
+}
+
+/**
+ * Code mode: the GROUNDED product spec — the real surface area of the thing being
+ * built, distilled from web research (the target product's features, screens, data
+ * model, UX) rather than the model's parametric memory. Produced by researchProductSpec()
+ * before scope/plan, journaled as `code.research`, and fed into the acceptance split and
+ * BuildPlan so neither hallucinates. `grounded:false` marks a spec inferred from thin/no
+ * sources (downstream prompts then know it is a best-effort guess, not researched truth).
+ */
+export interface ProductSpec {
+  productName: string;
+  oneLiner: string;
+  features: SpecFeature[];
+  screens: SpecScreen[];
+  dataModel: { entity: string; fields: string[]; relations?: string }[];
+  recommendedStack: RecommendedStack;
+  /** Concrete interaction / state details: empty/loading/error states, keyboard, theming, responsiveness. */
+  uxDetails: string[];
+  nonGoals: string[];
+  /** URLs the spec was grounded in (empty when inferred from model knowledge). */
+  sources: string[];
+  /** True when real sources backed the spec; false → inferred, treat as a guess. */
+  grounded: boolean;
+}
+
+/** Code mode: one scored candidate from the best-of-N BuildPlan ensemble (transparency for `code.design.candidates`). */
+export interface BuildPlanCandidate {
+  perspective: string;
+  score: number;
+  validPartition: boolean;
+  coverage: number;
+  moduleCount: number;
+  winner: boolean;
+}
+
 export interface RunOptions {
   model: string;
   conductorModel: string;
@@ -588,6 +650,16 @@ export interface RunOptions {
   codeEnsemble?: boolean;
   /** Code mode: per-run override of the cross-run repo-facts ledger. Undefined → cfg.codeRepoFacts. */
   codeRepoFacts?: boolean;
+  /** Code mode: per-run override of the grounded research/scoping phase (pull the real product's surface area via web search before scoping). Undefined → cfg.codeResearch. */
+  codeResearch?: boolean;
+  /** Code mode: per-run override of the max web queries the research phase fans out. Undefined → cfg.codeResearchMaxQueries. */
+  codeResearchMaxQueries?: number;
+  /** Code mode: pause after scoping to surface the grounded spec + plan for approval before any workers start. Default true for sessions (UI), opt-in (--plan) for one-shot CLI. */
+  codePlanApproval?: boolean;
+  /** Code mode: per-run override of the visual/functional parity pass (render the built UI, compare to the reference, smoke-click controls). Undefined → cfg.codeVisual. */
+  codeVisual?: boolean;
+  /** Code mode: operator-supplied design reference (URL of the real product or a local image path) for the visual parity pass. */
+  designRef?: string;
   /** Code mode: build depth / ambition. Undefined → detected from the mission ("exhaustive" on parity/clone/comprehensive asks, else "standard"). */
   codeDepth?: CodeDepth;
   /** Code mode: per-run override of completeness/parity critic rounds. Undefined → scales with codeDepth (exhaustive ≥2). */
@@ -874,15 +946,23 @@ export interface RunSummary {
  *  forecast.question   { question: ForecastQuestion }           — sharpened question (forecast mode)
  *  forecast.submitted  { taskId, agentId, forecast: Forecast }  — one panelist's forecast
  *  forecast.aggregated { aggregate: AggregateForecast, panel: {taskId,method,probability?,p50?}[], ledgerId? }
- *  code.plan       { profile: RepoProfile, commit: boolean, branch: string|null } — recon result (code mode)
+ *  code.plan       { profile: RepoProfile, commit: boolean, branch: string|null, baseline?: string } — recon result (code mode)
  *  code.checkpoint { sha, taskId }                — engine commit-on-green (code mode)
  *  code.gate       { green: boolean, summary }    — pre-synthesis green-gate result (code mode)
  *  code.criteria   { items: AcceptanceItem[] }    — acceptance criteria split into tracked items (code mode)
+ *  code.research   { skipped?, productName?, featureCount?, screenCount?, stack?, sources?, grounded? } — grounded product-spec research (code mode)
+ *  code.research.critique { round, gaps: string[] } — spec-critique refinement round (code mode)
  *  code.design     { plan: BuildPlan }            — engine-owned build plan / file partition (code mode)
+ *  code.design.candidates { winner: number, scores: BuildPlanCandidate[] } — best-of-N plan ensemble selection (code mode)
+ *  code.plan.proposed { spec?, criteria, modules, waves, stack? } — plan surfaced for operator approval (code mode)
+ *  code.narrate    { kind: "plan"|"progress"|"result", text, phase? } — conversational narration bubble (code mode)
+ *  code.commit     { sha, base }                  — a turn's final commit lineage (code mode sessions)
  *  code.map        { fileCount, symbolCount, truncated } — repo symbol-map built for workers (code mode)
  *  code.spec       { testFiles: string[], criteria: string[], initiallyRed: boolean } — TDD spec suite authored (code mode)
  *  code.review     { clean: boolean, issues: string[], round } — adversarial diff-review critic (code mode)
  *  code.ensemble   { taskId, n, winner, scores } — best-of-N solution ensemble outcome (code mode)
+ *  code.design.spec { hasReference, source: "spec"|"knowledge"|"image", screens, tokensPath } — design-reference ingestion (code mode)
+ *  code.visual     { clean?, findings?, deadControls?, round?, skipped?, screenshots? } — render/visual/functional parity pass (code mode)
  */
 export interface SwarmEvent {
   seq: number;

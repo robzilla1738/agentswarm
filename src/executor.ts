@@ -1,7 +1,8 @@
 import * as fs from "fs";
 import * as path from "path";
+import * as net from "net";
 import { AgentOutcome, estimateMessages, runAgent } from "./agent";
-import { SwarmConfig, contextLimitFor, runDir } from "./config";
+import { SwarmConfig, contextLimitFor, resolveVisionModel, runDir } from "./config";
 import { ControlReader } from "./control";
 import { ChatMsg, ChatResult, chat, gateFor, isFatalAuthError, validateAuth } from "./deepseek";
 import { JournalLike, TeamJournal } from "./journal";
@@ -33,6 +34,17 @@ import {
   codeSynthAddendum,
   completenessPrompt,
   planBuildSpecPrompt,
+  researchTriagePrompt,
+  productSpecPrompt,
+  specCritiquePrompt,
+  specRevisePrompt,
+  renderSpecMd,
+  renderSpecForPrompt,
+  stackLine,
+  PLAN_PERSPECTIVES,
+  designSpecBlock,
+  designKnowledgePrompt,
+  visualParityPrompt,
   conductorInitialUpdate,
   conductorSystem,
   conductorUpdate,
@@ -115,9 +127,12 @@ import { canonicalizeUrl } from "./searchcore";
 import { aggregateSources, renderFinalHtml, sourcesBlock } from "./report";
 import { SandboxRuntime, createSandbox } from "./sandbox";
 import { RunState } from "./state";
-import { buildRepoMap, codeCacheCleanCommand, coerceBuildModules, formatCheckResult, formatStubFindings, gitAddWorktree, gitCommitGreen, gitDiffSince, gitMergeWorktreeBranch, gitPrepare, gitRemoveWorktree, gitResetTo, parseCheckOutput, partitionWaves, reconRepo, scanStubs } from "./codeintel";
+import { buildRepoMap, codeCacheCleanCommand, coerceBuildModules, coerceProductSpec, detectServeCommand, formatCheckResult, formatStubFindings, gitAddWorktree, gitCommitGreen, gitDiffSince, gitMergeWorktreeBranch, gitPrepare, gitRemoveWorktree, gitResetTo, isWebApp, parseCheckOutput, partitionWaves, reconRepo, scanStubs, serveDaemonCommand } from "./codeintel";
+import { browserAvailable, HeadlessBrowser, DeadControl } from "./browser";
 import { appendRepoFacts, loadRepoFacts, manifestHash, mergeConfirmedCommands, repoKey } from "./codeledger";
-import { AcceptanceItem, AggregateForecast, BuildPlan, CodeCommands, CodeDepth, CodeGateResult, DomainId, FittedParams, Forecast, ForecastQuestion, MarketAnchor, RepoMap, RepoProfile, RunMeta, RunStatus, SimDriver, SourceRef, Task, TaskSpec, Usage, usageCost } from "./types";
+import { webSearch, fetchUrl, SearchHit } from "./webtools";
+import { crawlSite, resolveCrawlBackend } from "./crawltools";
+import { AcceptanceItem, AggregateForecast, BuildModule, BuildPlan, BuildPlanCandidate, CodeCommands, CodeDepth, CodeGateResult, DomainId, FittedParams, Forecast, ForecastQuestion, MarketAnchor, ProductSpec, RepoMap, RepoProfile, RunMeta, RunStatus, SimDriver, SourceRef, Task, TaskSpec, Usage, usageCost } from "./types";
 import { canonicalArtifactRel, clip, ensureDir, errMsg, normalizeWorkdirRel, oneLine, parseJsonLoose, rid, sleep, truncateMiddle, validateArtifactFormat, withTimeout } from "./util";
 
 
@@ -240,6 +255,19 @@ export class Executor {
   private gatePassDone = false;
   /** Code mode: acceptance criteria split into tracked items (set by planCode, restored on resume). */
   private acceptanceItems: AcceptanceItem[] = [];
+  /** Code mode: the grounded product spec from the research phase (set by planCode, restored on resume so research never re-runs). */
+  private productSpec?: ProductSpec;
+  /** Code mode: scored best-of-N plan candidates (transparency; restored on resume). */
+  private buildPlanCandidates?: BuildPlanCandidate[];
+  /** Code mode (visual): the design-target text the visual critic judges against (from the spec or model knowledge). */
+  private designText?: string;
+  /** Code mode (visual): absolute path of an operator-supplied reference design IMAGE (--design-ref <path>), if any. */
+  private designRefImage?: string;
+  /** Code mode (visual): an operator-supplied reference design URL (--design-ref <url>) screenshotted as the compare baseline. */
+  private designRefUrl?: string;
+  /** Code mode (visual): the live dev-server pid + port while a visual pass is running. */
+  private devServerPid?: number;
+  private devServerPort?: number;
   /** Code mode: the engine-owned build plan / file partition (set by planCode, restored on resume). */
   private buildPlan?: BuildPlan;
   /** Code mode: deterministic repo symbol-map injected into workers. */
@@ -250,6 +278,8 @@ export class Executor {
   private specTaskId?: string;
   /** Code mode: whether the engine pre-created the build-plan module tasks (so the conductor doesn't re-spawn them). */
   private buildPlanSeeded = false;
+  /** Code mode: set by an operator "approve" control message while awaiting plan approval (drainControl owns the read). */
+  private planApproved = false;
   /** Code mode: manifest hash from the PRISTINE recon profile — the stable ledger key; load + persist must use the same value so the ledger converges. */
   private codeManifestHash?: string;
   /** Code mode: diff-review critic bookkeeping. */
@@ -367,6 +397,33 @@ export class Executor {
     // Code mode: rehydrate tracked criteria + build plan so the resumed run
     // reasons over the same checklist/partition and never re-splits or re-plans.
     this.acceptanceItems = state.acceptanceItems ?? [];
+    this.productSpec = state.productSpec;
+    this.buildPlanCandidates = state.buildPlanCandidates;
+    // Resume: planDesignSpec() doesn't re-run (planCode is skipped once repoProfile
+    // is restored), so re-derive the UI design context here — otherwise a resumed
+    // UI build loses its design target and silently ignores --design-ref.
+    if (this.codeMode() && this.codeVisualEnabled()) {
+      // Prefer the persisted STYLE.md (covers BOTH the ProductSpec and the
+      // model-knowledge design paths); fall back to re-deriving from the spec.
+      try {
+        const style = fs.readFileSync(path.join(this.runDirPath, "artifacts", "STYLE.md"), "utf8").trim();
+        if (style) this.designText = style;
+      } catch {
+        /* no persisted design target */
+      }
+      if (!this.designText && this.productSpec) this.designText = designSpecBlock(this.productSpec);
+      const ref = (this.meta.options.designRef ?? "").trim();
+      if (ref) {
+        if (/^https?:\/\//i.test(ref)) this.designRefUrl = ref;
+        else {
+          try {
+            if (fs.existsSync(ref) && fs.statSync(ref).isFile()) this.designRefImage = path.resolve(ref);
+          } catch {
+            /* ignore a bad path */
+          }
+        }
+      }
+    }
     this.buildPlan = state.buildPlan;
     // The diff-review baseline (set in planCode, which doesn't re-run on resume).
     this.codeBaselineSha = state.codeBaselineSha;
@@ -518,6 +575,14 @@ export class Executor {
     } else if (this.codeMode() && !this.repoProfile) {
       await this.planCode();
     }
+    // "Show the plan first": for code runs with approval on (sessions by default,
+    // --plan for CLI), surface the grounded scope + plan and block until the
+    // operator approves / tweaks / cancels. Any tweak notes fold into the first
+    // conductor turn. No-op (returns []) when approval is off or on resume.
+    const approvalNotes = await this.awaitPlanApproval();
+    const planTweaks = approvalNotes.length
+      ? `\n\nOPERATOR ADJUSTMENTS TO THE PLAN (apply these before spawning — they refine the pinned plan):\n${approvalNotes.map((n) => `• ${n}`).join("\n")}`
+      : "";
     const forecastDoctrine =
       this.forecastMode() && this.questions.length
         ? `\n\n${forecastConductorAddendum(this.questions, this.panelSize(), this.safeCalibrationBlock(), Boolean(this.meta.options.forecastOrigin), this.forecastBrief)}`
@@ -526,7 +591,8 @@ export class Executor {
     // (appended AFTER conductorSystem, so it wins by recency).
     const codeDoctrine =
       this.codeMode() && this.repoProfile
-        ? `\n\n${codeConductorAddendum(this.repoProfile, this.meta.options.acceptanceCriteria, this.acceptanceItems, this.buildPlan, this.codeTddEnabled(), this.buildPlanSeeded)}`
+        ? `\n\n${codeConductorAddendum(this.repoProfile, this.meta.options.acceptanceCriteria, this.acceptanceItems, this.buildPlan, this.codeTddEnabled(), this.buildPlanSeeded)}` +
+          (this.designText ? `\n${this.designText}` : "")
         : "";
 
     // Real-directory runs remember: prior missions in the same workspace feed
@@ -558,7 +624,7 @@ export class Executor {
                 "tasks that were in flight were reset to pending and will re-run automatically. " +
                 "Spawn tasks only if the plan has a gap — otherwise wait.",
             })
-          : conductorInitialUpdate(this.meta, this.nextId()),
+          : conductorInitialUpdate(this.meta, this.nextId()) + planTweaks,
       },
     ];
     if (this.resumed) {
@@ -604,6 +670,19 @@ export class Executor {
       // capabilities reopen the build; each addition is re-gated AND re-reviewed
       // before shipping. Bounded by codeCompletenessRounds().
       while (await this.codeCompletenessPass()) {
+        await this.mainLoop();
+        while (await this.greenGate()) await this.mainLoop();
+        while (await this.codeReviewPass()) {
+          await this.mainLoop();
+          while (await this.greenGate()) await this.mainLoop();
+        }
+      }
+      // Code mode (web/UI): render the built app, compare it to the design target
+      // (visually with a vision model, else structurally), and drive the primary
+      // controls — the net for "the UI isn't close" and "this button does nothing"
+      // that the static critics can't see. Each fix is re-gated AND re-reviewed
+      // before shipping. Skips honestly when no browser / non-UI / remote sandbox.
+      while (await this.codeVisualPass()) {
         await this.mainLoop();
         while (await this.greenGate()) await this.mainLoop();
         while (await this.codeReviewPass()) {
@@ -731,6 +810,22 @@ export class Executor {
   }
   private codeRepoFactsEnabled(): boolean {
     return this.meta.options.codeRepoFacts ?? this.cfg.codeRepoFacts;
+  }
+  private codeResearchEnabled(): boolean {
+    return this.meta.options.codeResearch ?? this.cfg.codeResearch;
+  }
+  private codeResearchMaxQueries(): number {
+    return Math.max(0, this.meta.options.codeResearchMaxQueries ?? this.cfg.codeResearchMaxQueries ?? 6);
+  }
+  private codeVisualEnabled(): boolean {
+    return this.meta.options.codeVisual ?? this.cfg.codeVisual;
+  }
+  /** Visual-parity round budget — scales with ambition like the completeness critic (exhaustive ≥2, prototype 0). */
+  private codeVisualRounds(): number {
+    const a = this.codeAmbition();
+    if (a === "prototype") return 0;
+    const base = Math.max(0, this.cfg.codeVisualMaxRounds ?? 1);
+    return a === "exhaustive" ? Math.max(2, base) : Math.max(1, base);
   }
 
   /**
@@ -862,6 +957,14 @@ export class Executor {
         : `code mode: ${p.primaryLanguage ?? "unknown stack"}${p.framework ? ` (${p.framework})` : ""} · build=${p.commands.build ?? "?"} · test=${p.commands.test ?? "?"}`,
     });
 
+    // GROUNDED RESEARCH: before scoping, research the real target (web search +
+    // crawl the named product/domain) and distill a ProductSpec, so the acceptance
+    // split and the BuildPlan are derived from researched FACTS, not the model's
+    // memory. This is the fix for "missing details / not close" on clone/parity
+    // asks. Self-contained utilities skip it via triage. Best-effort: any failure
+    // leaves productSpec undefined and the pipeline behaves exactly as before.
+    await this.researchProductSpec();
+
     // Acceptance criteria → first-class tracked state, so the spec-test author,
     // the diff-review critic, and the synthesizer reason over one checklist and
     // "done" is never claimed for an unverified item.
@@ -875,6 +978,14 @@ export class Executor {
     // Deterministic repo symbol-map for workers (brownfield: edit with the
     // existing structure; greenfield has nothing to map yet — built post-scaffold).
     if (this.codeRepoMapEnabled() && !this.repoProfile.greenfield) await this.refreshRepoMap();
+
+    // For UI builds, establish the DESIGN TARGET (researched spec or model
+    // knowledge) so workers build to a concrete visual spec and the visual-parity
+    // pass has something to judge against. Best-effort; no-op for non-UI builds.
+    await this.planDesignSpec();
+
+    // Conversational "here's my plan & scope" bubble for the code-chat UI.
+    this.narratePlan();
   }
 
   /** Repo identity for the cross-run facts ledger: git remote URL when present, else the absolute path. */
@@ -953,44 +1064,346 @@ export class Executor {
   }
 
   /**
-   * Produce + deterministically validate the BuildPlan (one LLM call). The
-   * partition (no two modules own the same file, no dependency cycle) is checked
-   * by partitionWaves(); an invalid or unparseable plan degrades to `waves:null`
-   * and the conductor falls back to the free-form doctrine — never fails the run.
+   * GROUNDED RESEARCH: before scoping, research the real target and distill a
+   * ProductSpec so the acceptance split + BuildPlan derive from facts, not the
+   * model's memory. Engine-owned (cheap triage → deep web search/crawl → strong
+   * distill → cheap critique loop), bounded, and strictly best-effort: any
+   * failure leaves productSpec undefined and the pipeline behaves as before.
    */
-  private async planBuildSpec(): Promise<void> {
-    if (this.buildPlan) return; // restored on resume
-    let modules = [] as ReturnType<typeof coerceBuildModules>;
-    let scaffoldFirst = this.repoProfile?.greenfield ?? false;
-    let integrationPerWave = true;
-    const ambition = this.codeAmbition();
-    // Decomposition width + tier scale with ambition: a cheap conductor holding a
-    // 20-module partition is the weak link, so the capable model owns the plan
-    // for ambitious builds and is allowed many more modules.
-    const maxModules = ambition === "exhaustive" ? 24 : ambition === "prototype" ? 6 : 8;
-    const tier = ambition === "prototype" ? "cheap" : "strong";
+  private async researchProductSpec(): Promise<void> {
+    if (this.productSpec) return; // restored on resume
+    if (!this.codeMode() || !this.codeResearchEnabled()) return;
+    if (this.codeAmbition() === "prototype") return; // a quick cut skips grounding
+    if (this.budgetExceeded()) return;
+    const profile = this.repoProfile;
+    if (!profile) return;
+    const warn = (m: string) => this.journal.append("log", { level: "warn", msg: `research: ${m}` });
+    try {
+      // 1) Triage — does this need external grounding, and what to search?
+      const tri = await chat(this.cfg, {
+        model: this.resolveModel("cheap"),
+        messages: [{ role: "user", content: researchTriagePrompt(this.meta.mission, profile) }],
+        thinking: false,
+        maxTokens: 700,
+        signal: this.ac.signal,
+      });
+      this.onUsage(this.resolveModel("cheap"), tri.usage);
+      const t = parseJsonLoose<{ needsResearch?: unknown; queries?: unknown; canonicalUrls?: unknown }>(tri.content || "{}") ?? {};
+      if (!(t.needsResearch === true || t.needsResearch === "true")) {
+        this.journal.append("code.research", { skipped: true });
+        return;
+      }
+      const queries = (Array.isArray(t.queries) ? t.queries : []).map((q) => String(q).trim()).filter(Boolean).slice(0, this.codeResearchMaxQueries());
+      const urls = (Array.isArray(t.canonicalUrls) ? t.canonicalUrls : []).map((u) => String(u).trim()).filter((u) => /^https?:\/\//.test(u)).slice(0, 3);
+      if (!queries.length && !urls.length) {
+        this.journal.append("code.research", { skipped: true });
+        return;
+      }
+      this.journal.append("log", {
+        level: "info",
+        msg: `code mode: researching ${queries.length} quer${queries.length === 1 ? "y" : "ies"}${urls.length ? ` + ${urls.length} reference URL(s)` : ""} to ground scope`,
+      });
+
+      // 2) Gather — deep web search + crawl/fetch references, concurrent + best-effort.
+      const searchP = Promise.allSettled(queries.map((q) => webSearch(this.cfg, q, 8, this.ac.signal, true, warn, false, "year")));
+      const crawlBackend = resolveCrawlBackend(this.cfg);
+      const refP = Promise.allSettled(
+        urls.map((u) =>
+          crawlBackend
+            ? crawlSite(this.cfg, { url: u, maxPages: this.cfg.codeResearchMaxPages, signal: this.ac.signal }).then((o) => o.pages.map((p) => `# ${p.title}\n${p.markdown}`).join("\n\n"))
+            : fetchUrl(this.cfg, u, false, 8000, this.ac.signal, warn)
+        )
+      );
+      const [searchSettled, refSettled] = await Promise.all([searchP, refP]);
+      const sources: string[] = [];
+      const parts: string[] = [];
+      for (const s of searchSettled) {
+        if (s.status !== "fulfilled") continue;
+        for (const hit of s.value as SearchHit[]) {
+          const text = hit.passages && hit.passages.length ? hit.passages.join(" … ") : hit.snippet || "";
+          if (text) {
+            sources.push(hit.url);
+            parts.push(`SOURCE ${hit.url} — ${hit.title}\n${text}`);
+          }
+        }
+      }
+      urls.forEach((u, i) => {
+        const r = refSettled[i];
+        if (r && r.status === "fulfilled" && r.value) {
+          sources.push(u);
+          parts.push(`REFERENCE ${u}\n${r.value}`);
+        }
+      });
+      const uniqueSources = [...new Set(sources)];
+      const corpus = truncateMiddle(parts.join("\n\n---\n\n"), 60_000, "chars");
+      const grounded = corpus.trim().length > 200;
+
+      // 3) Distill — strong tier produces the ProductSpec.
+      let spec = await this.distillProductSpec(profile, corpus, uniqueSources);
+      if (!spec) {
+        this.journal.append("code.research", { skipped: true, reason: grounded ? "distill-failed" : "thin-corpus" });
+        return;
+      }
+      if (!grounded) spec.grounded = false;
+
+      // 4) Critique loop — what is the spec missing? Re-distill to close gaps.
+      const rounds = Math.max(0, this.cfg.codeResearchCritiqueRounds ?? 1);
+      for (let r = 0; r < rounds && !this.budgetExceeded(); r++) {
+        const gaps = await this.critiqueSpec(spec);
+        if (!gaps.length) break;
+        this.journal.append("code.research.critique", { round: r + 1, gaps });
+        const revised = await this.reviseSpec(corpus, spec, gaps);
+        if (!revised) break;
+        if (!grounded) revised.grounded = false;
+        spec = revised;
+      }
+
+      this.productSpec = spec;
+      try {
+        fs.writeFileSync(path.join(this.runDirPath, "artifacts", "SPEC.md"), renderSpecMd(spec), "utf8");
+      } catch {
+        /* artifact is best-effort */
+      }
+      this.journal.append("code.research", {
+        spec,
+        productName: spec.productName,
+        featureCount: spec.features.length,
+        screenCount: spec.screens.length,
+        stack: stackLine(spec.recommendedStack),
+        sources: uniqueSources.slice(0, 12),
+        grounded: spec.grounded,
+      });
+      this.journal.append("log", {
+        level: "info",
+        msg: `code mode: grounded spec — ${spec.productName}, ${spec.features.length} features / ${spec.screens.length} screens${spec.grounded ? "" : " (inferred — thin sources)"}`,
+      });
+    } catch (e) {
+      this.journal.append("log", { level: "warn", msg: `code mode: research phase failed (${errMsg(e)}) — scoping ungrounded` });
+    }
+  }
+
+  /** One strong-tier distill of the research corpus into a ProductSpec, or null on failure. */
+  private async distillProductSpec(profile: RepoProfile, corpus: string, sources: string[]): Promise<ProductSpec | null> {
+    try {
+      const res = await chat(this.cfg, {
+        model: this.resolveModel("strong"),
+        messages: [{ role: "user", content: productSpecPrompt(this.meta.mission, profile, corpus, sources) }],
+        thinking: true,
+        maxTokens: 6144,
+        signal: this.ac.signal,
+      });
+      this.onUsage(this.resolveModel("strong"), res.usage);
+      return coerceProductSpec(parseJsonLoose(res.content || "{}"), sources);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Cheap-tier adversarial critique: concrete capabilities/screens/states the spec is missing. */
+  private async critiqueSpec(spec: ProductSpec): Promise<string[]> {
+    try {
+      const res = await chat(this.cfg, {
+        model: this.resolveModel("cheap"),
+        messages: [{ role: "user", content: specCritiquePrompt(this.meta.mission, spec) }],
+        thinking: false,
+        maxTokens: 800,
+        signal: this.ac.signal,
+      });
+      this.onUsage(this.resolveModel("cheap"), res.usage);
+      const p = parseJsonLoose<{ complete?: unknown; gaps?: unknown }>(res.content || "{}") ?? {};
+      if (p.complete === true) return [];
+      return (Array.isArray(p.gaps) ? p.gaps : []).map((g) => String(g).trim()).filter(Boolean).slice(0, 8);
+    } catch {
+      return [];
+    }
+  }
+
+  /** Strong-tier re-distill that folds reviewer gaps back into the spec, or null on failure. */
+  private async reviseSpec(corpus: string, spec: ProductSpec, gaps: string[]): Promise<ProductSpec | null> {
+    try {
+      const res = await chat(this.cfg, {
+        model: this.resolveModel("strong"),
+        messages: [{ role: "user", content: specRevisePrompt(this.meta.mission, corpus, spec, gaps) }],
+        thinking: true,
+        maxTokens: 6144,
+        signal: this.ac.signal,
+      });
+      this.onUsage(this.resolveModel("strong"), res.usage);
+      return coerceProductSpec(parseJsonLoose(res.content || "{}"), spec.sources);
+    } catch {
+      return null;
+    }
+  }
+
+  /** The decomposition-width ceiling for a given ambition (max modules the plan may use). */
+  private maxModulesFor(ambition: CodeDepth): number {
+    return ambition === "exhaustive" ? 24 : ambition === "prototype" ? 6 : 8;
+  }
+
+  /**
+   * Plan-approval beat ("always show the plan first"): surface the grounded
+   * scope + build plan and BLOCK until the operator approves, sends a tweak note,
+   * or cancels — bounded by a timeout so a walked-away user never hangs the
+   * one-live-turn slot. Default-on for sessions; opt-in (--plan) for one-shot CLI.
+   * Notes that arrive during the wait are queued (drainControl) and returned so
+   * the caller folds them into the conductor's very first turn. Returns the
+   * captured tweak notes (empty unless the operator steered the plan).
+   */
+  private static readonly APPROVAL_TIMEOUT_MS = 10 * 60 * 1000;
+  private async awaitPlanApproval(): Promise<string[]> {
+    if (this.mode !== "root" || this.resumed) return [];
+    if (!this.codeMode()) return [];
+    if (!(this.meta.options.codePlanApproval ?? false)) return [];
+    if (this.fatal || this.ac.signal.aborted) return [];
+    this.journal.append("code.plan.proposed", {
+      spec: this.productSpec ?? null,
+      criteria: this.acceptanceItems,
+      modules: this.buildPlan?.modules ?? [],
+      waves: this.buildPlan?.waves ?? null,
+      stack: this.productSpec ? stackLine(this.productSpec.recommendedStack) : null,
+    });
+    this.setStatus("awaiting-approval");
+    this.journal.append("log", { level: "info", msg: "code mode: awaiting plan approval — Approve & build, send a note to tweak the plan, or Stop." });
+    const deadline = Date.now() + Executor.APPROVAL_TIMEOUT_MS;
+    // drainControl (fired by the control timer) records approve→flag, note→queue,
+    // cancel→abort. We only watch those effects so the single ControlReader is
+    // never double-polled.
+    while (Date.now() < deadline && !this.planApproved && !this.ac.signal.aborted) {
+      await sleep(300);
+    }
+    if (this.ac.signal.aborted) return [];
+    if (!this.planApproved) {
+      this.journal.append("log", { level: "info", msg: "code mode: plan approval timed out — proceeding autonomously." });
+    }
+    // Fold any tweak notes the operator sent during approval into the first
+    // conductor turn (consumed here so they aren't re-applied later).
+    return this.consumeOperatorNotes();
+  }
+
+  /**
+   * One BuildPlan proposal (a single LLM call) from an optional architectural
+   * lens. Returns the raw module set (pre-validation) or null on failure. The
+   * caller scores + selects; this never throws.
+   */
+  private async proposeBuildPlan(
+    opts: { ambition: CodeDepth; maxModules: number; tier: "cheap" | "strong"; greenfield: boolean },
+    perspective?: string
+  ): Promise<{ modules: BuildModule[]; scaffoldFirst: boolean; integrationPerWave: boolean } | null> {
+    const { ambition, maxModules, tier, greenfield } = opts;
     try {
       const res = await chat(this.cfg, {
         model: this.resolveModel(tier),
-        messages: [{ role: "user", content: planBuildSpecPrompt(this.meta.mission, this.repoProfile!, this.acceptanceItems, { ambition, maxModules }) }],
+        messages: [
+          {
+            role: "user",
+            content: planBuildSpecPrompt(this.meta.mission, this.repoProfile!, this.acceptanceItems, {
+              ambition,
+              maxModules,
+              spec: this.productSpec,
+              perspective,
+            }),
+          },
+        ],
         thinking: ambition === "exhaustive",
         maxTokens: ambition === "exhaustive" ? 6144 : 2048,
         signal: this.ac.signal,
       });
       this.onUsage(this.resolveModel(tier), res.usage);
       const parsed = parseJsonLoose<{ modules?: unknown; scaffoldFirst?: unknown; integrationPerWave?: unknown }>(res.content || "{}");
+      let modules: BuildModule[] = [];
+      let scaffoldFirst = greenfield;
+      let integrationPerWave = true;
       if (parsed && typeof parsed === "object") {
         modules = coerceBuildModules(parsed.modules);
         if (typeof parsed.scaffoldFirst === "boolean") scaffoldFirst = parsed.scaffoldFirst;
         if (typeof parsed.integrationPerWave === "boolean") integrationPerWave = parsed.integrationPerWave;
       }
+      return { modules, scaffoldFirst, integrationPerWave };
     } catch {
-      /* degrade below */
+      return null;
     }
+  }
+
+  /** Fraction of acceptance items whose distinctive words appear in some module (purpose/files/id/interface). */
+  private planCoverage(modules: BuildModule[]): number {
+    if (!this.acceptanceItems.length) return 1;
+    const STOP = new Set(["the", "and", "with", "that", "this", "from", "into", "when", "must", "done", "user", "should", "able", "page", "view", "show", "have", "each", "also", "support", "allow", "every", "across", "their", "which", "where", "while"]);
+    const blobs = modules.map((m) => `${m.id} ${m.purpose} ${m.files.join(" ")} ${m.interface ?? ""}`.toLowerCase());
+    let covered = 0;
+    for (const it of this.acceptanceItems) {
+      const words = (it.text.toLowerCase().match(/[a-z][a-z0-9]{3,}/g) ?? []).filter((w) => !STOP.has(w));
+      if (!words.length) {
+        covered++;
+        continue;
+      }
+      if (blobs.some((b) => words.some((w) => b.includes(w)))) covered++;
+    }
+    return covered / this.acceptanceItems.length;
+  }
+
+  /** Objective score for one proposal: a valid conflict-free partition dominates, then acceptance coverage, then a sane module count. */
+  private scoreBuildPlan(modules: BuildModule[], ambition: CodeDepth): { waves: string[][] | null; score: number; coverage: number; validPartition: boolean } {
     const waves = partitionWaves({ modules });
-    this.buildPlan = { modules, scaffoldFirst, integrationPerWave, waves };
+    const validPartition = Boolean(waves && waves.length);
+    const coverage = this.planCoverage(modules);
+    const max = this.maxModulesFor(ambition);
+    const [lo, hi] = ambition === "exhaustive" ? [6, max] : ambition === "prototype" ? [1, 6] : [2, max];
+    const inBand = modules.length >= lo && modules.length <= hi;
+    const score =
+      (validPartition ? 1000 : 0) +
+      Math.round(coverage * 300) +
+      (inBand ? 50 : 0) -
+      (modules.length === 0 ? 1000 : 0);
+    return { waves, score, coverage, validPartition };
+  }
+
+  /**
+   * Produce + deterministically validate the BuildPlan via a best-of-N ensemble:
+   * propose a module/file partition from several architectural lenses in parallel
+   * (scaled by ambition) and keep the one that validates conflict-free with the
+   * best acceptance coverage. The partition (no two modules own the same file, no
+   * dependency cycle) is checked by partitionWaves(); if no proposal validates the
+   * winner still pins `waves:null` and the conductor falls back to the free-form
+   * doctrine — never fails the run. Grounded in the researched ProductSpec when present.
+   */
+  private async planBuildSpec(): Promise<void> {
+    if (this.buildPlan) return; // restored on resume
+    const ambition = this.codeAmbition();
+    const greenfield = this.repoProfile?.greenfield ?? false;
+    const maxModules = this.maxModulesFor(ambition);
+    const tier = ambition === "prototype" ? "cheap" : "strong";
+    // N proposals from distinct lenses (exhaustive 3, standard 2, prototype 1 =
+    // today's single call). Planning is pure text, so no worktrees — run in parallel.
+    const n = ambition === "exhaustive" ? Math.min(3, PLAN_PERSPECTIVES.length) : ambition === "prototype" ? 1 : 2;
+    const perspectives: (string | undefined)[] = n === 1 ? [undefined] : PLAN_PERSPECTIVES.slice(0, n);
+    const proposals = await Promise.all(perspectives.map((p) => this.proposeBuildPlan({ ambition, maxModules, tier, greenfield }, p)));
+    const scored = proposals
+      .map((prop, i) => (prop ? { ...prop, ...this.scoreBuildPlan(prop.modules, ambition), perspective: perspectives[i] ?? "default" } : null))
+      .filter((x): x is NonNullable<typeof x> => x !== null);
+
+    if (!scored.length) {
+      // Total failure (every proposal threw/empty): degrade to free-form doctrine.
+      this.buildPlan = { modules: [], scaffoldFirst: greenfield, integrationPerWave: true, waves: null };
+      this.journal.append("code.design", { plan: this.buildPlan });
+      this.journal.append("log", { level: "warn", msg: "code mode: build plan unavailable — falling back to free-form build doctrine" });
+      return;
+    }
+
+    const best = scored.reduce((a, b) => (b.score > a.score ? b : a));
+    this.buildPlan = { modules: best.modules, scaffoldFirst: best.scaffoldFirst, integrationPerWave: best.integrationPerWave, waves: best.waves };
+    this.buildPlanCandidates = scored.map((s) => ({
+      perspective: String(s.perspective),
+      score: s.score,
+      validPartition: s.validPartition,
+      coverage: Math.round(s.coverage * 100) / 100,
+      moduleCount: s.modules.length,
+      winner: s === best,
+    }));
     this.journal.append("code.design", { plan: this.buildPlan });
-    if (waves && waves.length) {
+    if (scored.length > 1) {
+      this.journal.append("code.design.candidates", { winner: this.buildPlanCandidates.findIndex((c) => c.winner), scores: this.buildPlanCandidates });
+    }
+    if (best.waves && best.waves.length) {
       try {
         fs.writeFileSync(path.join(this.runDirPath, "artifacts", "DESIGN.md"), this.renderDesignMd(this.buildPlan), "utf8");
       } catch {
@@ -998,7 +1411,7 @@ export class Executor {
       }
       this.journal.append("log", {
         level: "info",
-        msg: `code mode: pinned build plan — ${modules.length} modules in ${waves.length} conflict-free wave(s)`,
+        msg: `code mode: pinned build plan — ${best.modules.length} modules in ${best.waves.length} conflict-free wave(s)${scored.length > 1 ? ` (best of ${scored.length}, ${best.perspective})` : ""}`,
       });
     } else {
       this.journal.append("log", {
@@ -1102,7 +1515,9 @@ export class Executor {
         title: "Recon + scaffold the project",
         objective:
           (greenfield
-            ? `Scaffold this greenfield build: choose and lay down the stack, install dependencies, and establish the build + test commands as the foundation every module builds on.\n\n`
+            ? (this.productSpec
+                ? `Scaffold this greenfield build using the RESEARCHED stack (already decided — do NOT re-litigate it): ${stackLine(this.productSpec.recommendedStack)}. Lay it down, install dependencies, and establish the build + test commands as the foundation every module builds on.\n\n`
+                : `Scaffold this greenfield build: choose and lay down the stack, install dependencies, and establish the build + test commands as the foundation every module builds on.\n\n`)
             : `Recon the repo and prepare the build: confirm it builds with the detected commands (install deps if missing) before any module work fans out.\n\n`) +
           (cmds.build || cmds.test ? `Detected commands — build: ${cmds.build ?? "(establish one)"} · test: ${cmds.test ?? "(establish one)"}.\n\n` : ``) +
           (tddOn && greenfield
@@ -1219,7 +1634,7 @@ export class Executor {
     try {
       const res = await chat(this.cfg, {
         model: this.resolveModel(tier),
-        messages: [{ role: "user", content: acceptanceCriteriaSplitPrompt(this.meta.mission, raw, { ambition, cap, greenfield }) }],
+        messages: [{ role: "user", content: acceptanceCriteriaSplitPrompt(this.meta.mission, raw, { ambition, cap, greenfield, spec: this.productSpec }) }],
         thinking: ambition === "exhaustive",
         maxTokens: ambition === "exhaustive" ? 4096 : 1024,
         signal: this.ac.signal,
@@ -2895,6 +3310,7 @@ PROTOCOL
   }
 
   private completenessRounds = 0;
+  private visualRounds = 0;
   /**
    * Effective parity-critic round budget. An explicit per-run/cfg value wins;
    * otherwise it scales with ambition — exhaustive builds get multiple passes to
@@ -2994,6 +3410,460 @@ PROTOCOL
     );
     await this.conductorTurn();
     return this.lastConductorAction === "spawn";
+  }
+
+  // ---------------------------------------------------------------- visual / functional parity
+
+  /** Pick a free localhost TCP port for the dev server. */
+  private freePort(): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const srv = net.createServer();
+      srv.once("error", reject);
+      srv.listen(0, "127.0.0.1", () => {
+        const addr = srv.address();
+        const port = typeof addr === "object" && addr ? addr.port : 0;
+        srv.close(() => (port ? resolve(port) : reject(new Error("no free port"))));
+      });
+    });
+  }
+
+  /** Any HTTP response (even 404/500) means the dev server is listening. */
+  private async httpReachable(url: string): Promise<boolean> {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(2500), redirect: "manual" });
+      return res.status > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Start the built web app's dev server detached on a free port and wait until
+   * it answers. Host-only; bounded; returns null (skip visual) if no serve script
+   * is detected or it never comes up. The process is daemonized (nohup + </dev/null)
+   * so the blocking sandbox.exec returns immediately while the server keeps running.
+   */
+  private async startDevServer(): Promise<{ url: string; port: number } | null> {
+    const wd = this.sandbox.workdir;
+    const exec = this.sandbox.exec.bind(this.sandbox);
+    let pkgRaw = "";
+    try {
+      pkgRaw = (await exec("cat package.json 2>/dev/null", { cwd: wd, timeoutSec: 15, signal: this.ac.signal })).out ?? "";
+    } catch {
+      return null;
+    }
+    if (!pkgRaw.trim()) return null;
+    let port: number;
+    try {
+      port = await this.freePort();
+    } catch {
+      return null;
+    }
+    const serve = detectServeCommand({ packageJson: pkgRaw, lockfiles: [] }, port);
+    if (!serve) return null;
+    if (serve.needsBuild && this.repoProfile?.commands.build) {
+      await exec(this.repoProfile.commands.build, { cwd: wd, timeoutSec: 300, signal: this.ac.signal }).catch(() => {});
+    }
+    const logFile = path.join(this.runDirPath, "serve.log");
+    const pidFile = path.join(this.runDirPath, "serve.pid");
+    this.devServerPort = port;
+    await exec(serveDaemonCommand(serve.cmd, logFile, pidFile), { cwd: wd, timeoutSec: 25, signal: this.ac.signal }).catch(() => {});
+    try {
+      this.devServerPid = Number((fs.readFileSync(pidFile, "utf8") || "").trim()) || undefined;
+    } catch {
+      /* pid optional — stop falls back to the port */
+    }
+    const url = `http://127.0.0.1:${port}`;
+    const deadline = Date.now() + Math.min(75_000, this.cfg.codeVisualTimeoutMs ?? 120_000);
+    while (Date.now() < deadline && !this.ac.signal.aborted) {
+      if (await this.httpReachable(url)) {
+        this.journal.append("log", { level: "info", msg: `visual: dev server up on ${url}` });
+        return { url, port };
+      }
+      await sleep(800);
+    }
+    this.journal.append("log", { level: "warn", msg: "visual: dev server did not become reachable in time" });
+    await this.stopDevServer();
+    return null;
+  }
+
+  /** Kill the dev server by recorded pid + whatever holds the port. Best-effort. */
+  private async stopDevServer(): Promise<void> {
+    const pid = this.devServerPid;
+    const port = this.devServerPort;
+    if (!pid && !port) return;
+    const parts: string[] = [];
+    if (pid) parts.push(`kill ${pid} 2>/dev/null`, `pkill -P ${pid} 2>/dev/null`);
+    if (port) parts.push(`lsof -ti tcp:${port} 2>/dev/null | xargs kill -9 2>/dev/null`);
+    try {
+      await this.sandbox.exec(`(${parts.join("; ")}) ; true`, { cwd: this.sandbox.workdir, timeoutSec: 10 });
+    } catch {
+      /* best-effort */
+    }
+    this.devServerPid = undefined;
+    this.devServerPort = undefined;
+  }
+
+  /**
+   * Establish the DESIGN TARGET for a UI build (after the plan): the researched
+   * ProductSpec when present, else a model-knowledge design spec. Resolves an
+   * operator --design-ref (image path or URL). Written to STYLE.md and injected
+   * into the conductor doctrine so workers build to a concrete target. No-op for
+   * non-UI builds / when visual is off.
+   */
+  private async planDesignSpec(): Promise<void> {
+    if (!this.codeMode() || !this.codeVisualEnabled()) return;
+    if (this.codeAmbition() === "prototype" || this.designText) return;
+    const ref = (this.meta.options.designRef ?? "").trim();
+    if (ref) {
+      if (/^https?:\/\//i.test(ref)) this.designRefUrl = ref;
+      else
+        try {
+          if (fs.existsSync(ref) && fs.statSync(ref).isFile()) this.designRefImage = path.resolve(ref);
+        } catch {
+          /* ignore a bad path */
+        }
+    }
+    const uiByStack = Boolean(this.productSpec?.recommendedStack?.frontend);
+    const uiByProfile = this.repoProfile ? isWebApp(this.repoProfile) : false;
+    if (!uiByStack && !uiByProfile && !this.designRefImage && !this.designRefUrl) return;
+    let source: "spec" | "knowledge" | "image" = "spec";
+    if (this.productSpec) {
+      this.designText = designSpecBlock(this.productSpec);
+    } else {
+      try {
+        const res = await chat(this.cfg, {
+          model: this.resolveModel("strong"),
+          messages: [{ role: "user", content: designKnowledgePrompt(this.meta.mission) }],
+          thinking: false,
+          maxTokens: 1500,
+          signal: this.ac.signal,
+        });
+        this.onUsage(this.resolveModel("strong"), res.usage);
+        const md = (res.content || "").trim();
+        if (md) {
+          this.designText = `\nDESIGN TARGET (build the UI to match this):\n${md}`;
+          source = "knowledge";
+        }
+      } catch {
+        /* no design target — the visual pass still runs structural + smoke checks */
+      }
+      if (!this.designText) return;
+    }
+    if (this.designRefImage) source = "image";
+    try {
+      fs.writeFileSync(path.join(this.runDirPath, "artifacts", "STYLE.md"), this.designText.trim() + "\n", "utf8");
+    } catch {
+      /* best-effort */
+    }
+    this.journal.append("code.design.spec", {
+      source,
+      screens: this.productSpec?.screens.length ?? 0,
+      hasReference: Boolean(this.designRefImage || this.designRefUrl),
+      tokensPath: "artifacts/STYLE.md",
+    });
+  }
+
+  /** Drive the primary on-screen controls; return the dead (no-effect) and broken (threw) ones. */
+  private async smokeControls(browser: HeadlessBrowser, baseUrl: string): Promise<DeadControl[]> {
+    const enumJs = `(() => {
+      const vis = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width>4 && r.height>4 && r.top<innerHeight && r.left<innerWidth && r.bottom>0 && r.right>0 && s.visibility!=='hidden' && s.display!=='none' && s.pointerEvents!=='none'; };
+      const out = []; const seen = new Set();
+      const els = document.querySelectorAll('button,a[href],[role=button],[role=tab],input[type=submit],input[type=button],summary,[onclick]');
+      for (const el of els) {
+        if (!vis(el)) continue;
+        const r = el.getBoundingClientRect();
+        let label = String(el.getAttribute('aria-label') || el.textContent || el.value || el.getAttribute('title') || el.tagName).replace(/[\\s]+/g,' ').trim().slice(0,40) || el.tagName;
+        const key = label + '@' + Math.round(r.left) + ',' + Math.round(r.top);
+        if (seen.has(key)) continue; seen.add(key);
+        const tag = el.tagName.toLowerCase();
+        const href = tag === 'a' ? String(el.getAttribute('href')||'') : '';
+        const dead = tag === 'a' && (href==='' || href==='#' || href.indexOf('javascript:')===0);
+        // Controls whose effect a single-page CDP session can't observe (a new tab,
+        // window.open, or an external-origin link) are EXCLUDED from the smoke test
+        // so they're never false-flagged as dead.
+        const target = String(el.getAttribute('target')||'');
+        const oc = String(el.getAttribute('onclick')||'');
+        let external = false;
+        try { external = tag==='a' && /^https?:\\/\\//.test(href) && new URL(href).origin !== location.origin; } catch(e) {}
+        const skip = target==='_blank' || oc.indexOf('window.open')>=0 || external;
+        out.push({ label, x: r.left + r.width/2, y: r.top + r.height/2, href, dead, skip });
+        if (out.length >= 12) break;
+      }
+      return out;
+    })()`;
+    // A control "had an effect" if it produced a VISIBLE content delta — a nav, a
+    // change in visible text, a change in element count, or an overlay/dialog
+    // opening. This is far more specific than "any DOM mutation": an idle SPA
+    // (hydration, animations, timers, polling) churns the DOM constantly, so a
+    // blanket MutationObserver would score every dead button as "working" (false
+    // negative). The snapshot delta ignores that background noise.
+    const snapJs =
+      "(()=>({href:location.href,textLen:(document.body.innerText||'').length,elems:document.querySelectorAll('*').length,dialogs:document.querySelectorAll('[role=dialog],[aria-modal=true],dialog[open],.modal,.drawer,.popover,.menu').length}))()";
+    type Snap = { href: string; textLen: number; elems: number; dialogs: number };
+    const dead: DeadControl[] = [];
+    try {
+      const controls = (await browser.evaluate(enumJs)) as { label: string; x: number; y: number; href: string; dead: boolean; skip: boolean }[];
+      const list = Array.isArray(controls) ? controls.filter((c) => !c.skip).slice(0, 8) : [];
+      for (const c of list) {
+        if (this.ac.signal.aborted) break;
+        if (c.dead) {
+          dead.push({ label: c.label, reason: "no-effect", detail: "dead link (href is # / empty)" });
+          continue;
+        }
+        // Only a real uncaught EXCEPTION counts as "broke on click" — console.error
+        // noise from a dev server (framework warnings, failed polling) is ignored.
+        const errsBefore = browser.uncaughtExceptions().length;
+        const before = (await browser.evaluate(snapJs).catch(() => null)) as Snap | null;
+        await browser.click(c.x, c.y);
+        await sleep(650); // settle async fetch/render before judging "no effect"
+        const after = (await browser.evaluate(snapJs).catch(() => null)) as Snap | null;
+        const newErrs = browser.uncaughtExceptions().slice(errsBefore);
+        const effect =
+          !before ||
+          !after ||
+          before.href !== after.href ||
+          Math.abs(after.textLen - before.textLen) > 8 || // ignore a stray timestamp tick
+          after.elems !== before.elems ||
+          after.dialogs !== before.dialogs;
+        if (newErrs.length) dead.push({ label: c.label, reason: "threw", detail: clip(newErrs[0], 120) });
+        else if (!effect) dead.push({ label: c.label, reason: "no-effect" });
+        if (before && after && before.href !== after.href) {
+          // Navigated away → return to base so the next control is on the same page.
+          try {
+            await browser.navigate(baseUrl, 15_000);
+          } catch {
+            break;
+          }
+        }
+      }
+    } catch (e) {
+      this.journal.append("log", { level: "warn", msg: `visual: smoke-controls failed: ${errMsg(e)}` });
+    }
+    return dead;
+  }
+
+  /** A compact structural snapshot of the rendered page (no-vision compare baseline). */
+  private async structuralSnapshot(browser: HeadlessBrowser): Promise<string> {
+    const js = `(() => {
+      const cs = getComputedStyle(document.body);
+      const pal = new Set(); const fonts = new Set(); let n=0;
+      for (const el of document.querySelectorAll('*')) { if(n++>1500)break; const s=getComputedStyle(el); pal.add(s.color); pal.add(s.backgroundColor); fonts.add(s.fontFamily); }
+      const count = (sel) => document.querySelectorAll(sel).length;
+      const headings = [...document.querySelectorAll('h1,h2,h3')].slice(0,12).map(h=>String(h.textContent).replace(/[\\s]+/g,' ').trim().slice(0,60)).filter(Boolean);
+      const landmarks = ['header','nav','main','aside','footer','form','table','ul','dialog'].map(t=>t+':'+count(t)).filter(s=>s.slice(-2)!==':0');
+      const text = String(document.body.innerText||'').replace(/[\\s]+/g,' ').trim().slice(0,800);
+      return JSON.stringify({ title: document.title, bg: cs.backgroundColor, color: cs.color, fontFamilies: [...fonts].slice(0,5), palette: [...pal].slice(0,12), buttons: count('button'), inputs: count('input,textarea,select'), links: count('a[href]'), media: count('img,svg'), landmarks, headings, textSample: text });
+    })()`;
+    const snap = await browser.evaluate(js);
+    return typeof snap === "string" ? snap : JSON.stringify(snap);
+  }
+
+  /**
+   * Visual + functional parity pass (web/UI builds): render the green tree in a
+   * headless browser, compare it to the design target (a vision model when one is
+   * configured, else a structural DOM/style snapshot), and DRIVE the primary
+   * controls to catch dead/broken ones the static stub scan misses. Findings
+   * reopen the build loop with concrete fix tasks — same shape as the parity
+   * critic. Every guard failure skips honestly (never blocks the ship). Returns
+   * true when it reopened the loop.
+   */
+  private async codeVisualPass(): Promise<boolean> {
+    if (!this.codeMode() || !this.codeVisualEnabled()) return false;
+    if (this.cfg.verification === "off") return false;
+    if (this.fatal || this.ac.signal.aborted || this.budgetExceeded()) return false;
+    if (this.finishReason.includes("cancel") || this.finishReason.includes("conductor unavailable")) return false;
+    if (!this.lastGateGreen) return false; // only ever render a green tree
+    const maxRounds = this.codeVisualRounds();
+    if (maxRounds < 1 || this.visualRounds >= maxRounds) return false;
+    if (this.sandbox.kind !== "host" || !this.sandbox.localFs) {
+      this.journal.append("code.visual", { skipped: "remote-sandbox" });
+      return false;
+    }
+    if (!browserAvailable()) {
+      this.journal.append("code.visual", { skipped: "no-browser" });
+      return false;
+    }
+    if (this.inflight.size) await Promise.allSettled([...this.inflight.values()]);
+    this.visualRounds++;
+    let browser: HeadlessBrowser | null = null;
+    try {
+      const server = await this.startDevServer();
+      if (!server) {
+        this.journal.append("code.visual", { skipped: "non-ui-or-no-server", round: this.visualRounds });
+        return false;
+      }
+      browser = new HeadlessBrowser();
+      await browser.start({ timeoutMs: 25_000 });
+      await browser.navigate(server.url, 45_000);
+      const builtShot = await browser.screenshotDataUrl();
+      const shotDir = path.join(this.runDirPath, "artifacts", `visual-round-${this.visualRounds}`);
+      ensureDir(shotDir);
+      try {
+        fs.writeFileSync(path.join(shotDir, "built-home.png"), Buffer.from(builtShot.split(",")[1] ?? "", "base64"));
+      } catch {
+        /* artifact best-effort */
+      }
+      const screenshots = [`artifacts/visual-round-${this.visualRounds}/built-home.png`];
+
+      // Functional smoke: which primary controls do nothing / throw?
+      const deadControls = await this.smokeControls(browser, server.url);
+
+      // Reference image: an explicit local image, or a screenshot of the ref URL.
+      const refImages: string[] = [];
+      if (this.designRefImage) {
+        try {
+          refImages.push(`data:image/png;base64,${fs.readFileSync(this.designRefImage).toString("base64")}`);
+        } catch {
+          /* ignore unreadable ref */
+        }
+      } else if (this.designRefUrl) {
+        try {
+          await browser.navigate(this.designRefUrl, 20_000);
+          refImages.push(await browser.screenshotDataUrl());
+          await browser.navigate(server.url, 20_000);
+        } catch {
+          /* reference unreachable → spec-only compare */
+        }
+      }
+
+      const designText = this.designText ?? `Mission: ${this.meta.mission}. Build a faithful, polished UI with populated sample data and every control wired to do real work.`;
+      // Smoke-click findings are ADVISORY — both "threw" and "no-effect" are
+      // heuristics (dev-server console noise, async effects, clipboard/download),
+      // so they are fed to the critic as a runtime SIGNAL and never reopen the
+      // build on their own, mirroring how scanStubs findings are critic-verified.
+      const suspectLabels = deadControls.map((d) => `${d.reason === "threw" ? "threw on click" : "did nothing on click"}: ${d.label}${d.detail ? ` (${d.detail})` : ""}`);
+      const deadLabels = deadControls.map((d) => `${d.reason === "threw" ? "broken" : "possibly-dead"} control: ${d.label}${d.detail ? ` (${d.detail})` : ""}`);
+      const vision = resolveVisionModel(this.cfg);
+      let verdict = "";
+
+      if (vision) {
+        try {
+          const res = await chat(vision.cfg, {
+            model: vision.model,
+            messages: [
+              {
+                role: "user",
+                content: visualParityPrompt({ mission: this.meta.mission, designText, deadControls: suspectLabels, hasReference: refImages.length > 0 }),
+                imageParts: [...refImages, builtShot],
+              },
+            ],
+            thinking: false,
+            maxTokens: 1500,
+            signal: this.ac.signal,
+          });
+          this.onUsage(vision.model, res.usage);
+          verdict = (res.content || "").trim();
+        } catch (e) {
+          this.journal.append("log", { level: "warn", msg: `visual critic (vision) failed: ${errMsg(e)}` });
+        }
+      }
+      if (!verdict) {
+        const snap = await this.structuralSnapshot(browser).catch(() => "");
+        try {
+          const res = await chat(this.cfg, {
+            model: this.resolveModel("strong"),
+            messages: [{ role: "user", content: visualParityPrompt({ mission: this.meta.mission, designText, deadControls: suspectLabels, hasReference: false, structural: snap || "(snapshot unavailable)" }) }],
+            thinking: false,
+            maxTokens: 1200,
+            signal: this.ac.signal,
+          });
+          this.onUsage(this.resolveModel("strong"), res.usage);
+          verdict = (res.content || "").trim();
+        } catch (e) {
+          this.journal.append("log", { level: "warn", msg: `visual critic (structural) failed: ${errMsg(e)}` });
+        }
+      }
+
+      const visualOk = !verdict || /^VISUAL-OK\b/i.test(verdict);
+      let findings = visualOk
+        ? []
+        : verdict
+            .split("\n")
+            .map((l) => l.trim())
+            .filter((l) => /^\d+[.)]/.test(l))
+            .map((l) => clip(l, 300))
+            .slice(0, 6);
+      if (!visualOk && !findings.length && verdict) findings = [clip(verdict, 300)];
+      // The critic's verdict is authoritative; smoke findings only matter if the
+      // critic (which is shown them above) folds them in. This avoids reopening a
+      // build — and churning correct code — on a heuristic false positive.
+      const clean = visualOk;
+      this.journal.append("code.visual", { clean, findings, deadControls: deadLabels, round: this.visualRounds, screenshots });
+      if (clean) {
+        this.journal.append("log", { level: "info", msg: `visual parity: built UI matches the design target${deadControls.length ? ` (${deadControls.length} control(s) flagged for the critic, not confirmed)` : "; controls are wired"}` });
+        return false;
+      }
+      const allFindings = findings;
+      this.journal.append("log", { level: "info", msg: `visual parity found issues:\n${allFindings.join("\n")}` });
+      this.finishing = false;
+      this.lastGateGreen = false;
+      this.gatePassDone = false;
+      this.gateRounds = 0;
+      this.reviewRounds = 0;
+      this.appendConductorUpdate(
+        `VISUAL / FUNCTIONAL PARITY (round ${this.visualRounds}/${maxRounds}) — the app builds and passes its tests, but the RENDERED UI diverges from the design target and/or has dead controls:\n${allFindings.map((f, i) => `${i + 1}. ${f}`).join("\n")}\n` +
+          "Spawn focused tasks (verify:true, on disjoint files) to FIX these for real — match layout/spacing/typography to the target, populate realistic default data (no empty shells), and WIRE every dead control to do real work. Keep the gate green."
+      );
+      await this.conductorTurn();
+      return this.lastConductorAction === "spawn";
+    } catch (e) {
+      this.journal.append("code.visual", { skipped: `error: ${errMsg(e)}`, round: this.visualRounds });
+      return false;
+    } finally {
+      if (browser) await browser.destroy();
+      await this.stopDevServer();
+    }
+  }
+
+  // ---------------------------------------------------------------- chat narration
+
+  /**
+   * Emit one conversational narration bubble for the code-chat UI. Strictly
+   * derived from data already in hand (scope, plan, phase, gate) — NO extra model
+   * call. Root code runs only.
+   */
+  private narrate(kind: "plan" | "progress" | "result", text: string, phase?: string): void {
+    if (!this.codeMode() || this.mode !== "root") return;
+    const t = text.trim();
+    if (!t) return;
+    this.journal.append("code.narrate", { kind, text: clip(t, 600), phase });
+  }
+
+  /** The "here's my plan & scope" opening bubble, assembled from the grounded scope + plan. */
+  private narratePlan(): void {
+    const p = this.repoProfile;
+    const stack = this.productSpec ? stackLine(this.productSpec.recommendedStack) : p?.framework ?? p?.primaryLanguage ?? "";
+    const crit = this.acceptanceItems.length;
+    const mods = this.buildPlan?.modules.length ?? 0;
+    const waves = this.buildPlan?.waves?.length ?? 0;
+    const bits: string[] = [];
+    if (this.productSpec) bits.push(`Researched ${this.productSpec.productName} — ${this.productSpec.features.length} features, ${this.productSpec.screens.length} screens${this.productSpec.grounded ? "" : " (inferred)"}.`);
+    if (crit) bits.push(`Scope: ${crit} acceptance ${crit === 1 ? "criterion" : "criteria"}.`);
+    if (mods) bits.push(`Plan: ${mods} module${mods === 1 ? "" : "s"}${waves ? ` across ${waves} conflict-free wave${waves === 1 ? "" : "s"}` : ""}.`);
+    if (stack) bits.push(`Stack: ${stack}.`);
+    if (p?.greenfield) bits.push("Greenfield — scaffolding first.");
+    if (bits.length) this.narrate("plan", "Here's the plan. " + bits.join(" "));
+  }
+
+  /** Record this turn's final commit lineage (base..head) so the UI can diff/revert it. */
+  private async emitCodeCommit(): Promise<void> {
+    if (!this.codeMode() || this.mode !== "root" || !this.codeCommit) return;
+    try {
+      const r = await this.sandbox.exec("git rev-parse HEAD 2>/dev/null", { cwd: this.sandbox.workdir, timeoutSec: 15, signal: this.ac.signal });
+      const sha = (r.out ?? "").trim().split("\n")[0];
+      if (sha) this.journal.append("code.commit", { sha, base: this.codeBaselineSha ?? null });
+    } catch {
+      /* best-effort — diff/revert just won't be offered for this turn */
+    }
+  }
+
+  /** The closing "here's what I built" bubble, from the synthesizer summary + gate evidence. */
+  private narrateResult(summary: string): void {
+    const gateLine = this.lastGateSummary
+      ? clip(this.lastGateSummary.split("\n").find((l) => /pass|green|fail|red|test/i.test(l)) ?? this.lastGateSummary, 120)
+      : "";
+    this.narrate("result", clip(summary, 450) + (gateLine ? ` — ${gateLine}` : ""));
   }
 
   /** Code mode: the last green-gate's summary, fed to the synthesizer as test evidence. */
@@ -3208,6 +4078,7 @@ PROTOCOL
       if (result.green) {
         this.lastGateGreen = true;
         await this.commitGreen("clean-build verified");
+        this.narrate("progress", "Build sealed — clean (cold-cache) build is green.");
         return;
       }
       // Cold build is RED: an error the warm incremental cache hid, or a regression
@@ -3352,6 +4223,7 @@ PROTOCOL
             exitCriteria: args.exit_criteria ? String(args.exit_criteria) : undefined,
           };
           this.journal.append("phase.set", { name, goal: this.phase.goal, exit_criteria: this.phase.exitCriteria });
+          this.narrate("progress", `${name}${this.phase.goal ? ` — ${this.phase.goal}` : ""}`, name);
           toolResult = `Phase set: ${name}. Now also call spawn_tasks, wait, or finish.`;
           // Not a scheduling decision by itself — fall through to the nudge
           // loop if the conductor stopped here.
@@ -4799,6 +5671,12 @@ PROTOCOL
       if (msg.kind === "cancel") {
         this.journal.append("operator.note", { text: "⛔ Cancel requested by operator." });
         this.cancel();
+      } else if (msg.kind === "approve") {
+        // Releases the plan-approval wait. drainControl owns the single shared
+        // ControlReader, so the approve is recorded as a flag here (the wait loop
+        // never polls itself — that would race the control timer for the line).
+        this.planApproved = true;
+        this.journal.append("operator.note", { text: "✅ Plan approved by operator." });
       } else if (msg.kind === "note" && msg.text) {
         this.operatorQueue.push(msg.text);
         this.journal.append("operator.note", { text: msg.text });
@@ -5032,6 +5910,12 @@ PROTOCOL
       status = "failed";
       reason = `All ${tasks.length} task(s) failed or were blocked.`;
     }
+    // Conversational closing bubble + the turn's commit lineage (for diff/revert).
+    if (this.codeMode()) {
+      await this.emitCodeCommit();
+      this.narrateResult(summary || clip(reportMarkdown, 400));
+    }
+
     await this.writeFinal(status, reason, reportMarkdown, summary || clip(reportMarkdown, 600));
 
     // Cross-run memory: real-directory runs leave a trace for the next swarm.

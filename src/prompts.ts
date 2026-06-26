@@ -1,6 +1,6 @@
 import * as os from "os";
 import { daysToIso } from "./forecast";
-import { AcceptanceItem, AggregateForecast, BuildPlan, CodeDepth, ForecastQuestion, RepoMap, RepoProfile, RunMeta, SimDriver, SimulationResult, Task } from "./types";
+import { AcceptanceItem, AggregateForecast, BuildPlan, CodeDepth, ForecastQuestion, ProductSpec, RecommendedStack, RepoMap, RepoProfile, RunMeta, SimDriver, SimulationResult, Task } from "./types";
 import { clip, fmtTokens } from "./util";
 
 // ============================================================ conductor
@@ -828,6 +828,181 @@ CODE RULES
 - Deliver the WORKING TREE plus a short PR-style change summary — never a long prose report. The code is the product.`;
 }
 
+// ============================================================ grounded research / product spec
+
+/** One-line summary of a researched stack, for pinning into the plan + scaffold. */
+export function stackLine(s: RecommendedStack): string {
+  const parts = [s.frontend, s.backend, s.database, s.auth, s.styling, s.testing, ...(s.other ?? [])].filter(Boolean);
+  return parts.join(" · ") || "(unspecified)";
+}
+
+/** Compact, token-bounded rendering of a researched ProductSpec for injection into the scope/plan prompts. */
+export function renderSpecForPrompt(spec: ProductSpec): string {
+  const feat = spec.features.map((f) => `  - [${f.priority}] ${f.name}: ${f.description}`).join("\n");
+  const screens = spec.screens.map((s) => `  - ${s.name} (${s.purpose}) — ${s.elements.join(", ")}`).join("\n");
+  const data = spec.dataModel.map((d) => `  - ${d.entity}: ${d.fields.join(", ")}${d.relations ? ` [${d.relations}]` : ""}`).join("\n");
+  const ux = spec.uxDetails.map((u) => `  - ${u}`).join("\n");
+  return `PRODUCT: ${spec.productName} — ${spec.oneLiner}${spec.grounded ? "" : " (INFERRED — sources were thin; treat as a best-effort guess, not researched truth)"}
+FEATURES:
+${feat || "  (none)"}
+KEY SCREENS / FLOWS:
+${screens || "  (none)"}
+DATA MODEL:
+${data || "  (none)"}
+UX DETAILS (states, interactions, theming):
+${ux || "  (none)"}
+RECOMMENDED STACK: ${stackLine(spec.recommendedStack)}
+NON-GOALS: ${spec.nonGoals.join("; ") || "(none stated)"}`;
+}
+
+/** Full SPEC.md artifact written to the run dir so the operator sees what scope was researched. */
+export function renderSpecMd(spec: ProductSpec): string {
+  const feat = spec.features.map((f) => `- **${f.name}** _(${f.priority})_ — ${f.description}`).join("\n");
+  const screens = spec.screens.map((s) => `### ${s.name}\n${s.purpose}\n\nElements: ${s.elements.join(", ")}`).join("\n\n");
+  const data = spec.dataModel.map((d) => `- **${d.entity}**: ${d.fields.join(", ")}${d.relations ? ` — _${d.relations}_` : ""}`).join("\n");
+  const ux = spec.uxDetails.map((u) => `- ${u}`).join("\n");
+  const st = spec.recommendedStack;
+  const stackRows = ([["Frontend", st.frontend], ["Backend", st.backend], ["Database", st.database], ["Auth", st.auth], ["Styling", st.styling], ["Testing", st.testing]] as [string, string | undefined][])
+    .filter(([, v]) => v)
+    .map(([k, v]) => `| ${k} | ${v} |`)
+    .join("\n");
+  const sources = spec.sources.length ? spec.sources.map((s) => `- ${s}`).join("\n") : "_(inferred from model knowledge — no live sources)_";
+  return `# ${spec.productName}
+
+> ${spec.oneLiner}
+
+${spec.grounded ? "_Grounded in researched sources._" : "_⚠️ Inferred — sources were thin; treat as a best-effort guess._"}
+
+## Features
+${feat || "_(none)_"}
+
+## Screens & Flows
+${screens || "_(none)_"}
+
+## Data Model
+${data || "_(none)_"}
+
+## UX Details
+${ux || "_(none)_"}
+
+## Recommended Stack
+| Layer | Choice |
+|---|---|
+${stackRows || "| | |"}
+
+${st.rationale ? `**Rationale:** ${st.rationale}` : ""}
+
+## Non-Goals
+${spec.nonGoals.map((g) => `- ${g}`).join("\n") || "_(none)_"}
+
+## Sources
+${sources}
+`;
+}
+
+/**
+ * Cheap triage: decide whether a build needs external grounding (clone/parity/
+ * named-product/ambitious-app) and, if so, the web queries + canonical URLs that
+ * surface the real product's surface area. Self-contained utilities short-circuit
+ * here so research never taxes "a CLI that parses CSV". JSON only.
+ */
+export function researchTriagePrompt(mission: string, profile: RepoProfile): string {
+  return `You are scoping a software BUILD before any research. Decide whether building this WELL requires grounding in an external, real-world product or domain — or whether the mission is fully self-contained.
+
+MISSION
+${mission}
+
+CONTEXT: ${profile.greenfield ? "Greenfield — empty working directory, building from scratch." : `Existing ${profile.primaryLanguage ?? "unknown"} repo${profile.framework ? ` (${profile.framework})` : ""}.`}
+
+Reply with ONLY this JSON (no prose, no fences):
+{"needsResearch": <bool — TRUE for clones / parity asks ("like Linear", "Notion clone", "Stripe-style dashboard"), named real products, or ambitious apps modeled on a real reference; FALSE for self-contained utilities ("a CLI that parses CSV", "a function that …")>,
+ "productKind": "<short kind, e.g. note-taking app / kanban board / payments dashboard>",
+ "namedProducts": ["<real products this should match or draw from, if any>"],
+ "canonicalUrls": ["<homepage or docs URLs worth fetching for features/screens, most authoritative first>"],
+ "queries": ["<up to 8 focused web queries that surface the real product's features, key screens, data model, and the modern stack to build it — e.g. '<product> features list', '<product> UI screens layout', '<product> data model', 'best stack to build a <kind> app 2026'>"]}`;
+}
+
+/**
+ * Distill the research corpus into a grounded ProductSpec. Strong-tier, thinking
+ * on. Grounds scope in researched facts instead of the model's memory — the fix
+ * for "missing details / not close". JSON only.
+ */
+export function productSpecPrompt(mission: string, profile: RepoProfile, corpus: string, sources: string[]): string {
+  return `You are the product architect for a software BUILD. Using ONLY the RESEARCH CORPUS below (ranked passages + fetched pages about the real product/domain), produce a GROUNDED spec of the real surface area needed to build a faithful version. Do not invent features the corpus does not support; if the corpus is thin or off-topic, set "grounded": false and infer conservatively from what a real product of this kind has.
+
+MISSION
+${mission}
+${profile.greenfield ? "" : `\nEXISTING REPO: ${profile.primaryLanguage ?? "unknown"}${profile.framework ? ` (${profile.framework})` : ""} — fit the stack to it.\n`}
+RESEARCH CORPUS (ground only in this — do not cite anything outside it)
+${corpus}
+
+Produce:
+- The REAL feature list, each marked "core" (must exist for a faithful match) or "secondary".
+- The KEY SCREENS / flows and the concrete on-screen ELEMENTS each needs (panels, controls, lists, editors, menus).
+- The DATA MODEL: entities, their fields, and relations.
+- Concrete UX DETAILS: empty / loading / error / streaming states, keyboard shortcuts, theming/typography, responsive behavior.
+- Explicit NON-GOALS (what a clone should NOT try to build).
+- A RECOMMENDED MODERN STACK ${profile.greenfield ? "for a from-scratch build" : "consistent with the existing repo"} with a one-paragraph rationale grounded in how this class of app is built today.
+
+Reply with ONLY this JSON (no prose, no fences):
+{"productName":"...","oneLiner":"...",
+ "features":[{"name":"...","description":"...","priority":"core"}],
+ "screens":[{"name":"...","purpose":"...","elements":["..."]}],
+ "dataModel":[{"entity":"...","fields":["..."],"relations":"..."}],
+ "recommendedStack":{"frontend":"...","backend":"...","database":"...","auth":"...","styling":"...","testing":"...","other":["..."],"rationale":"..."},
+ "uxDetails":["..."],"nonGoals":["..."],
+ "sources":${JSON.stringify(sources.slice(0, 12))},
+ "grounded":<bool>}`;
+}
+
+/** Adversarial spec critique: what does a real <product> have that this spec is missing? JSON only. */
+export function specCritiquePrompt(mission: string, spec: ProductSpec): string {
+  return `You are a demanding product reviewer who knows ${spec.productName} (and this class of product) deeply. Judge whether the SPEC below captures what a faithful build truly needs. List concrete capabilities, key screens, data-model pieces, or UX states that a real ${spec.productName} HAS but the spec is MISSING or under-specifies. Be specific and actionable; do not pad with nice-to-haves.
+
+MISSION
+${mission}
+
+SPEC
+${renderSpecForPrompt(spec)}
+
+Reply with ONLY this JSON: {"complete": <bool — true if genuinely faithful>, "gaps": ["<each a concrete missing capability/screen/state to add>"]}. Keep gaps to the real, important omissions (max 8).`;
+}
+
+/** Re-distill the spec to close reviewer gaps, staying grounded in the corpus. JSON only. */
+export function specRevisePrompt(mission: string, corpus: string, spec: ProductSpec, gaps: string[]): string {
+  return `Revise the product spec to close the gaps a reviewer found, staying grounded in the research corpus. Keep everything already correct; ADD or expand to cover each gap.
+
+MISSION
+${mission}
+
+CURRENT SPEC
+${renderSpecForPrompt(spec)}
+
+GAPS TO CLOSE
+${gaps.map((g, i) => `${i + 1}. ${g}`).join("\n")}
+
+RESEARCH CORPUS (ground additions in this)
+${corpus}
+
+Reply with ONLY the full revised ProductSpec JSON (same fields: productName, oneLiner, features, screens, dataModel, recommendedStack, uxDetails, nonGoals, sources, grounded). No prose, no fences.`;
+}
+
+// ============================================================ build plan
+
+/**
+ * Distinct architectural lenses for the best-of-N BuildPlan ensemble. The engine
+ * proposes a partition from several of these in parallel and keeps the one that
+ * validates conflict-free with the best acceptance coverage — independent
+ * proposals + an objective selector compound a small model (the planForecast/
+ * runEnsemble philosophy applied to the plan itself).
+ */
+export const PLAN_PERSPECTIVES: string[] = [
+  "VERTICAL FEATURE SLICES — one module per end-to-end feature (its UI + state + data together), so each is independently shippable and owns its own files.",
+  "LAYERED ARCHITECTURE — partition by layer (data/model, services/logic, UI/components, routing/glue) with clean contracts between the layers.",
+  "MINIMAL SURFACE / LIBRARY-FIRST — lean on well-chosen libraries; the fewest modules that still keep files disjoint, each doing real, substantial work.",
+  "TEST-DRIVEN BOUNDARIES — draw module boundaries around independently-testable units so each module has a crisp spec and its own fitness function.",
+];
+
 /**
  * Ask a model to produce the engine-owned BuildPlan: a module/file partition
  * with interface contracts and a dependency order. The engine validates the
@@ -839,12 +1014,19 @@ export function planBuildSpecPrompt(
   mission: string,
   profile: RepoProfile,
   items: AcceptanceItem[],
-  opts: { ambition: CodeDepth; maxModules: number }
+  opts: { ambition: CodeDepth; maxModules: number; spec?: ProductSpec; perspective?: string }
 ): string {
+  const spec = opts.spec;
   const repo = profile.greenfield
-    ? "GREENFIELD — the working directory is empty; choose a stack and lay out the new files."
+    ? spec
+      ? `GREENFIELD — the working directory is empty. Use this RESEARCHED stack (already decided — do NOT re-litigate it): ${stackLine(spec.recommendedStack)}. Lay out the new files for it.`
+      : "GREENFIELD — the working directory is empty; choose a stack and lay out the new files."
     : `EXISTING REPO — ${profile.primaryLanguage ?? "unknown stack"}${profile.framework ? ` (${profile.framework})` : ""}${profile.packageManager ? ` · ${profile.packageManager}` : ""}. Edit existing files where appropriate; list the real paths you expect to touch.`;
   const crit = items.length ? items.map((it) => `  [${it.id}] ${it.text}`).join("\n") : "  (none specified — infer from the mission)";
+  const specBlock = spec
+    ? `\nGROUNDED PRODUCT SPEC (researched from the real product — map modules 1:1 to these features/screens; this is truth, not imagination):\n${renderSpecForPrompt(spec)}\n`
+    : "";
+  const perspectiveRule = opts.perspective ? `\nPARTITION LENS for THIS proposal — ${opts.perspective}\n` : "";
   // Module-count guidance scales with ambition. The old flat "2–8 modules"
   // under-decomposed broad products into a handful of giant modules; an
   // exhaustive build should be MANY well-bounded modules covering every feature.
@@ -858,10 +1040,10 @@ MISSION
 ${mission}
 
 ${repo}
-
+${specBlock}
 ACCEPTANCE CRITERIA
 ${crit}
-
+${perspectiveRule}
 Rules for the partition:
 - Each module owns a DISJOINT set of files — no file may appear under two modules. This is the hard constraint; if two pieces of work need the same file, they are ONE module.
 - Give each module a short id, the exact files it owns, a one-line purpose, an optional interface/contract other modules import, and deps (module ids it must build after).
@@ -906,21 +1088,27 @@ ${waveLines}
 export function acceptanceCriteriaSplitPrompt(
   mission: string,
   criteria: string,
-  opts: { ambition: CodeDepth; cap: number; greenfield: boolean }
+  opts: { ambition: CodeDepth; cap: number; greenfield: boolean; spec?: ProductSpec }
 ): string {
-  const { ambition, cap, greenfield } = opts;
+  const { ambition, cap, greenfield, spec } = opts;
   // Exhaustive builds get a SCOPE-EXPANSION prompt: enumerate the real surface
   // area instead of collapsing a vague ask into a handful of generic items. This
   // is the fix for the failure where "a 1:1 Claude.ai clone with skills +
   // connectors" became 12 generic chat criteria that dropped the named features.
   if (ambition === "exhaustive") {
+    const specBlock = spec
+      ? `\nGROUNDED PRODUCT SPEC (researched from the real product — DERIVE the checklist from this; it is truth, not imagination)\n${renderSpecForPrompt(spec)}\n`
+      : "";
+    const specRule = spec
+      ? `- DERIVE the checklist from the GROUNDED PRODUCT SPEC above. EVERY "core" feature and EVERY key screen MUST appear as one or more concrete items; fold the UX-details (empty/loading/error states, keyboard, theming) into checkable conditions. Do not drop a researched capability.`
+      : `- ENUMERATE THE REAL SURFACE AREA. If the mission names capabilities (e.g. "skills", "connectors", "model picker", "file upload", specific screens or flows), EACH becomes one or more concrete items. NEVER silently drop a named capability — that is the most important rule.`;
     return `You are the product architect for an AMBITIOUS software build. Produce a COMPLETE acceptance checklist — the full surface area a demanding reviewer would require before calling this a true match for the request. Breadth is the point; do NOT reduce it to a minimal subset.
 
 MISSION
 ${mission}
-${criteria ? `\nOPERATOR ACCEPTANCE NOTES (free text — fold these in; they are notes, NOT the full scope)\n${criteria}\n` : ""}
+${specBlock}${criteria ? `\nOPERATOR ACCEPTANCE NOTES (free text — fold these in; they are notes, NOT the full scope)\n${criteria}\n` : ""}
 Rules:
-- ENUMERATE THE REAL SURFACE AREA. If the mission names capabilities (e.g. "skills", "connectors", "model picker", "file upload", specific screens or flows), EACH becomes one or more concrete items. NEVER silently drop a named capability — that is the most important rule.
+${specRule}
 - Expand vague quality bars into concrete, checkable sub-features. "1:1 parity / looks like X / beautiful / polished" ⇒ itemize the actual UI surfaces, components, states and interactions parity requires: layout & navigation, every key screen, empty/loading/error/streaming states, responsive behavior, theming/typography, keyboard and interaction details.
 - ${greenfield ? "Greenfield: include the foundational items (stack choice, scaffold, build+test commands) AND the full feature set." : "Brownfield: cover the new behavior end-to-end, including integration points with existing code."}
 - Each item is a single concrete, testable "done when X" condition. Prefer specific over generic; merge only exact duplicates.
@@ -1063,6 +1251,50 @@ ${sources ? `SOURCE LIST (the only citable sources)\n${sources}\n\n` : ""}FINAL 
 ${finalReport}
 
 Reply with EXACTLY "OK" if the final report's claims are supported by the task reports and nothing material is misrepresented or fabricated${sources ? ", its inline [n] citations all reference numbers that exist in the source list, and no key web-derived factual claim is left uncited" : ""}. Otherwise list the specific discrepancies (max 5), each citing what the final report says vs what the task reports support.`;
+}
+
+// ============================================================ visual / functional parity
+
+/** A concrete design brief injected into the conductor doctrine for UI builds, so workers build to the researched screens, not vibes. */
+export function designSpecBlock(spec: ProductSpec): string {
+  const screens = spec.screens.map((s) => `  - ${s.name}: ${s.elements.join(", ")}`).join("\n");
+  return `
+DESIGN TARGET (build the UI to MATCH this real, researched surface — not a rough sketch):
+PRODUCT: ${spec.productName} — ${spec.oneLiner}
+KEY SCREENS & the on-screen elements each MUST render:
+${screens || "  (derive concrete screens from the features)"}
+UX DETAILS to honor: ${spec.uxDetails.slice(0, 12).join("; ") || "loading/empty/error states, keyboard, theming"}
+VISUAL BAR: real-product polish — consistent spacing/typography/color, a POPULATED default state (seed realistic sample data; never ship an empty shell), and EVERY interactive control wired to do real work.`;
+}
+
+/** Strong-tier design spec from model knowledge, used when a UI build has no researched ProductSpec. Markdown out. */
+export function designKnowledgePrompt(mission: string): string {
+  return `Write a concise DESIGN SPEC (markdown) for building a faithful, polished UI for this mission, from your knowledge of the real product / class of app. Cover: the key SCREENS and the on-screen ELEMENTS each needs, layout & navigation, color/typography direction, and the important UX states (empty / loading / error). Be concrete and buildable. No preamble.
+
+MISSION
+${mission}`;
+}
+
+/**
+ * Vision (or structural) critic: judge whether the BUILT web app matches its
+ * design target. Shown reference image(s) (optional) then screenshot(s) of the
+ * built app — or, in the no-vision path, a structural DOM/computed-style
+ * snapshot. Same verdict grammar as the parity critic so the engine reuses one
+ * parser. `deadControls` are runtime smoke-click findings folded in.
+ */
+export function visualParityPrompt(opts: { mission: string; designText: string; deadControls: string[]; hasReference: boolean; structural?: string }): string {
+  const { mission, designText, deadControls, hasReference, structural } = opts;
+  return `You are a demanding product designer reviewing whether a BUILT web app is a faithful, polished match for its design target. ${structural ? "You are given a STRUCTURAL snapshot of the rendered DOM + computed styles." : `You are shown ${hasReference ? "the REFERENCE design image(s) FIRST, then " : ""}screenshot(s) of the BUILT app.`} Do NOT judge whether it compiles — judge VISUAL FIDELITY and COMPLETENESS.
+
+MISSION
+${mission}
+
+DESIGN TARGET
+${designText}
+${structural ? `\nRENDERED SNAPSHOT (built app)\n${structural}\n` : ""}${deadControls.length ? `\nRUNTIME SIGNAL — these controls did NOTHING when clicked (likely dead / unwired): ${deadControls.join("; ")}\n` : ""}
+Judge: the key screens and elements are PRESENT and POPULATED (not an empty shell, lorem-ipsum, or "coming soon"); layout & structure match the target; spacing / typography / color are coherent and product-quality; the important states exist; and every visible control looks wired. Be specific about what diverges from the target.
+
+Reply EXACTLY "VISUAL-OK" if the built UI is a faithful, polished match. Otherwise reply a short numbered list (max 6) of concrete visual/functional defects, each actionable enough to become a fix task.`;
 }
 
 // ============================================================ compaction

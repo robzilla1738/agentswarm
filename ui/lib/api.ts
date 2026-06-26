@@ -190,6 +190,22 @@ export const api = {
   getSession: (id: string) => jget<SessionSnapshot>(`/api/sessions/${id}`),
   sessionMessage: (id: string, message: string) =>
     jpost<{ turnId: string }>(`/api/sessions/${id}/message`, { message }),
+  // ---- live-turn control (steer / stop / approve the plan) ----
+  sessionNote: (id: string, text: string) => jpost<{ ok: boolean }>(`/api/sessions/${id}/note`, { text }),
+  sessionCancel: (id: string) => jpost<{ ok: boolean }>(`/api/sessions/${id}/cancel`, {}),
+  sessionApprove: (id: string) => jpost<{ ok: boolean }>(`/api/sessions/${id}/approve`, {}),
+  // ---- per-turn diff + revert ----
+  turnDiff: async (id: string, turnId: string): Promise<string> => {
+    const res = await fetch(hubBase() + `/api/sessions/${id}/turns/${turnId}/diff`);
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      let msg = txt;
+      try { msg = JSON.parse(txt).error || txt; } catch { /* keep txt */ }
+      throw new Error(msg || `${res.status}`);
+    }
+    return res.text();
+  },
+  revertTurn: (id: string, turnId: string) => jpost<{ ok: boolean }>(`/api/sessions/${id}/turns/${turnId}/revert`, {}),
   deleteSession: async (id: string): Promise<void> => {
     const res = await fetch(hubBase() + `/api/sessions/${id}`, { method: "DELETE" });
     if (!res.ok) {

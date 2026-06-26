@@ -33,6 +33,8 @@ export interface ProviderInfo {
   efforts: ReasoningEffort[];
   /** OpenAI rejects max_tokens on reasoning models; needs max_completion_tokens. */
   maxTokensParam: "max_tokens" | "max_completion_tokens";
+  /** This provider's flagship models accept image inputs (multimodal). Drives visual-parity degradation. */
+  vision?: boolean;
   defaultModel: string;
   /** Fallback suggestions when /models is unavailable. */
   knownModels: string[];
@@ -71,6 +73,7 @@ export const PROVIDERS: Record<ProviderId, ProviderInfo> = {
     deepseekThinking: false,
     efforts: ["low", "medium", "high"],
     maxTokensParam: "max_completion_tokens",
+    vision: true,
     defaultModel: "gpt-5.1-mini",
     knownModels: ["gpt-5.1", "gpt-5.1-mini", "gpt-4.1", "gpt-4.1-mini"],
   },
@@ -84,6 +87,7 @@ export const PROVIDERS: Record<ProviderId, ProviderInfo> = {
     deepseekThinking: false,
     efforts: [],
     maxTokensParam: "max_tokens",
+    vision: true,
     defaultModel: "claude-sonnet-4-6",
     knownModels: ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"],
     note: "Uses Anthropic's OpenAI-compatible endpoint.",
@@ -98,6 +102,7 @@ export const PROVIDERS: Record<ProviderId, ProviderInfo> = {
     deepseekThinking: false,
     efforts: [],
     maxTokensParam: "max_tokens",
+    vision: true,
     defaultModel: "grok-4-fast",
     knownModels: ["grok-4", "grok-4-fast", "grok-3-mini"],
   },

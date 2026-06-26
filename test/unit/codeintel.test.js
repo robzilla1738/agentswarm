@@ -7,6 +7,10 @@ const {
   codeCacheCleanCommand,
   partitionWaves,
   coerceBuildModules,
+  coerceProductSpec,
+  detectServeCommand,
+  isWebApp,
+  serveDaemonCommand,
   moduleFileOwner,
   buildRepoMap,
   gitDiffSince,
@@ -291,4 +295,92 @@ test("formatStubFindings: groups by kind; empty in, empty out", () => {
   assert.match(out, /dead-handler \(2\)/);
   assert.match(out, /dead-link \(1\)/);
   assert.match(out, /a\.tsx:1/);
+});
+
+test("coerceProductSpec: distills a valid spec, defaults missing fields", () => {
+  const raw = {
+    productName: "Notion",
+    oneLiner: "an all-in-one workspace",
+    features: [
+      { name: "Block editor", description: "rich text blocks", priority: "core" },
+      { name: "Templates", description: "starter pages", priority: "secondary" },
+      { name: "", description: "dropped — no name" },
+    ],
+    screens: [{ name: "Sidebar", purpose: "navigation", elements: ["tree", "search"] }],
+    dataModel: [{ entity: "Page", fields: ["id", "title"], relations: "has many Block" }],
+    recommendedStack: { frontend: "Next.js", database: "Postgres", rationale: "modern" },
+    uxDetails: ["empty state", "keyboard shortcuts"],
+    nonGoals: ["mobile app"],
+    grounded: true,
+  };
+  const spec = coerceProductSpec(raw, ["https://notion.so"]);
+  assert.ok(spec, "spec produced");
+  assert.equal(spec.productName, "Notion");
+  assert.equal(spec.features.length, 2, "the nameless feature is dropped");
+  assert.equal(spec.features[1].priority, "secondary");
+  assert.equal(spec.screens[0].elements.length, 2);
+  assert.equal(spec.dataModel[0].relations, "has many Block");
+  assert.equal(spec.recommendedStack.frontend, "Next.js");
+  assert.equal(spec.grounded, true, "grounded stays true when sources back it");
+  assert.deepEqual(spec.sources, ["https://notion.so"]);
+});
+
+test("coerceProductSpec: grounded is false without real sources, even if the model claims true", () => {
+  const spec = coerceProductSpec(
+    { productName: "X", features: [{ name: "f", description: "d", priority: "core" }], grounded: true },
+    []
+  );
+  assert.ok(spec);
+  assert.equal(spec.grounded, false, "no sources → not grounded");
+});
+
+test("coerceProductSpec: null on garbage / no substance", () => {
+  assert.equal(coerceProductSpec(null, []), null);
+  assert.equal(coerceProductSpec("nope", []), null);
+  assert.equal(coerceProductSpec({ productName: "Empty", features: [], screens: [] }, []), null);
+});
+
+test("detectServeCommand: recovers the dev server with a deterministic port per framework", () => {
+  // Next.js dev → -p flag + PORT env, wrapped via `npm run`
+  const next = detectServeCommand({ packageJson: JSON.stringify({ scripts: { dev: "next dev", build: "next build", start: "next start" }, dependencies: { next: "^15" } }), lockfiles: ["package-lock.json"] }, 4317);
+  assert.ok(next, "Next.js dev script is recognized as a serve command");
+  assert.match(next.cmd, /npm run dev/);
+  assert.match(next.cmd, /-p 4317/);
+  assert.match(next.cmd, /PORT=4317/);
+  assert.equal(next.needsBuild, false);
+
+  // Vite dev → --port --strictPort
+  const vite = detectServeCommand({ packageJson: JSON.stringify({ scripts: { dev: "vite", build: "vite build", preview: "vite preview" }, devDependencies: { vite: "^5", vue: "^3" } }), lockfiles: [] }, 4318);
+  assert.match(vite.cmd, /--port 4318/);
+  assert.match(vite.cmd, /--strictPort/);
+
+  // CRA → PORT env, BROWSER=none
+  const cra = detectServeCommand({ packageJson: JSON.stringify({ scripts: { start: "react-scripts start" }, dependencies: { react: "^18", "react-scripts": "5" } }), lockfiles: [] }, 4319);
+  assert.match(cra.cmd, /PORT=4319/);
+  assert.match(cra.cmd, /BROWSER=none/);
+
+  // A non-web project (cargo / plain lib) → null
+  assert.equal(detectServeCommand({ cargo: "[package]", lockfiles: [] }, 4000), null);
+  assert.equal(detectServeCommand({ packageJson: JSON.stringify({ scripts: { build: "tsc", test: "vitest" } }), lockfiles: [] }, 4000), null);
+});
+
+test("isWebApp: true for JS UI frameworks, false otherwise", () => {
+  const p = (framework) => ({ greenfield: false, primaryLanguage: "TypeScript", packageManager: "npm", framework, commands: {}, monorepo: { tool: null, packages: [] }, git: { isRepo: true, branch: "main", dirty: false }, conventions: [], manifestFiles: [] });
+  assert.equal(isWebApp(p("Next.js")), true);
+  assert.equal(isWebApp(p("React")), true);
+  assert.equal(isWebApp(p("Vue")), true);
+  assert.equal(isWebApp(p("Express")), false);
+  assert.equal(isWebApp(p(null)), false);
+});
+
+test("serveDaemonCommand: runs the serve cmd through `sh -c` so a PORT= env prefix is an assignment, not nohup's program", () => {
+  const cmd = serveDaemonCommand("PORT=4317 npm run dev -- -p 4317", "/runs/x/serve.log", "/runs/x/serve.pid");
+  // Must wrap in `sh -c` so `PORT=…` is parsed by the shell as an env assignment.
+  assert.match(cmd, /nohup sh -c /);
+  // The env prefix must NOT appear directly after `nohup` (that is the bug: nohup
+  // would treat `PORT=4317` as its program operand → ENOENT, server never binds).
+  assert.ok(!/nohup PORT=/.test(cmd), "PORT= must not follow nohup directly");
+  // Daemonized + pid captured.
+  assert.match(cmd, /< \/dev\/null/);
+  assert.match(cmd, /echo \$! >/);
 });

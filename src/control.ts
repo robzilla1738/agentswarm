@@ -9,7 +9,7 @@ import { safeJson } from "./util";
  */
 export interface ControlMsg {
   t: number;
-  kind: "note" | "cancel";
+  kind: "note" | "cancel" | "approve";
   text?: string;
 }
 

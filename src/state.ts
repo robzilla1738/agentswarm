@@ -2,8 +2,10 @@ import {
   AcceptanceItem,
   AggregateForecast,
   BuildPlan,
+  BuildPlanCandidate,
   Forecast,
   ForecastQuestion,
+  ProductSpec,
   RepoProfile,
   RunMeta,
   RunStatus,
@@ -100,6 +102,10 @@ export class RunState {
   codeBaselineSha?: string;
   /** Code mode: acceptance criteria split into tracked items (restored on resume). */
   acceptanceItems: AcceptanceItem[] = [];
+  /** Code mode: the grounded product spec from research (restored on resume so research never re-runs). */
+  productSpec?: ProductSpec;
+  /** Code mode: scored best-of-N plan candidates (transparency; restored on resume). */
+  buildPlanCandidates?: BuildPlanCandidate[];
   /** Code mode: the engine-owned build plan / file partition (restored on resume). */
   buildPlan?: BuildPlan;
   finalSummary?: string;
@@ -366,14 +372,26 @@ export class RunState {
       case "code.criteria":
         if (Array.isArray(ev.items)) this.acceptanceItems = ev.items as AcceptanceItem[];
         break;
+      case "code.research":
+        if (ev.spec) this.productSpec = ev.spec as ProductSpec;
+        break;
       case "code.design":
         if (ev.plan) this.buildPlan = ev.plan as BuildPlan;
+        break;
+      case "code.design.candidates":
+        if (Array.isArray(ev.scores)) this.buildPlanCandidates = ev.scores as BuildPlanCandidate[];
         break;
       case "code.gate":
       case "code.map":
       case "code.spec":
       case "code.review":
       case "code.ensemble":
+      case "code.research.critique":
+      case "code.plan.proposed":
+      case "code.narrate":
+      case "code.commit":
+      case "code.design.spec":
+      case "code.visual":
         // Presentation-only (no reduced field needed beyond the journal record).
         break;
       case "run.final":

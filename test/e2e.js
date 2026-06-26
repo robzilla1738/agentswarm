@@ -1276,6 +1276,22 @@ async function phaseCodeSession() {
   try {
     const base = await waitFor(() => (/(http:\/\/localhost:\d+)/.exec(hubOut) || [])[1], 15000, "hub to print its URL");
 
+    // Sessions now "show the plan first": every turn pauses at awaiting-approval
+    // until the operator approves. Drive that beat here and confirm it fired.
+    const settleTurn = async (turnId, sessionId, label) => {
+      let sawApproval = false;
+      await waitFor(async () => {
+        const st = statusOf(turnId);
+        if (st === "awaiting-approval") {
+          sawApproval = true;
+          await fetch(`${base}/api/sessions/${sessionId}/approve`, { method: "POST" }).catch(() => {});
+          return null;
+        }
+        return ["done", "failed", "cancelled"].includes(st) ? true : null;
+      }, 90000, label);
+      return sawApproval;
+    };
+
     // --- Turn 1: create a MANAGED session with a first message. ---
     const created = await (await fetch(`${base}/api/sessions`, {
       method: "POST", headers: { "content-type": "application/json" },
@@ -1285,9 +1301,10 @@ async function phaseCodeSession() {
     ok(`hub created a managed session + launched turn 1: ${created.id}`);
 
     const turn1 = created.firstTurnId;
-    await waitFor(() => (["done", "failed", "cancelled"].includes(statusOf(turn1)) ? true : null), 90000, "turn 1 to finish");
+    const approved1 = await settleTurn(turn1, created.id, "turn 1 to finish");
+    if (!approved1) fail("turn 1 should pause at awaiting-approval (sessions show the plan first)");
     if (statusOf(turn1) !== "done") fail(`turn 1 ended ${statusOf(turn1)}`);
-    ok("turn 1 finished done");
+    ok("turn 1 paused for plan approval, then finished done after approve");
 
     // The turn is a NON-sandbox run pinned to the managed workspace, tagged with the session.
     const meta1 = JSON.parse(fs.readFileSync(path.join(home, "runs", turn1, "meta.json"), "utf8"));
@@ -1300,6 +1317,18 @@ async function phaseCodeSession() {
     if (oneOf(turn1, "code.plan").profile.greenfield !== true) fail("turn 1 (empty workspace) should recon as greenfield");
     ok("turn 1 reconned the empty workspace as greenfield");
 
+    // Per-turn diff endpoint: turnRange pairs code.plan.baseline .. code.commit.sha.
+    const d1 = await fetch(`${base}/api/sessions/${created.id}/turns/${turn1}/diff`);
+    const diff1 = await d1.text();
+    if (!d1.ok || !/greet\.js/.test(diff1)) fail(`turn 1 diff should show greet.js (status ${d1.status}, body ${diff1.slice(0, 120)})`);
+    ok("per-turn diff endpoint returns this turn's committed range (greet.js)");
+    // Authorization: a turnId not in this session must be rejected on BOTH the
+    // read-only diff and the history-mutating revert (membership check).
+    const dBad = await fetch(`${base}/api/sessions/${created.id}/turns/run_not_in_session/diff`);
+    const rBad = await fetch(`${base}/api/sessions/${created.id}/turns/run_not_in_session/revert`, { method: "POST" });
+    if (dBad.status !== 404 || rBad.status !== 404) fail(`diff/revert must 404 a foreign turnId (got ${dBad.status}/${rBad.status})`);
+    ok("diff/revert reject a turnId from outside the session (membership-authorized)");
+
     // --- Turn 2: a follow-up message must iterate on the SAME tree, not wipe it. ---
     const second = await (await fetch(`${base}/api/sessions/${created.id}/message`, {
       method: "POST", headers: { "content-type": "application/json" },
@@ -1308,7 +1337,7 @@ async function phaseCodeSession() {
     if (!second.turnId) fail(`follow-up message failed: ${JSON.stringify(second)}`);
     ok(`follow-up message launched turn 2: ${second.turnId}`);
 
-    await waitFor(() => (["done", "failed", "cancelled"].includes(statusOf(second.turnId)) ? true : null), 90000, "turn 2 to finish");
+    await settleTurn(second.turnId, created.id, "turn 2 to finish");
     // The workspace from turn 1 must still be intact (persistence, no per-turn wipe).
     if (!fs.existsSync(path.join(ws, "greet.js"))) fail("turn 2 must NOT wipe the workspace — greet.js from turn 1 should persist");
     ok("turn 2 preserved the prior turn's workspace (greet.js survived)");

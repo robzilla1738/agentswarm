@@ -93,6 +93,50 @@ test("planBuildSpecPrompt widens decomposition for exhaustive builds", () => {
   assert.ok(/Keep it tight: 2–8 modules/.test(standard));
 });
 
+const sampleSpec = {
+  productName: "Notion",
+  oneLiner: "all-in-one workspace",
+  features: [
+    { name: "Block editor", description: "rich blocks", priority: "core" },
+    { name: "Database views", description: "table/board/calendar", priority: "core" },
+  ],
+  screens: [{ name: "Sidebar", purpose: "nav", elements: ["page tree", "search"] }],
+  dataModel: [{ entity: "Page", fields: ["id", "title"], relations: "has many Block" }],
+  recommendedStack: { frontend: "Next.js", database: "Postgres", styling: "Tailwind", testing: "Vitest", rationale: "modern" },
+  uxDetails: ["empty state", "slash menu"],
+  nonGoals: ["mobile"],
+  sources: ["https://notion.so"],
+  grounded: true,
+};
+
+test("acceptanceCriteriaSplitPrompt GROUNDS the checklist in a researched spec when present", () => {
+  const grounded = acceptanceCriteriaSplitPrompt("Notion clone", "1:1 parity", { ambition: "exhaustive", cap: 40, greenfield: true, spec: sampleSpec });
+  assert.ok(/GROUNDED PRODUCT SPEC/.test(grounded), "injects the spec block");
+  assert.ok(/DERIVE the checklist from the GROUNDED PRODUCT SPEC/.test(grounded), "derives from facts, not memory");
+  assert.ok(grounded.includes("Block editor"), "the real researched features appear");
+  // Without a spec it falls back to the memory-enumeration rule.
+  const ungrounded = acceptanceCriteriaSplitPrompt("Notion clone", "1:1 parity", { ambition: "exhaustive", cap: 40, greenfield: true });
+  assert.ok(/ENUMERATE THE REAL SURFACE AREA/.test(ungrounded));
+  assert.ok(!/GROUNDED PRODUCT SPEC/.test(ungrounded));
+});
+
+test("planBuildSpecPrompt pins the researched stack for greenfield and threads the perspective", () => {
+  const items = [{ id: "AC1", text: "renders editor", met: false }];
+  const grounded = planBuildSpecPrompt("Notion clone", baseProfile, items, {
+    ambition: "exhaustive",
+    maxModules: 24,
+    spec: sampleSpec,
+    perspective: "VERTICAL FEATURE SLICES — one module per feature.",
+  });
+  assert.ok(/RESEARCHED stack/.test(grounded), "greenfield uses the pinned researched stack");
+  assert.ok(/Next\.js · Postgres · Tailwind · Vitest/.test(grounded), "stackLine renders the chosen stack");
+  assert.ok(/GROUNDED PRODUCT SPEC/.test(grounded), "the spec is injected into the plan prompt too");
+  assert.ok(/PARTITION LENS for THIS proposal/.test(grounded), "the ensemble perspective is threaded in");
+  // Without a spec greenfield still says "choose a stack".
+  const ungrounded = planBuildSpecPrompt("x", baseProfile, items, { ambition: "exhaustive", maxModules: 24 });
+  assert.ok(/choose a stack/.test(ungrounded));
+});
+
 test("codeConductorAddendum tells the conductor NOT to re-spawn engine-pre-created tasks", () => {
   const preseeded = codeConductorAddendum(baseProfile, "done", [{ id: "AC1", text: "x", met: false }], undefined, true, true);
   assert.ok(/ALREADY created/i.test(preseeded));

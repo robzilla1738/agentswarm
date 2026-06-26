@@ -14,6 +14,14 @@ export interface ToolCall {
 export interface ChatMsg {
   role: "system" | "user" | "assistant" | "tool";
   content: string | null;
+  /**
+   * Vision: data:image/...;base64 URLs attached to a USER message. When present,
+   * sanitizeMessages emits OpenAI/Anthropic-compatible multimodal content (a text
+   * part + one image_url part each). Ignored on non-user roles. Keeping this a
+   * separate field (rather than widening `content`) avoids a type ripple across
+   * the all-string call sites — only the vision path sets it.
+   */
+  imageParts?: string[];
   /** DeepSeek thinking mode: present on assistant turns; MUST be sent back on
    *  assistant messages that carry tool_calls, or the API returns 400. */
   reasoning_content?: string;
@@ -93,7 +101,7 @@ function normalizeUsage(u: any): Usage {
   };
 }
 
-function sanitizeMessages(messages: ChatMsg[], thinking: boolean): unknown[] {
+export function sanitizeMessages(messages: ChatMsg[], thinking: boolean): unknown[] {
   return messages.map((m) => {
     if (m.role === "assistant") {
       const out: Record<string, unknown> = { role: "assistant", content: m.content ?? "" };
@@ -107,6 +115,14 @@ function sanitizeMessages(messages: ChatMsg[], thinking: boolean): unknown[] {
     }
     if (m.role === "tool") {
       return { role: "tool", content: m.content ?? "", tool_call_id: m.tool_call_id };
+    }
+    // Vision: a user message with attached images becomes multimodal content
+    // (a text part + one image_url part per image) — the OpenAI/Anthropic shape.
+    if (m.role === "user" && m.imageParts?.length) {
+      const parts: unknown[] = [];
+      if (m.content) parts.push({ type: "text", text: m.content });
+      for (const url of m.imageParts) parts.push({ type: "image_url", image_url: { url } });
+      return { role: "user", content: parts };
     }
     return { role: m.role, content: m.content ?? "" };
   });

@@ -67,7 +67,7 @@ interface Args {
 
 /** Flags that never take a value — they must not swallow the next positional
  *  (`swarm run --fg "mission"` would otherwise eat the mission). */
-const BOOL_FLAGS = new Set(["fg", "open", "resume", "auto", "dry-run", "reforecast", "single", "simulate", "greenfield"]);
+const BOOL_FLAGS = new Set(["fg", "open", "resume", "auto", "dry-run", "reforecast", "single", "simulate", "greenfield", "plan"]);
 
 function parseArgs(argv: string[]): Args {
   const _: string[] = [];
@@ -165,6 +165,9 @@ export async function main(): Promise<void> {
       case "cancel":
         cmdCancel(_[1]);
         break;
+      case "approve":
+        cmdApprove(_[1]);
+        break;
       case "config":
         await cmdConfig(_.slice(1), flags);
         break;
@@ -246,6 +249,11 @@ export function optionOverrides(flags: Args["flags"], cfg: SwarmConfig): Partial
   if (flags.review === false) o.codeReview = false;
   if (flags.ensemble === false) o.codeEnsemble = false;
   if (flags["repo-facts"] === false) o.codeRepoFacts = false;
+  if (flags.research === false) o.codeResearch = false;
+  // One-shot CLI builds run autonomously; --plan opts into the "show plan, approve first" beat.
+  if (flags.plan === true || flags.plan === "true") o.codePlanApproval = true;
+  if (typeof flags["design-ref"] === "string") o.designRef = flags["design-ref"];
+  if (flags.visual === false) o.codeVisual = false;
   if (typeof flags.by === "string") {
     if (!ISO_DATE.test(flags.by) || !Number.isFinite(Date.parse(flags.by))) {
       throw new Error("--by must be an ISO date (YYYY-MM-DD)");
@@ -320,10 +328,11 @@ async function cmdRun(mission: string, flags: Args["flags"]): Promise<void> {
   await watchRunUntilSignal(meta.id, cfg.pricing, () => detaching);
   process.off("SIGINT", onSig);
   if (detaching && isRunLive(meta.id)) {
+    const approveHint = meta.options.codePlanApproval ? `\n  approve:   swarm approve ${meta.id}` : "";
     console.log(
       "\n" +
         ansi.yellow("detached") +
-        ` — run continues in the background.\n  reattach:  swarm watch ${meta.id}\n  steer:     swarm note ${meta.id} "..."\n  stop:      swarm cancel ${meta.id}`
+        ` — run continues in the background.\n  reattach:  swarm watch ${meta.id}\n  steer:     swarm note ${meta.id} "..."${approveHint}\n  stop:      swarm cancel ${meta.id}`
     );
   } else {
     printFinalLine(meta.id);
@@ -613,6 +622,14 @@ function cmdCancel(id: string): void {
   if (!loadMeta(id)) throw new Error(`run not found: ${id}`);
   appendControl(runDir(id), { kind: "cancel" });
   console.log(ansi.yellow("⛔ cancel requested for ") + id);
+}
+
+function cmdApprove(id: string): void {
+  if (!id) throw new Error("usage: swarm approve <id>");
+  id = resolveId(id);
+  if (!loadMeta(id)) throw new Error(`run not found: ${id}`);
+  appendControl(runDir(id), { kind: "approve" });
+  console.log(ansi.green("✓ ") + "plan approved — the build will start");
 }
 
 // ---------------------------------------------------------------- forecasts
@@ -1352,16 +1369,21 @@ ${b("USAGE")}
                                       decomposed questions): ranked scenarios + a driver tornado
   swarm code "<build task>" [--accept "<done when>"] [--depth exhaustive] [--greenfield] [--no-gate] [--no-commit]
                             [--no-tdd] [--no-design] [--no-repo-map] [--no-review] [--no-ensemble] [--no-repo-facts]
-                                      build software: recon + an engine-owned build plan, author a
-                                      failing spec test-suite from the acceptance criteria (TDD),
+                            [--no-research] [--no-visual] [--design-ref <url|path>] [--plan]
+                                      build software: RESEARCH the real target (web search + crawl)
+                                      and scope from facts, recon + an engine-owned build plan, author
+                                      a failing spec test-suite from the acceptance criteria (TDD),
                                       fan out on disjoint files, run the detected build/test after
                                       every change, commit on green (interrupts resume compiling),
                                       best-of-N on hard tasks, then a green-gate + blind diff-review +
-                                      a completeness/parity critic before shipping. Deliverable is a
-                                      working tree + change summary. --depth prototype|standard|
-                                      exhaustive (default: auto-detected; exhaustive maxes quality —
-                                      capable model for all craft, wider decomposition, ensembles,
-                                      multi-round review). Deliverable is a working tree + summary.
+                                      a completeness/parity critic + (web apps) a render/visual + smoke
+                                      pass before shipping. --no-research / --no-visual disable the
+                                      grounding / visual passes; --design-ref pins a reference URL or
+                                      image; --plan shows the grounded plan for approval before building.
+                                      --depth prototype|standard|exhaustive (default: auto-detected;
+                                      exhaustive maxes quality — capable model for all craft, wider
+                                      decomposition, ensembles, multi-round review). Deliverable is a
+                                      working tree + change summary.
   swarm serve [--port 7777] [--open]  start the mission-control web UI + API
   swarm watch <id>                    attach a live dashboard to a run
   swarm resume <id> [--fg]            resume an interrupted run (done tasks keep their results)
@@ -1386,6 +1408,7 @@ ${b("USAGE")}
                                       plus mc + numeric tables and the trend-projector gate
   swarm report <id> [--open]          print (or open) a run's final report
   swarm note <id> "<text>"            steer a live run (the conductor reads it)
+  swarm approve <id>                  approve a --plan build waiting at the plan-approval gate
   swarm cancel <id>                   stop a run gracefully (still synthesizes)
   swarm config [list|get|set|unset|path]  manage config (~/.agentswarm/config.json)
   swarm sandbox [test|<runtime>]      show / smoke-test the shell runtime (host, docker, e2b, modal, vercel)
